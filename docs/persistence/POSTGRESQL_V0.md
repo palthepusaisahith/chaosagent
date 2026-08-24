@@ -1,0 +1,160 @@
+# PostgreSQL persistence v0
+
+## Scope and ownership
+
+This package is the PostgreSQL adapter introduced by Issue #5. It persists
+validated Scenario revisions, unresolved Agent Configuration revision
+references, structural Runs, Run Event evidence, and one final Run Report per
+Run. It does not implement campaign expansion, run transitions, leases, workers,
+evaluation, tool/fault behavior, or event streaming.
+
+The tables have deliberately different responsibilities:
+
+- `scenario_revisions` stores the validated canonical Scenario JSON value, its
+  schema version and JCS SHA-256 digest, plus creation metadata.
+- `agent_configuration_revisions` is only an immutable `{id, revision, digest}`
+  reference registry. There is no Agent Configuration contract yet, so this
+  table does not claim that the referenced content was loaded or that its digest
+  was independently verified. In particular, the all-zero digest in structural
+  examples remains an explicit unresolved placeholder.
+- `runs` assigns a stable Run ID and freezes the Scenario and Agent
+  Configuration keys _and digests_. Its `status` column has the architecture's
+  allowed vocabulary and defaults to `queued`; Issue #5 provides no update or
+  transition API. Until Issue #6 implements the lifecycle state machine,
+  `runs.status` is structural and is not asserted to agree with a stored final
+  report. A Run Report's `run_status` is authoritative only for that immutable
+  report document; Issue #6 will make `runs.status` authoritative for live Run
+  lifecycle and define the cross-document terminal-status invariant.
+- `run_events` stores each validated Run Event document and the small set of
+  envelope columns needed for identity, ordering, and later replay queries.
+- `run_reports` stores one validated, final Run Report document per Run. V0 does
+  not support replacing or rebuilding a report. A future versioned-report policy
+  requires an explicit migration and contract decision.
+
+Campaigns remain outside this package. Scenario v0's trial intent does not
+become campaign persistence here, preserving the boundary established in Issue
+#3.
+
+## Relational columns and JSONB documents
+
+Opaque contract IDs remain bounded text rather than UUIDs. JSONB stores the
+validated semantic JSON value; PostgreSQL does not preserve the input's key
+order, whitespace, or numeric spelling. On reads, the contract loader
+revalidates and re-canonicalizes that value. Scenario digests therefore retain
+their Scenario/JCS meaning even though the database does not store a second copy
+of canonical bytes.
+
+V0 applies one explicit persistence profile before insertion: U+0000 is rejected
+in JSON string values and object keys because PostgreSQL JSONB cannot represent
+it. This is a typed `PersistenceProfileError`, not an unpredictable driver
+failure and not a change to Scenario v0 validation. Other contract semantics
+remain owned by the versioned Python/JSON Schema loaders.
+
+Relational columns duplicate only values needed for keys, foreign keys,
+constraints, or expected queries. Check constraints bind those columns to the
+corresponding JSON envelope/reference fields. Runs include revision digests so a
+report's Scenario and Agent Configuration references can be tied to the same
+frozen Run by a composite foreign key. Projection checks use fail-closed
+null-safe comparisons, so missing keys, JSON null, malformed nested paths, and
+mismatched projected values cannot become immutable rows. These checks do not
+replace full contract validation.
+
+PostgreSQL cannot recompute the Scenario semantic-normalization/JCS digest with
+built-in functions. The validated loader computes it; database immutability,
+primary keys, and repository conflict checks prevent an existing
+`(scenario_id, revision)` from being remapped. Reads recompute and verify the
+stored digest, detecting corruption or privileged out-of-band writes.
+
+## Immutability and append-only guarantees
+
+The repository returns frozen records containing immutable validated contract
+wrappers and exposes no update/delete API for Scenario revisions, Agent
+Configuration references, events, or reports. The migration also installs
+row-level `BEFORE UPDATE OR DELETE` triggers for those four tables and revokes
+those operations from `PUBLIC`.
+
+This is a database-level guard for normal DML, not an absolute tamper-proof
+ledger. A database owner or superuser can disable/drop triggers, change schema,
+use privileged maintenance paths, or restore different data. Production role
+provisioning is deployment-specific and deferred; the application role must not
+own these tables and should receive only `SELECT`/`INSERT` on immutable tables.
+`TRUNCATE` and DDL must not be granted. The migration intentionally does not
+create cluster-global roles.
+
+Runs are not immutable at the database layer because Issue #6 will add guarded
+lifecycle transitions. This package currently exposes creation and fetch only.
+
+## Transactions, conflicts, and event ordering
+
+Repository methods call `flush()` but never `commit()`. Callers own the
+SQLAlchemy `Session` and transaction, so a Scenario/Run/event/report operation
+can be composed atomically and rolls back with the caller's transaction.
+Expected uniqueness conflicts use savepoints so they do not poison that outer
+transaction.
+
+At PostgreSQL's default `READ COMMITTED` isolation:
+
+- identical Scenario or Agent Configuration revision inserts are idempotent;
+  different content/digests raise `RevisionConflictError`;
+- duplicate Run IDs raise `PersistenceConflictError`;
+- duplicate event IDs raise `DuplicateEventIDError`;
+- duplicate `(run_id, sequence)` values raise `EventSequenceConflictError`;
+- a write conflicting on both dimensions raises
+  `EventIdentityAndSequenceConflictError`, independent of which unique index
+  PostgreSQL reports first;
+- an identical final-report retry is idempotent, while any different report for
+  that Run raises `FinalReportConflictError`.
+
+The event producer assigns the positive sequence. The repository never derives
+`MAX(sequence) + 1`, because that would be a race-prone hidden allocator.
+Concurrent writers may insert different sequence values in either commit order;
+sequence is the authoritative logical order, not insertion time, `occurred_at`,
+or `recorded_at`. PostgreSQL's unique constraint serializes a collision so
+exactly one same-sequence insert wins. Fetches always order by sequence, and Run
+Event v0 intentionally permits gaps.
+
+## Migrations and local PostgreSQL
+
+Alembic reads `CHAOSAGENT_DATABASE_URL`, fails closed for non-PostgreSQL URLs,
+and explicitly owns its tables, indexes, trigger function, triggers, and version
+table in the `public` schema. From the repository root:
+
+```shell
+docker compose -f deploy/compose/postgres.yml up -d
+$env:CHAOSAGENT_DATABASE_URL = "postgresql+psycopg://chaosagent:chaosagent@127.0.0.1:55432/chaosagent_test"
+uv run alembic -c packages/persistence/alembic.ini upgrade head
+uv run alembic -c packages/persistence/alembic.ini downgrade base
+```
+
+The Compose file contains only an ephemeral PostgreSQL service, binds it to
+`127.0.0.1`, and uses fixed development-only credentials that are unsuitable for
+production. CI and Compose use the same immutable PostgreSQL 17.11 Alpine image
+digest. CI sets both test safeguards. For a local integration run:
+
+```shell
+$env:CHAOSAGENT_TEST_DATABASE_URL = "postgresql+psycopg://chaosagent:chaosagent@127.0.0.1:55432/chaosagent_test"
+$env:CHAOSAGENT_ALLOW_DESTRUCTIVE_DATABASE_TESTS = "1"
+uv run pytest tests/python/test_postgres_persistence.py
+```
+
+Tests skip when the database URL is absent. Before any migration teardown, the
+fixture also requires the explicit destructive-test opt-in and a database name
+ending in `_test`; otherwise it fails without touching the database. When all
+guards pass, connection or migration failures fail the suite.
+
+SQLAlchemy supplies typed PostgreSQL mappings and transaction behavior, Alembic
+supplies auditable migrations, and psycopg is the PostgreSQL driver. The
+`binary` psycopg extra gives local development and CI a self-contained,
+cross-platform libpq runtime instead of requiring a machine-level client
+installation. The standard library and prior JSON-contract dependencies provide
+none of those capabilities, so all three are necessary runtime dependencies.
+
+## Deferred to Issue #6 and later
+
+- legal run-transition enforcement, optimistic versions, leases, workers,
+  heartbeat/reaper behavior, and sequence allocation ownership;
+- Campaign persistence and campaign statistics;
+- synthetic-company state, tools, fault activations, approvals, evaluators, SSE,
+  telemetry, exports, and deployment role creation;
+- an actual versioned Agent Configuration document contract;
+- any report rebuild/version history policy.

@@ -106,13 +106,16 @@ apps/web/                  TypeScript web-package placeholder
 services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
 packages/evidence/         Run Event/Report v0 schemas and validated loaders
+packages/persistence/      PostgreSQL models, Alembic migration, repositories
 packages/scenarios/        Scenario v0 schema, validation, and canonicalization
 tests/python/              Python smoke tests
 docs/                      Project documentation
 .github/workflows/         Linux CI
 ```
 
-No application behavior is included in these placeholders.
+Persistence responsibilities and local PostgreSQL setup are documented in
+[`docs/persistence/POSTGRESQL_V0.md`](docs/persistence/POSTGRESQL_V0.md). No run
+execution behavior is implemented.
 
 ## Developer commands
 

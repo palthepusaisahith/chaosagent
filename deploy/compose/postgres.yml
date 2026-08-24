@@ -1,0 +1,18 @@
+services:
+  postgres:
+    # Disposable development/test service only. Never reuse these credentials
+    # or settings for a production database.
+    image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      POSTGRES_DB: chaosagent_test
+      POSTGRES_PASSWORD: chaosagent
+      POSTGRES_USER: chaosagent
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U chaosagent -d chaosagent_test']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - '127.0.0.1:55432:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
