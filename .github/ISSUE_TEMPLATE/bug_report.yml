@@ -1,0 +1,88 @@
+name: Bug report
+description: Report a reproducible problem in ChaosAgent
+title: '[Bug]: '
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include secrets or vulnerability details here.
+        Report security issues privately as described in SECURITY.md.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description:
+        Provide the smallest deterministic sequence that reproduces the problem.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description:
+        Include operating system, Python, uv, Node.js, and pnpm versions as
+        relevant.
+      placeholder: |
+        OS:
+        Python:
+        uv:
+        Node.js:
+        pnpm:
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description:
+        Provide the release version or full commit SHA where the problem occurs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs and evidence
+      description:
+        Add sanitized logs, screenshots, or other evidence. Remove credentials
+        and personal data.
+
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security confirmation
+      options:
+        - label:
+            I confirm this report contains no vulnerability details, real
+            secrets, or sensitive data.
+          required: true

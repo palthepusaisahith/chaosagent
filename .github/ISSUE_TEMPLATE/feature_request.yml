@@ -1,0 +1,74 @@
+name: Feature request
+description: Propose a focused improvement to ChaosAgent
+title: '[Feature]: '
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the problem before the implementation. Keep proposals aligned with the architecture
+        and avoid combining unrelated backlog items.
+        Do not submit security vulnerabilities or sensitive security information through this public form.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete user or engineering problem needs to be solved?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description:
+        Describe the desired behavior and boundaries, not only an
+        implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What simpler approaches or existing tools were considered?
+    validations:
+      required: true
+
+  - type: textarea
+    id: justification
+    attributes:
+      label: Engineering justification
+      description:
+        Explain the tradeoffs, operational cost, and why the change belongs in
+        ChaosAgent.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+      description: State what is included and explicitly excluded.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducibility
+    attributes:
+      label: Reproducibility and evaluation impact
+      description:
+        Describe effects on determinism, evidence, evaluation semantics, or
+        state reconstruction, if relevant.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label:
+            I checked the architecture dossier and existing issues for overlap.
+          required: true
+        - label: This request does not combine unrelated backlog work.
+          required: true

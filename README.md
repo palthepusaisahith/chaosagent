@@ -3,11 +3,52 @@
 ChaosAgent is an open-source platform for chaos engineering, reliability
 evaluation, observability, and security testing of autonomous AI agents.
 
-This repository currently contains only the Python/TypeScript monorepo
-bootstrap. Product behavior and runtime infrastructure are intentionally
-deferred to later issues.
+## Project status
 
-## Prerequisites
+ChaosAgent is pre-1.0 and under active design.
+
+- **Implemented:** the Python/TypeScript monorepo bootstrap, reproducible
+  developer tooling, Linux CI smoke checks, and repository governance documents.
+- **Planned:** the V1 capabilities described below and in the architecture
+  dossier. They are not available yet.
+- **Experimental:** architecture, interfaces, and roadmap decisions may change
+  before the first release.
+
+No application behavior is implemented today.
+
+## Why ChaosAgent exists
+
+Action-taking agents can fail through ambiguous tool outcomes, retries, stale
+dependencies, unsafe content, or incorrect claims about external state.
+Happy-path tests and general tracing do not by themselves create controlled
+failure campaigns or verify stateful effects. ChaosAgent is intended to combine
+controlled perturbation, evidence capture, and outcome evaluation without
+claiming novelty over existing chaos-engineering or agent-evaluation work.
+
+## V1 goals
+
+The planned V1 focuses on:
+
+- reproducible baseline and fault campaigns against a bounded synthetic
+  environment;
+- deterministic fault selection and evidence-linked evaluation of externally
+  observable behavior;
+- traceable run, tool, policy, and state evidence;
+- security tests for agent/tool trust boundaries; and
+- an inspectable local demonstration that does not require live provider
+  credentials in CI.
+
+ChaosAgent currently does **not** support arbitrary real-world credentials or
+real payment systems. Do not use real secrets, production accounts, customer
+data, or live financial systems with this project.
+
+See the
+[approved architecture dossier](docs/architecture/CHAOSAGENT_PRODUCT_ARCHITECTURE.md)
+for the product boundaries, threat model, and staged roadmap.
+
+## Local development
+
+### Prerequisites
 
 - Python 3.12.x
 - [uv 0.12.1](https://docs.astral.sh/uv/)
@@ -91,3 +132,14 @@ The control-plane package uses Hatchling as its PEP 517 backend. Because
 isolated build dependencies are separate from the project lockfile, the root uv
 configuration constrains Hatchling to an exact version for reproducible clean
 builds.
+
+## Contributing and security
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request and follow
+the [Code of Conduct](CODE_OF_CONDUCT.md). Report suspected vulnerabilities
+privately according to [SECURITY.md](SECURITY.md); never post real secrets or
+exploit details in a public issue.
+
+## License
+
+ChaosAgent is licensed under the [Apache License 2.0](LICENSE).
