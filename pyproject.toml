@@ -1,0 +1,42 @@
+[project]
+name = "chaosagent-workspace"
+version = "0.0.0"
+description = "Development tooling for the ChaosAgent monorepo"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy==1.17.1",
+    "pytest==8.4.1",
+    "ruff==0.12.9",
+]
+
+[tool.uv]
+package = false
+required-version = "==0.12.1"
+# PEP 517 build requirements are isolated from the project lock; constrain the
+# workspace backend here so clean builds cannot select an arbitrary release.
+build-constraint-dependencies = ["hatchling==1.32.0"]
+
+[tool.uv.workspace]
+members = ["services/control-plane"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["services/control-plane/src", "tests/python"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests/python"]

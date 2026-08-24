@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.uv-cache/
+.tools/
+.corepack/
+.coverage
+htmlcov/
+build/
+
+# Node.js
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+test-results/
+playwright-report/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/

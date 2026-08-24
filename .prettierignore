@@ -1,0 +1,9 @@
+# The approved architecture dossier is reviewed prose, not generated source.
+docs/architecture/
+.corepack/
+.tools/
+.uv-cache/
+.venv/
+node_modules/
+pnpm-lock.yaml
+uv.lock
