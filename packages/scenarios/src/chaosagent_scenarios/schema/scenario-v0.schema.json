@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/scenario/v0/schema.json",
+  "title": "ChaosAgent Scenario v0",
+  "description": "Immutable semantic contract for a ChaosAgent experiment scenario.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario_id",
+    "revision",
+    "metadata",
+    "fixture",
+    "agent",
+    "policy",
+    "faults",
+    "budgets",
+    "expected_outcomes"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.scenario/v0" },
+    "scenario_id": { "$ref": "#/$defs/id" },
+    "revision": { "$ref": "#/$defs/revision" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "fixture": { "$ref": "#/$defs/revision_reference" },
+    "agent": { "$ref": "#/$defs/agent" },
+    "policy": { "$ref": "#/$defs/revision_reference" },
+    "faults": {
+      "type": "array",
+      "maxItems": 64,
+      "x-chaosagent-array-semantics": "set",
+      "description": "Unordered set of named fault definitions available to a future campaign.",
+      "items": { "$ref": "#/$defs/fault" }
+    },
+    "budgets": { "$ref": "#/$defs/budgets" },
+    "expected_outcomes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "x-chaosagent-array-semantics": "set",
+      "description": "Unordered set of ground-truth references.",
+      "items": { "$ref": "#/$defs/revision_reference" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": {
+      "type": "string",
+      "description": "Structurally validated digest supplied by a future external revision catalog.",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "revision_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "description"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "tags": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "tool_id": {
+      "description": "Closed Scenario v0 tool vocabulary for the V1 fake-company domain.",
+      "enum": [
+        "orders.get",
+        "shipping.get_status",
+        "payments.refund",
+        "support.update_ticket"
+      ]
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "instructions", "allowed_tools", "capabilities"],
+      "properties": {
+        "task": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "instructions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "x-chaosagent-array-semantics": "ordered",
+          "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/tool_id" }
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": {
+            "enum": ["tool_calling", "request_human_approval"]
+          }
+        }
+      }
+    },
+    "fault_match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id", "phase"],
+      "properties": {
+        "tool_id": { "$ref": "#/$defs/tool_id" },
+        "phase": { "enum": ["before_tool", "after_commit", "after_tool"] },
+        "call_ordinal": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "argument_equals": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean", "null"]
+          },
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+        }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["probability_ppm", "max_occurrences"],
+      "properties": {
+        "probability_ppm": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "max_occurrences": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "http_error_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "enum": [429, 503] } }
+    },
+    "auth_error_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "enum": [401, 403] } }
+    },
+    "duration_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_ms"],
+      "properties": {
+        "duration_ms": { "type": "integer", "minimum": 1, "maximum": 600000 }
+      }
+    },
+    "malformed_response_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": { "mode": { "enum": ["invalid_json", "schema_violation"] } }
+    },
+    "stale_field_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["json_pointer", "value"],
+      "properties": {
+        "json_pointer": {
+          "type": "string",
+          "pattern": "^/(?:[^~/]|~[01])*(?:/(?:[^~/]|~[01])*)*$"
+        },
+        "value": {}
+      }
+    },
+    "prompt_injection_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content"],
+      "properties": {
+        "content": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      }
+    },
+    "duplicate_response_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deliveries"],
+      "properties": {
+        "deliveries": { "type": "integer", "minimum": 2, "maximum": 10 }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "match", "activation", "parameters"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": {
+          "enum": [
+            "delay",
+            "timeout",
+            "http_error",
+            "malformed_response",
+            "stale_field",
+            "ambiguous_post_commit_timeout",
+            "auth_error",
+            "indirect_prompt_injection",
+            "duplicate_response"
+          ]
+        },
+        "match": { "$ref": "#/$defs/fault_match" },
+        "activation": { "$ref": "#/$defs/activation" },
+        "parameters": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["delay", "timeout"] } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/duration_parameters" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "http_error" } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/http_error_parameters" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "auth_error" } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/auth_error_parameters" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "malformed_response" } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/malformed_response_parameters" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "stale_field" } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/stale_field_parameters" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "ambiguous_post_commit_timeout" }
+            }
+          },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/duration_parameters" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "indirect_prompt_injection" } }
+          },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/prompt_injection_parameters" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "duplicate_response" } } },
+          "then": {
+            "properties": {
+              "parameters": { "$ref": "#/$defs/duplicate_response_parameters" }
+            }
+          }
+        }
+      ]
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_steps",
+        "max_tool_calls",
+        "max_wall_time_ms",
+        "max_cost_microusd"
+      ],
+      "properties": {
+        "max_steps": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_tool_calls": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "max_wall_time_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        },
+        "max_cost_microusd": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000000
+        }
+      }
+    }
+  }
+}

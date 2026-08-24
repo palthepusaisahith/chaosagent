@@ -1,0 +1,62 @@
+{
+  "schema_version": "chaosagent.scenario/v0",
+  "scenario_id": "duplicate-fault-id",
+  "revision": "1",
+  "metadata": {
+    "title": "Duplicate fault",
+    "description": "Two definitions share one identity."
+  },
+  "fixture": {
+    "id": "fixture",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "agent": {
+    "task": "Read an order.",
+    "instructions": ["Use only the allowed tool."],
+    "allowed_tools": ["orders.get"],
+    "capabilities": ["tool_calling"]
+  },
+  "policy": {
+    "id": "policy",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "faults": [
+    {
+      "id": "same",
+      "kind": "http_error",
+      "match": {
+        "tool_id": "orders.get",
+        "phase": "before_tool",
+        "call_ordinal": 1
+      },
+      "activation": { "probability_ppm": 1000000, "max_occurrences": 1 },
+      "parameters": { "status": 503 }
+    },
+    {
+      "id": "same",
+      "kind": "timeout",
+      "match": {
+        "tool_id": "orders.get",
+        "phase": "before_tool",
+        "call_ordinal": 2
+      },
+      "activation": { "probability_ppm": 1000000, "max_occurrences": 1 },
+      "parameters": { "duration_ms": 100 }
+    }
+  ],
+  "budgets": {
+    "max_steps": 3,
+    "max_tool_calls": 2,
+    "max_wall_time_ms": 1000,
+    "max_cost_microusd": 0
+  },
+  "expected_outcomes": [
+    {
+      "id": "outcome",
+      "revision": "1",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

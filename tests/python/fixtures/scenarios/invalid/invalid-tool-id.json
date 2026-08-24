@@ -1,0 +1,39 @@
+{
+  "schema_version": "chaosagent.scenario/v0",
+  "scenario_id": "invalid-tool",
+  "revision": "1",
+  "metadata": {
+    "title": "Invalid tool",
+    "description": "Uses a tool outside V0."
+  },
+  "fixture": {
+    "id": "fixture",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "agent": {
+    "task": "Do a thing.",
+    "instructions": ["Use tools."],
+    "allowed_tools": ["shell.exec"],
+    "capabilities": ["tool_calling"]
+  },
+  "policy": {
+    "id": "policy",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "faults": [],
+  "budgets": {
+    "max_steps": 1,
+    "max_tool_calls": 1,
+    "max_wall_time_ms": 1,
+    "max_cost_microusd": 0
+  },
+  "expected_outcomes": [
+    {
+      "id": "outcome",
+      "revision": "1",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

@@ -20,7 +20,7 @@ required-version = "==0.12.1"
 build-constraint-dependencies = ["hatchling==1.32.0"]
 
 [tool.uv.workspace]
-members = ["services/control-plane"]
+members = ["packages/scenarios", "services/control-plane"]
 
 [tool.ruff]
 line-length = 100
@@ -35,7 +35,7 @@ quote-style = "double"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["services/control-plane/src", "tests/python"]
+files = ["packages/scenarios/src", "services/control-plane/src", "tests/python"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"

@@ -8,13 +8,14 @@ evaluation, observability, and security testing of autonomous AI agents.
 ChaosAgent is pre-1.0 and under active design.
 
 - **Implemented:** the Python/TypeScript monorepo bootstrap, reproducible
-  developer tooling, Linux CI smoke checks, and repository governance documents.
+  developer tooling, Linux CI smoke checks, repository governance documents, and
+  the versioned Scenario v0 contract with validation and stable digests.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
-No application behavior is implemented today.
+No experiment execution behavior is implemented today.
 
 ## Why ChaosAgent exists
 
@@ -103,6 +104,7 @@ make check
 apps/web/                  TypeScript web-package placeholder
 services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
+packages/scenarios/        Scenario v0 schema, validation, and canonicalization
 tests/python/              Python smoke tests
 docs/                      Project documentation
 .github/workflows/         Linux CI

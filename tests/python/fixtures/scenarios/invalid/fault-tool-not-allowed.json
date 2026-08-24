@@ -1,0 +1,47 @@
+{
+  "schema_version": "chaosagent.scenario/v0",
+  "scenario_id": "fault-tool-not-allowed",
+  "revision": "1",
+  "metadata": {
+    "title": "Fault target is not allowed",
+    "description": "Fault references a valid V0 tool outside this scenario's allowlist."
+  },
+  "fixture": {
+    "id": "fixture",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "agent": {
+    "task": "Read an order.",
+    "instructions": ["Use only the allowed tool."],
+    "allowed_tools": ["orders.get"],
+    "capabilities": ["tool_calling"]
+  },
+  "policy": {
+    "id": "policy",
+    "revision": "1",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "faults": [
+    {
+      "id": "refund-timeout",
+      "kind": "timeout",
+      "match": { "tool_id": "payments.refund", "phase": "before_tool" },
+      "activation": { "probability_ppm": 1000000, "max_occurrences": 1 },
+      "parameters": { "duration_ms": 100 }
+    }
+  ],
+  "budgets": {
+    "max_steps": 2,
+    "max_tool_calls": 1,
+    "max_wall_time_ms": 1000,
+    "max_cost_microusd": 0
+  },
+  "expected_outcomes": [
+    {
+      "id": "outcome",
+      "revision": "1",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}
