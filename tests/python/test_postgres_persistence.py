@@ -20,8 +20,10 @@ from chaosagent_evidence import (
     loads_run_event,
     loads_run_report,
 )
+from chaosagent_fixtures import Fixture, load_fixture, loads_fixture
 from chaosagent_persistence import (
     ClaimedRun,
+    CompanyStateInitializationError,
     DuplicateEventIDError,
     EventIdentityAndSequenceConflictError,
     EventSequenceConflictError,
@@ -34,6 +36,7 @@ from chaosagent_persistence import (
     PersistenceIntegrityError,
     PersistenceProfileError,
     PersistenceRepository,
+    ReferenceNotFoundError,
     RevisionConflictError,
     RevisionReference,
     StaleLeaseError,
@@ -53,6 +56,7 @@ pytestmark = pytest.mark.postgres
 
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_PATH = ROOT / "benchmarks/shipment-refund/scenarios/refund-ambiguous-timeout.v0.json"
+FIXTURE_PATH = ROOT / "benchmarks/shipment-refund/fixtures/failed-shipment.v0.json"
 EVENT_PATH = ROOT / "benchmarks/shipment-refund/evidence/v0/001-run-started.json"
 REPORT_PATH = ROOT / "benchmarks/shipment-refund/evidence/v0/run-report.json"
 ALEMBIC_INI = ROOT / "packages/persistence/alembic.ini"
@@ -102,6 +106,10 @@ def _scenario() -> Scenario:
     return load_scenario(SCENARIO_PATH)
 
 
+def _fixture() -> Fixture:
+    return load_fixture(FIXTURE_PATH)
+
+
 def _event(run_id: str, sequence: int, *, event_id: str | None = None) -> RunEvent:
     document = cast(dict[str, object], json.loads(EVENT_PATH.read_text(encoding="utf-8")))
     document["event_id"] = event_id or _unique("event")
@@ -120,7 +128,9 @@ def _report(run_id: str, *, report_id: str | None = None) -> RunReport:
 def _seed_run(session: Session, run_id: str) -> None:
     repository = PersistenceRepository(session)
     scenario = _scenario()
+    fixture = _fixture()
     scenario_document = scenario.to_dict()
+    repository.insert_fixture_revision(fixture, created_by="test-suite")
     repository.insert_scenario_revision(scenario, created_by="test-suite")
     repository.insert_agent_configuration_reference(AGENT_REFERENCE, created_by="test-suite")
     repository.create_run(
@@ -285,6 +295,14 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
     command.upgrade(configuration, "head")
     assert {
         "agent_configuration_revisions",
+        "company_customers",
+        "company_orders",
+        "company_payments",
+        "company_refunds",
+        "company_shipments",
+        "company_support_tickets",
+        "fixture_revisions",
+        "run_company_state",
         "run_events",
         "run_reports",
         "runs",
@@ -427,10 +445,209 @@ def test_lifecycle_migration_round_trips_to_issue_5(migrated_engine: Engine) -> 
     command.check(configuration)
 
 
+def test_fixture_migration_round_trips_to_issue_6(migrated_engine: Engine) -> None:
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0002_run_lifecycle_leases")
+    tables = set(inspect(migrated_engine).get_table_names(schema="public"))
+    assert "fixture_revisions" not in tables
+    assert "run_company_state" not in tables
+    run_columns = {
+        column["name"] for column in inspect(migrated_engine).get_columns("runs", schema="public")
+    }
+    assert "fixture_id" not in run_columns
+    command.upgrade(configuration, "head")
+    tables = set(inspect(migrated_engine).get_table_names(schema="public"))
+    assert {
+        "fixture_revisions",
+        "run_company_state",
+        "company_customers",
+        "company_orders",
+        "company_shipments",
+        "company_payments",
+        "company_refunds",
+        "company_support_tickets",
+    }.issubset(tables)
+    command.check(configuration)
+
+
+def test_insert_fetch_fixture_revision_conflict_and_database_immutability(
+    migrated_engine: Engine,
+) -> None:
+    fixture = _fixture()
+    document = fixture.to_dict()
+    cast(dict[str, object], document["metadata"])["title"] = "Conflicting fixture title"
+    conflicting = loads_fixture(json.dumps(document))
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        inserted = repository.insert_fixture_revision(fixture, created_by="fixture-author")
+        repeated = repository.insert_fixture_revision(fixture, created_by="ignored")
+        fetched = repository.get_fixture_revision(
+            cast(str, fixture.to_dict()["fixture_id"]), cast(str, fixture.to_dict()["revision"])
+        )
+        assert inserted.fixture.digest == repeated.fixture.digest
+        assert repeated.created_by == "fixture-author"
+        assert fetched is not None
+        assert fetched.fixture.canonical_bytes == fixture.canonical_bytes
+        with pytest.raises(RevisionConflictError):
+            repository.insert_fixture_revision(conflicting, created_by="other")
+
+    with migrated_engine.connect() as connection:
+        transaction = connection.begin()
+        with pytest.raises(DBAPIError, match="append-only"):
+            connection.execute(
+                text(
+                    "UPDATE public.fixture_revisions SET created_by = 'mutated' "
+                    "WHERE fixture_id = :fixture_id AND revision = :revision"
+                ),
+                {
+                    "fixture_id": fixture.to_dict()["fixture_id"],
+                    "revision": fixture.to_dict()["revision"],
+                },
+            )
+        transaction.rollback()
+
+
+def test_run_requires_and_freezes_exact_scenario_fixture_reference(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("fixture-bound-run")
+    fixture_document = _fixture().to_dict()
+    fixture_document["fixture_id"] = _unique("fixture-binding")
+    fixture = loads_fixture(json.dumps(fixture_document))
+    scenario_document = _scenario().to_dict()
+    scenario_document["scenario_id"] = _unique("fixture-binding-scenario")
+    scenario_document["fixture"] = {
+        "id": fixture.to_dict()["fixture_id"],
+        "revision": fixture.to_dict()["revision"],
+        "digest": fixture.digest,
+    }
+    scenario = loads_scenario(json.dumps(scenario_document))
+    scenario_document = scenario.to_dict()
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.insert_scenario_revision(scenario, created_by="test-suite")
+        repository.insert_agent_configuration_reference(AGENT_REFERENCE, created_by="test-suite")
+        with pytest.raises(ReferenceNotFoundError, match="fixture reference"):
+            repository.create_run(
+                run_id,
+                scenario_id=cast(str, scenario_document["scenario_id"]),
+                scenario_revision=cast(str, scenario_document["revision"]),
+                agent_configuration_id=AGENT_REFERENCE.id,
+                agent_configuration_revision=AGENT_REFERENCE.revision,
+                created_by="test-suite",
+            )
+        inserted_fixture = repository.insert_fixture_revision(fixture, created_by="test-suite")
+        run = repository.create_run(
+            run_id,
+            scenario_id=cast(str, scenario_document["scenario_id"]),
+            scenario_revision=cast(str, scenario_document["revision"]),
+            agent_configuration_id=AGENT_REFERENCE.id,
+            agent_configuration_revision=AGENT_REFERENCE.revision,
+            created_by="test-suite",
+        )
+        assert run.fixture is not None
+        assert run.fixture.digest == inserted_fixture.fixture.digest
+
+
+def test_run_company_initialization_is_deterministic_idempotent_and_isolated(
+    migrated_engine: Engine,
+) -> None:
+    run_a = _unique("company-run-a")
+    run_b = _unique("company-run-b")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_a)
+        _seed_run(session, run_b)
+        repository = PersistenceRepository(session)
+        state_a = repository.initialize_run_company_state(run_a)
+        state_b = repository.initialize_run_company_state(run_b)
+        repeated_a = repository.initialize_run_company_state(run_a)
+        assert state_a.fixture == state_b.fixture
+        assert state_a.customers == state_b.customers
+        assert state_a.orders == state_b.orders
+        assert state_a.shipments == state_b.shipments
+        assert state_a.payments == state_b.payments
+        assert state_a.refunds == state_b.refunds == ()
+        assert state_a.support_tickets == state_b.support_tickets
+        assert repeated_a.reference_time == state_a.reference_time == state_b.reference_time
+
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE public.company_support_tickets SET status = 'closed', note = 'Run A only' "
+                "WHERE run_id = :run_id AND ticket_id = 'TKT-204'"
+            ),
+            {"run_id": run_a},
+        )
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repeated_a = repository.initialize_run_company_state(run_a)
+        unchanged_b = repository.get_run_company_state(run_b)
+        assert repeated_a.support_tickets[0].status == "closed"
+        assert repeated_a.support_tickets[0].note == "Run A only"
+        assert unchanged_b is not None
+        assert unchanged_b.support_tickets[0].status == "open"
+        assert unchanged_b.support_tickets[0].note != "Run A only"
+
+
+def test_company_initialization_rejects_started_run_and_participates_in_rollback(
+    migrated_engine: Engine,
+) -> None:
+    started_run = _unique("started-company-run")
+    rollback_run = _unique("rollback-company-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, started_run)
+        claimed = PersistenceRepository(session).claim_next_run(
+            "fixture-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=started_run,
+        )
+        assert claimed is not None
+    with Session(migrated_engine) as session, session.begin():
+        with pytest.raises(CompanyStateInitializationError, match="before its first claim"):
+            PersistenceRepository(session).initialize_run_company_state(started_run)
+
+    with Session(migrated_engine) as session:
+        transaction = session.begin()
+        _seed_run(session, rollback_run)
+        PersistenceRepository(session).initialize_run_company_state(rollback_run)
+        transaction.rollback()
+    with Session(migrated_engine) as session:
+        assert PersistenceRepository(session).get_run(rollback_run) is None
+        assert PersistenceRepository(session).get_run_company_state(rollback_run) is None
+
+
+def test_concurrent_company_initialization_is_idempotent(migrated_engine: Engine) -> None:
+    run_id = _unique("concurrent-company-init")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+    barrier = Barrier(2)
+
+    def initialize() -> tuple[str, int]:
+        with Session(migrated_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            state = PersistenceRepository(session).initialize_run_company_state(run_id)
+            return state.fixture.digest, len(state.orders)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: initialize(), range(2)))
+    assert results == [(_fixture().digest, 1), (_fixture().digest, 1)]
+    with migrated_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.run_company_state WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+
+
 def test_insert_fetch_scenario_revision_and_idempotent_reinsert(
     migrated_engine: Engine,
 ) -> None:
-    scenario = _scenario()
+    document = _scenario().to_dict()
+    document["scenario_id"] = _unique("idempotent-scenario")
+    scenario = loads_scenario(json.dumps(document))
     with Session(migrated_engine) as session, session.begin():
         repository = PersistenceRepository(session)
         inserted = repository.insert_scenario_revision(scenario, created_by="author-1")

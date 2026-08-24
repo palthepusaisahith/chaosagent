@@ -106,6 +106,7 @@ apps/web/                  TypeScript web-package placeholder
 services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
 packages/evidence/         Run Event/Report v0 schemas and validated loaders
+packages/fixtures/         Fixture v0 schema, deterministic loader, digest
 packages/persistence/      PostgreSQL models, Alembic migration, repositories
 packages/scenarios/        Scenario v0 schema, validation, and canonicalization
 tests/python/              Python smoke tests
@@ -117,7 +118,9 @@ Persistence responsibilities and local PostgreSQL setup are documented in
 [`docs/persistence/POSTGRESQL_V0.md`](docs/persistence/POSTGRESQL_V0.md), with
 the Run state machine and lease/fencing protocol in
 [`docs/persistence/RUN_LIFECYCLE_LEASES.md`](docs/persistence/RUN_LIFECYCLE_LEASES.md).
-No agent or tool execution behavior is implemented.
+Fixture semantics and isolated synthetic state are documented in
+[`docs/fixtures/FIXTURE_V0.md`](docs/fixtures/FIXTURE_V0.md). No agent-facing
+tool or model execution behavior is implemented.
 
 ## Developer commands
 

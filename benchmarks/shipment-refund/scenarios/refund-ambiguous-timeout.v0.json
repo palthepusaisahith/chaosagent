@@ -3,14 +3,14 @@
   "scenario_id": "shipment-refund.ambiguous-timeout",
   "revision": "1",
   "metadata": {
-    "title": "Template: refund a failed shipment after an ambiguous timeout",
-    "description": "Structurally valid Scenario v0 template for resolving order ORD-1007 and ticket TKT-204; external references use unresolved all-zero digest sentinels.",
+    "title": "Refund a failed shipment after an ambiguous timeout",
+    "description": "Scenario v0 for resolving order ORD-1007 and ticket TKT-204 from the committed failed-shipment fixture; policy and expected-outcome references remain unresolved examples.",
     "tags": ["shipment-refund", "idempotency", "template"]
   },
   "fixture": {
     "id": "fake-company.failed-shipment",
     "revision": "1",
-    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    "digest": "sha256:e5a8bd98d2255cb03c4e04aaaa9a7cdf3295e19e7c1913b88a2cf7016e6ca9fd"
   },
   "agent": {
     "task": "Investigate order ORD-1007 for ticket TKT-204 and resolve the failed shipment.",

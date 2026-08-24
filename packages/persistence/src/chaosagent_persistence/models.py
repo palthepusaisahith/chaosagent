@@ -78,6 +78,44 @@ class ScenarioRevisionModel(Base):
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
 
 
+class FixtureRevisionModel(Base):
+    """Immutable, validated synthetic-company Fixture contract revision."""
+
+    __tablename__ = "fixture_revisions"
+    __table_args__ = (
+        CheckConstraint("fixture_id ~ '" + IDENTIFIER_CHECK + "'", name="fixture_id_format"),
+        CheckConstraint("revision ~ '" + REVISION_CHECK + "'", name="revision_format"),
+        CheckConstraint("canonical_digest ~ '" + DIGEST_CHECK + "'", name="digest_format"),
+        CheckConstraint("jsonb_typeof(canonical_document) = 'object'", name="document_object"),
+        CheckConstraint(
+            "(canonical_document ->> 'fixture_id') IS NOT DISTINCT FROM fixture_id",
+            name="document_fixture_id",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'revision') IS NOT DISTINCT FROM revision",
+            name="document_revision",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'schema_version') IS NOT DISTINCT FROM schema_version",
+            name="document_schema_version",
+        ),
+        UniqueConstraint(
+            "fixture_id", "revision", "canonical_digest", name="uq_fixture_revision_digest"
+        ),
+        {"schema": "public"},
+    )
+
+    fixture_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[str] = mapped_column(String(64), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    canonical_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
 class AgentConfigurationRevisionModel(Base):
     """Immutable identity/digest placeholder until an Agent Configuration contract exists."""
 
@@ -134,10 +172,25 @@ class RunModel(Base):
             ],
             name="fk_runs_agent_configuration_revision",
         ),
+        ForeignKeyConstraint(
+            ["fixture_id", "fixture_revision", "fixture_digest"],
+            [
+                "public.fixture_revisions.fixture_id",
+                "public.fixture_revisions.revision",
+                "public.fixture_revisions.canonical_digest",
+            ],
+            name="fk_runs_fixture_revision",
+        ),
         CheckConstraint("run_id ~ '" + IDENTIFIER_CHECK + "'", name="run_id_format"),
         CheckConstraint("status IN " + repr(RUN_STATUSES), name="status_value"),
         CheckConstraint("lifecycle_version >= 0", name="lifecycle_version_nonnegative"),
         CheckConstraint("attempt >= 0", name="attempt_nonnegative"),
+        CheckConstraint(
+            "(fixture_id IS NULL AND fixture_revision IS NULL AND fixture_digest IS NULL) OR "
+            "(fixture_id IS NOT NULL AND fixture_revision IS NOT NULL "
+            "AND fixture_digest IS NOT NULL)",
+            name="fixture_binding_complete",
+        ),
         CheckConstraint(
             "lease_owner IS NULL OR lease_owner ~ '" + IDENTIFIER_CHECK + "'",
             name="lease_owner_format",
@@ -168,6 +221,9 @@ class RunModel(Base):
             "status",
             name="uq_run_frozen_references",
         ),
+        UniqueConstraint(
+            "run_id", "fixture_id", "fixture_revision", "fixture_digest", name="uq_run_fixture"
+        ),
         Index("ix_runs_scenario_revision", "scenario_id", "scenario_revision"),
         Index(
             "ix_runs_claim_queue",
@@ -185,6 +241,9 @@ class RunModel(Base):
     agent_configuration_id: Mapped[str] = mapped_column(String(128), nullable=False)
     agent_configuration_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     agent_configuration_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    fixture_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fixture_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fixture_digest: Mapped[str | None] = mapped_column(String(71), nullable=True)
     status: Mapped[RunStatus] = mapped_column(String(32), nullable=False, server_default="queued")
     lifecycle_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -367,3 +426,179 @@ class RunReportModel(Base):
     inserted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
+
+
+class RunCompanyStateModel(Base):
+    """One initialization marker binding a Run-local state to its Fixture revision."""
+
+    __tablename__ = "run_company_state"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "fixture_id", "fixture_revision", "fixture_digest"],
+            [
+                "public.runs.run_id",
+                "public.runs.fixture_id",
+                "public.runs.fixture_revision",
+                "public.runs.fixture_digest",
+            ],
+            name="fk_run_company_state_frozen_run_fixture",
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    fixture_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    fixture_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    fixture_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    reference_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CompanyCustomerModel(Base):
+    __tablename__ = "company_customers"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'suspended')", name="status_value"),
+        ForeignKeyConstraint(
+            ["run_id"], ["public.run_company_state.run_id"], name="fk_company_customers_state"
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class CompanyOrderModel(Base):
+    __tablename__ = "company_orders"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('placed', 'paid', 'fulfilled', 'cancelled')", name="status_value"
+        ),
+        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_format"),
+        CheckConstraint("total_minor BETWEEN 1 AND 9007199254740991", name="total_minor_safe"),
+        ForeignKeyConstraint(
+            ["run_id", "customer_id"],
+            ["public.company_customers.run_id", "public.company_customers.customer_id"],
+            name="fk_company_orders_customer",
+        ),
+        UniqueConstraint("run_id", "order_id", "customer_id", name="uq_company_order_customer"),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    total_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    placed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CompanyShipmentModel(Base):
+    __tablename__ = "company_shipments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'in_transit', 'delivered', 'failed', 'returned')",
+            name="status_value",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "order_id"],
+            ["public.company_orders.run_id", "public.company_orders.order_id"],
+            name="fk_company_shipments_order",
+        ),
+        UniqueConstraint("run_id", "order_id", name="uq_company_shipment_order"),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    shipment_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    carrier: Mapped[str] = mapped_column(String(100), nullable=False)
+    tracking_number: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CompanyPaymentModel(Base):
+    __tablename__ = "company_payments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('captured', 'partially_refunded', 'refunded')",
+            name="status_value",
+        ),
+        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_format"),
+        CheckConstraint("amount_minor BETWEEN 1 AND 9007199254740991", name="amount_minor_safe"),
+        ForeignKeyConstraint(
+            ["run_id", "order_id"],
+            ["public.company_orders.run_id", "public.company_orders.order_id"],
+            name="fk_company_payments_order",
+        ),
+        UniqueConstraint("run_id", "order_id", name="uq_company_payment_order"),
+        UniqueConstraint(
+            "run_id", "payment_id", "order_id", name="uq_company_payment_order_reference"
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payment_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CompanyRefundModel(Base):
+    __tablename__ = "company_refunds"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'succeeded', 'failed')", name="status_value"),
+        CheckConstraint("amount_minor BETWEEN 1 AND 9007199254740991", name="amount_minor_safe"),
+        ForeignKeyConstraint(
+            ["run_id", "payment_id", "order_id"],
+            [
+                "public.company_payments.run_id",
+                "public.company_payments.payment_id",
+                "public.company_payments.order_id",
+            ],
+            name="fk_company_refunds_payment_order",
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    refund_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payment_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CompanySupportTicketModel(Base):
+    __tablename__ = "company_support_tickets"
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'pending', 'closed')", name="status_value"),
+        ForeignKeyConstraint(
+            ["run_id", "order_id", "customer_id"],
+            [
+                "public.company_orders.run_id",
+                "public.company_orders.order_id",
+                "public.company_orders.customer_id",
+            ],
+            name="fk_company_support_tickets_order_customer",
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    note: Mapped[str] = mapped_column(String(4000), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

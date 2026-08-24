@@ -6,6 +6,7 @@ requires-python = "==3.12.*"
 members = [
     "chaosagent-control-plane",
     "chaosagent-evidence",
+    "chaosagent-fixtures",
     "chaosagent-persistence",
     "chaosagent-scenarios",
     "chaosagent-workspace",
@@ -56,12 +57,28 @@ requires-dist = [
 ]
 
 [[package]]
+name = "chaosagent-fixtures"
+version = "0.0.0"
+source = { editable = "packages/fixtures" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "rfc8785" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+]
+
+[[package]]
 name = "chaosagent-persistence"
 version = "0.0.0"
 source = { editable = "packages/persistence" }
 dependencies = [
     { name = "alembic" },
     { name = "chaosagent-evidence" },
+    { name = "chaosagent-fixtures" },
     { name = "chaosagent-scenarios" },
     { name = "psycopg", extra = ["binary"] },
     { name = "sqlalchemy" },
@@ -71,6 +88,7 @@ dependencies = [
 requires-dist = [
     { name = "alembic", specifier = "==1.19.1" },
     { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-fixtures", editable = "packages/fixtures" },
     { name = "chaosagent-scenarios", editable = "packages/scenarios" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.4" },
     { name = "sqlalchemy", specifier = "==2.0.52" },

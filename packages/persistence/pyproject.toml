@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic==1.19.1",
     "chaosagent-evidence",
+    "chaosagent-fixtures",
     "chaosagent-scenarios",
     "psycopg[binary]==3.3.4",
     "sqlalchemy==2.0.52",
@@ -13,6 +14,7 @@ dependencies = [
 
 [tool.uv.sources]
 chaosagent-evidence = { workspace = true }
+chaosagent-fixtures = { workspace = true }
 chaosagent-scenarios = { workspace = true }
 
 [build-system]

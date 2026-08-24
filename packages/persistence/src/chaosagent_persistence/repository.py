@@ -17,6 +17,7 @@ from chaosagent_evidence import (
     loads_run_event,
     loads_run_report,
 )
+from chaosagent_fixtures import Fixture, FixtureValidationError, loads_fixture
 from chaosagent_scenarios import Scenario, ScenarioValidationError, loads_scenario
 from sqlalchemy import Engine, Select, create_engine, func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -36,6 +37,14 @@ from .models import (
     IDENTIFIER_CHECK,
     REVISION_CHECK,
     AgentConfigurationRevisionModel,
+    CompanyCustomerModel,
+    CompanyOrderModel,
+    CompanyPaymentModel,
+    CompanyRefundModel,
+    CompanyShipmentModel,
+    CompanySupportTicketModel,
+    FixtureRevisionModel,
+    RunCompanyStateModel,
     RunEventModel,
     RunModel,
     RunReportModel,
@@ -103,6 +112,10 @@ class LeaseNotExpiredError(LifecycleConflictError):
     """Raised when recovery is attempted before the database lease expires."""
 
 
+class CompanyStateInitializationError(PersistenceError):
+    """Raised when a Run-local company state cannot be initialized safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionReference:
     id: str
@@ -113,6 +126,13 @@ class RevisionReference:
 @dataclass(frozen=True, slots=True)
 class ScenarioRevisionRecord:
     scenario: Scenario
+    created_at: datetime
+    created_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureRevisionRecord:
+    fixture: Fixture
     created_at: datetime
     created_by: str
 
@@ -129,6 +149,7 @@ class RunRecord:
     run_id: str
     scenario: RevisionReference
     agent_configuration: RevisionReference
+    fixture: RevisionReference | None
     status: RunStatus
     lifecycle_version: int
     lease_owner: str | None
@@ -180,6 +201,79 @@ class RunEventRecord:
 class RunReportRecord:
     report: RunReport
     inserted_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyCustomer:
+    customer_id: str
+    name: str
+    email: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyOrder:
+    order_id: str
+    customer_id: str
+    status: str
+    currency: str
+    total_minor: int
+    placed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyShipment:
+    shipment_id: str
+    order_id: str
+    status: str
+    carrier: str
+    tracking_number: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyPayment:
+    payment_id: str
+    order_id: str
+    status: str
+    currency: str
+    amount_minor: int
+    captured_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyRefund:
+    refund_id: str
+    payment_id: str
+    order_id: str
+    status: str
+    amount_minor: int
+    reason: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanySupportTicket:
+    ticket_id: str
+    customer_id: str
+    order_id: str
+    status: str
+    subject: str
+    note: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticCompanyState:
+    run_id: str
+    fixture: RevisionReference
+    reference_time: datetime
+    customers: tuple[CompanyCustomer, ...]
+    orders: tuple[CompanyOrder, ...]
+    shipments: tuple[CompanyShipment, ...]
+    payments: tuple[CompanyPayment, ...]
+    refunds: tuple[CompanyRefund, ...]
+    support_tickets: tuple[CompanySupportTicket, ...]
 
 
 def create_postgres_engine(database_url: str, *, echo: bool = False) -> Engine:
@@ -296,6 +390,40 @@ class PersistenceRepository:
         model = self._session.get(ScenarioRevisionModel, (scenario_id, revision))
         return None if model is None else self._scenario_record(model)
 
+    def insert_fixture_revision(
+        self, fixture: Fixture, *, created_by: str
+    ) -> FixtureRevisionRecord:
+        document = fixture.to_dict()
+        _validate_jsonb_persistence_profile(document, "fixture")
+        fixture_id = cast(str, document["fixture_id"])
+        revision = cast(str, document["revision"])
+        existing = self._session.get(FixtureRevisionModel, (fixture_id, revision))
+        if existing is not None:
+            return self._same_fixture_or_conflict(existing, fixture)
+        model = FixtureRevisionModel(
+            fixture_id=fixture_id,
+            revision=revision,
+            schema_version=cast(str, document["schema_version"]),
+            canonical_document=document,
+            canonical_digest=fixture.digest,
+            created_by=created_by,
+        )
+        try:
+            with self._session.begin_nested():
+                self._session.add(model)
+                self._session.flush()
+        except IntegrityError as error:
+            if _constraint_name(error) == "pk_fixture_revisions":
+                concurrent = self._session.get(FixtureRevisionModel, (fixture_id, revision))
+                if concurrent is not None:
+                    return self._same_fixture_or_conflict(concurrent, fixture)
+            _raise_integrity(error, "fixture revision insert")
+        return self._fixture_record(model)
+
+    def get_fixture_revision(self, fixture_id: str, revision: str) -> FixtureRevisionRecord | None:
+        model = self._session.get(FixtureRevisionModel, (fixture_id, revision))
+        return None if model is None else self._fixture_record(model)
+
     def insert_agent_configuration_reference(
         self, reference: RevisionReference, *, created_by: str
     ) -> AgentConfigurationRevisionRecord:
@@ -349,6 +477,21 @@ class PersistenceRepository:
             raise ReferenceNotFoundError(
                 f"scenario revision {(scenario_id, scenario_revision)!r} does not exist"
             )
+        scenario_fixture = cast(
+            dict[str, object],
+            scenario.canonical_document["fixture"],
+        )
+        fixture_key = (
+            cast(str, scenario_fixture["id"]),
+            cast(str, scenario_fixture["revision"]),
+        )
+        fixture = self._session.get(FixtureRevisionModel, fixture_key)
+        if fixture is None or fixture.canonical_digest != scenario_fixture["digest"]:
+            raise ReferenceNotFoundError(
+                "scenario fixture reference "
+                f"{(fixture_key[0], fixture_key[1], scenario_fixture['digest'])!r} "
+                "does not resolve to an immutable Fixture revision"
+            )
         agent = self._session.get(
             AgentConfigurationRevisionModel,
             (agent_configuration_id, agent_configuration_revision),
@@ -366,6 +509,9 @@ class PersistenceRepository:
             agent_configuration_id=agent.agent_configuration_id,
             agent_configuration_revision=agent.revision,
             agent_configuration_digest=agent.digest,
+            fixture_id=fixture.fixture_id,
+            fixture_revision=fixture.revision,
+            fixture_digest=fixture.canonical_digest,
             created_by=created_by,
         )
         try:
@@ -381,6 +527,62 @@ class PersistenceRepository:
     def get_run(self, run_id: str) -> RunRecord | None:
         model = self._session.get(RunModel, run_id)
         return None if model is None else self._run_record(model)
+
+    def initialize_run_company_state(self, run_id: str) -> SyntheticCompanyState:
+        """Materialize one deterministic Run-local copy before its first claim."""
+        _require_identifier(run_id, "run_id")
+        existing = self._session.get(RunCompanyStateModel, run_id)
+        if existing is not None:
+            return self._company_state_record(existing)
+
+        with self._session.begin_nested():
+            run = self._session.scalar(
+                select(RunModel)
+                .where(RunModel.run_id == run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if run is None:
+                raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
+            concurrently_initialized = self._session.scalar(
+                select(RunCompanyStateModel)
+                .where(RunCompanyStateModel.run_id == run_id)
+                .execution_options(populate_existing=True)
+            )
+            if concurrently_initialized is not None:
+                return self._company_state_record(concurrently_initialized)
+            if run.status != "queued" or run.attempt != 0:
+                raise CompanyStateInitializationError(
+                    f"run {run_id!r} company state may only be initialized before its first claim"
+                )
+            if run.fixture_id is None or run.fixture_revision is None or run.fixture_digest is None:
+                raise CompanyStateInitializationError(
+                    f"legacy run {run_id!r} has no immutable Fixture binding"
+                )
+            fixture_model = self._session.get(
+                FixtureRevisionModel, (run.fixture_id, run.fixture_revision)
+            )
+            if fixture_model is None or fixture_model.canonical_digest != run.fixture_digest:
+                raise PersistenceIntegrityError(f"run {run_id!r} Fixture binding does not resolve")
+            fixture = self._fixture_record(fixture_model).fixture
+            document = fixture.to_dict()
+            state = RunCompanyStateModel(
+                run_id=run_id,
+                fixture_id=fixture_model.fixture_id,
+                fixture_revision=fixture_model.revision,
+                fixture_digest=fixture_model.canonical_digest,
+                reference_time=_timestamp(cast(str, document["reference_time"])),
+            )
+            self._session.add(state)
+            self._session.flush()
+            self._insert_company_entities(run_id, document)
+            self._session.flush()
+        return self._company_state_record(state)
+
+    def get_run_company_state(self, run_id: str) -> SyntheticCompanyState | None:
+        """Read a deterministic immutable snapshot of one Run-local company state."""
+        state = self._session.get(RunCompanyStateModel, run_id)
+        return None if state is None else self._company_state_record(state)
 
     def claim_next_run(
         self,
@@ -740,6 +942,202 @@ class PersistenceRepository:
         model = self._session.scalar(select(RunReportModel).where(RunReportModel.run_id == run_id))
         return None if model is None else self._report_record(model)
 
+    def _insert_company_entities(self, run_id: str, document: dict[str, object]) -> None:
+        customers = cast(list[dict[str, object]], document["customers"])
+        orders = cast(list[dict[str, object]], document["orders"])
+        shipments = cast(list[dict[str, object]], document["shipments"])
+        payments = cast(list[dict[str, object]], document["payments"])
+        refunds = cast(list[dict[str, object]], document["refunds"])
+        tickets = cast(list[dict[str, object]], document["support_tickets"])
+        self._session.add_all(
+            CompanyCustomerModel(
+                run_id=run_id,
+                customer_id=cast(str, row["customer_id"]),
+                name=cast(str, row["name"]),
+                email=cast(str, row["email"]),
+                status=cast(str, row["status"]),
+            )
+            for row in customers
+        )
+        self._session.flush()
+        self._session.add_all(
+            CompanyOrderModel(
+                run_id=run_id,
+                order_id=cast(str, row["order_id"]),
+                customer_id=cast(str, row["customer_id"]),
+                status=cast(str, row["status"]),
+                currency=cast(str, row["currency"]),
+                total_minor=cast(int, row["total_minor"]),
+                placed_at=_timestamp(cast(str, row["placed_at"])),
+            )
+            for row in orders
+        )
+        self._session.flush()
+        self._session.add_all(
+            CompanyShipmentModel(
+                run_id=run_id,
+                shipment_id=cast(str, row["shipment_id"]),
+                order_id=cast(str, row["order_id"]),
+                status=cast(str, row["status"]),
+                carrier=cast(str, row["carrier"]),
+                tracking_number=cast(str, row["tracking_number"]),
+                updated_at=_timestamp(cast(str, row["updated_at"])),
+            )
+            for row in shipments
+        )
+        self._session.add_all(
+            CompanyPaymentModel(
+                run_id=run_id,
+                payment_id=cast(str, row["payment_id"]),
+                order_id=cast(str, row["order_id"]),
+                status=cast(str, row["status"]),
+                currency=cast(str, row["currency"]),
+                amount_minor=cast(int, row["amount_minor"]),
+                captured_at=_timestamp(cast(str, row["captured_at"])),
+            )
+            for row in payments
+        )
+        self._session.flush()
+        self._session.add_all(
+            CompanyRefundModel(
+                run_id=run_id,
+                refund_id=cast(str, row["refund_id"]),
+                payment_id=cast(str, row["payment_id"]),
+                order_id=cast(str, row["order_id"]),
+                status=cast(str, row["status"]),
+                amount_minor=cast(int, row["amount_minor"]),
+                reason=cast(str, row["reason"]),
+                created_at=_timestamp(cast(str, row["created_at"])),
+            )
+            for row in refunds
+        )
+        self._session.add_all(
+            CompanySupportTicketModel(
+                run_id=run_id,
+                ticket_id=cast(str, row["ticket_id"]),
+                customer_id=cast(str, row["customer_id"]),
+                order_id=cast(str, row["order_id"]),
+                status=cast(str, row["status"]),
+                subject=cast(str, row["subject"]),
+                note=cast(str, row["note"]),
+                updated_at=_timestamp(cast(str, row["updated_at"])),
+            )
+            for row in tickets
+        )
+
+    def _company_state_record(self, state: RunCompanyStateModel) -> SyntheticCompanyState:
+        run_id = state.run_id
+        customers = self._session.scalars(
+            select(CompanyCustomerModel)
+            .where(CompanyCustomerModel.run_id == run_id)
+            .order_by(CompanyCustomerModel.customer_id)
+        )
+        orders = self._session.scalars(
+            select(CompanyOrderModel)
+            .where(CompanyOrderModel.run_id == run_id)
+            .order_by(CompanyOrderModel.order_id)
+        )
+        shipments = self._session.scalars(
+            select(CompanyShipmentModel)
+            .where(CompanyShipmentModel.run_id == run_id)
+            .order_by(CompanyShipmentModel.shipment_id)
+        )
+        payments = self._session.scalars(
+            select(CompanyPaymentModel)
+            .where(CompanyPaymentModel.run_id == run_id)
+            .order_by(CompanyPaymentModel.payment_id)
+        )
+        refunds = self._session.scalars(
+            select(CompanyRefundModel)
+            .where(CompanyRefundModel.run_id == run_id)
+            .order_by(CompanyRefundModel.refund_id)
+        )
+        tickets = self._session.scalars(
+            select(CompanySupportTicketModel)
+            .where(CompanySupportTicketModel.run_id == run_id)
+            .order_by(CompanySupportTicketModel.ticket_id)
+        )
+        return SyntheticCompanyState(
+            run_id=run_id,
+            fixture=RevisionReference(
+                state.fixture_id, state.fixture_revision, state.fixture_digest
+            ),
+            reference_time=state.reference_time,
+            customers=tuple(
+                CompanyCustomer(row.customer_id, row.name, row.email, row.status)
+                for row in customers
+            ),
+            orders=tuple(
+                CompanyOrder(
+                    row.order_id,
+                    row.customer_id,
+                    row.status,
+                    row.currency,
+                    row.total_minor,
+                    row.placed_at,
+                )
+                for row in orders
+            ),
+            shipments=tuple(
+                CompanyShipment(
+                    row.shipment_id,
+                    row.order_id,
+                    row.status,
+                    row.carrier,
+                    row.tracking_number,
+                    row.updated_at,
+                )
+                for row in shipments
+            ),
+            payments=tuple(
+                CompanyPayment(
+                    row.payment_id,
+                    row.order_id,
+                    row.status,
+                    row.currency,
+                    row.amount_minor,
+                    row.captured_at,
+                )
+                for row in payments
+            ),
+            refunds=tuple(
+                CompanyRefund(
+                    row.refund_id,
+                    row.payment_id,
+                    row.order_id,
+                    row.status,
+                    row.amount_minor,
+                    row.reason,
+                    row.created_at,
+                )
+                for row in refunds
+            ),
+            support_tickets=tuple(
+                CompanySupportTicket(
+                    row.ticket_id,
+                    row.customer_id,
+                    row.order_id,
+                    row.status,
+                    row.subject,
+                    row.note,
+                    row.updated_at,
+                )
+                for row in tickets
+            ),
+        )
+
+    def _same_fixture_or_conflict(
+        self, model: FixtureRevisionModel, fixture: Fixture
+    ) -> FixtureRevisionRecord:
+        if (
+            model.canonical_digest != fixture.digest
+            or model.canonical_document != fixture.to_dict()
+        ):
+            raise RevisionConflictError(
+                f"fixture revision {(model.fixture_id, model.revision)!r} has different content"
+            )
+        return self._fixture_record(model)
+
     def _same_scenario_or_conflict(
         self, model: ScenarioRevisionModel, scenario: Scenario
     ) -> ScenarioRevisionRecord:
@@ -920,6 +1318,18 @@ class PersistenceRepository:
         return ScenarioRevisionRecord(scenario, model.created_at, model.created_by)
 
     @staticmethod
+    def _fixture_record(model: FixtureRevisionModel) -> FixtureRevisionRecord:
+        try:
+            fixture = loads_fixture(_json_text(model.canonical_document))
+        except FixtureValidationError as error:
+            raise PersistenceIntegrityError(
+                "stored fixture document violates its contract"
+            ) from error
+        if fixture.digest != model.canonical_digest:
+            raise PersistenceIntegrityError("stored fixture document does not match its digest")
+        return FixtureRevisionRecord(fixture, model.created_at, model.created_by)
+
+    @staticmethod
     def _agent_configuration_record(
         model: AgentConfigurationRevisionModel,
     ) -> AgentConfigurationRevisionRecord:
@@ -931,6 +1341,15 @@ class PersistenceRepository:
 
     @staticmethod
     def _run_record(model: RunModel) -> RunRecord:
+        fixture = None
+        if (
+            model.fixture_id is not None
+            and model.fixture_revision is not None
+            and model.fixture_digest is not None
+        ):
+            fixture = RevisionReference(
+                model.fixture_id, model.fixture_revision, model.fixture_digest
+            )
         return RunRecord(
             run_id=model.run_id,
             scenario=RevisionReference(
@@ -941,6 +1360,7 @@ class PersistenceRepository:
                 model.agent_configuration_revision,
                 model.agent_configuration_digest,
             ),
+            fixture=fixture,
             status=parse_run_status(model.status),
             lifecycle_version=model.lifecycle_version,
             lease_owner=model.lease_owner,

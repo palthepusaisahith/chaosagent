@@ -2,25 +2,28 @@
 
 ## Scope and ownership
 
-This package is the PostgreSQL adapter introduced by Issue #5. It persists
-validated Scenario revisions, unresolved Agent Configuration revision
-references, structural Runs, Run Event evidence, and one final Run Report per
-Run. It does not implement campaign expansion, run transitions, leases, workers,
-evaluation, tool/fault behavior, or event streaming.
+This package is the PostgreSQL adapter introduced by Issue #5 and extended by
+Issues #6–#7. It persists validated Scenario and Fixture revisions, unresolved
+Agent Configuration revision references, Runs, isolated Run-local synthetic
+company state, Run Event evidence, and one final Run Report per Run. It does not
+implement workers, evaluation, agent-facing tools, fault behavior, or streaming.
 
 The tables have deliberately different responsibilities:
 
 - `scenario_revisions` stores the validated canonical Scenario JSON value, its
   schema version and JCS SHA-256 digest, plus creation metadata.
+- `fixture_revisions` stores immutable validated Fixture v0 documents and their
+  canonical digests. Mutable Run-local company rows are described in the Fixture
+  documentation.
 - `agent_configuration_revisions` is only an immutable `{id, revision, digest}`
   reference registry. There is no Agent Configuration contract yet, so this
   table does not claim that the referenced content was loaded or that its digest
   was independently verified. In particular, the all-zero digest in structural
   examples remains an explicit unresolved placeholder.
 - `runs` assigns a stable Run ID and freezes the Scenario and Agent
-  Configuration keys _and digests_. Issue #6 now makes its `status`
-  authoritative through the documented lifecycle/lease protocol. A final report
-  can be inserted only for a matching terminal Run status.
+  Configuration keys _and digests_. New Issue #7 Runs also freeze the Fixture
+  reference resolved from their Scenario. Issue #6 makes `status` authoritative
+  through the lifecycle/lease protocol.
 - `run_events` stores each validated Run Event document and the small set of
   envelope columns needed for identity, ordering, and later replay queries.
 - `run_reports` stores one validated, final Run Report document per Run. V0 does
@@ -64,10 +67,9 @@ stored digest, detecting corruption or privileged out-of-band writes.
 ## Immutability and append-only guarantees
 
 The repository returns frozen records containing immutable validated contract
-wrappers and exposes no update/delete API for Scenario revisions, Agent
-Configuration references, events, or reports. The migration also installs
-row-level `BEFORE UPDATE OR DELETE` triggers for those four tables and revokes
-those operations from `PUBLIC`.
+wrappers and exposes no update/delete API for Scenario revisions, Fixture
+revisions, Agent Configuration references, events, or reports. Migrations also
+install row-level `BEFORE UPDATE OR DELETE` triggers for those immutable tables.
 
 This is a database-level guard for normal DML, not an absolute tamper-proof
 ledger. A database owner or superuser can disable/drop triggers, change schema,
@@ -102,13 +104,15 @@ At PostgreSQL's default `READ COMMITTED` isolation:
 - an identical final-report retry is idempotent, while any different report for
   that Run raises `FinalReportConflictError`.
 
-The event producer assigns the positive sequence. The repository never derives
-`MAX(sequence) + 1`, because that would be a race-prone hidden allocator.
-Concurrent writers may insert different sequence values in either commit order;
-sequence is the authoritative logical order, not insertion time, `occurred_at`,
-or `recorded_at`. PostgreSQL's unique constraint serializes a collision so
-exactly one same-sequence insert wins. Fetches always order by sequence, and Run
-Event v0 intentionally permits gaps.
+Ordinary event producers assign the positive sequence. Issue #6 lifecycle
+mutations are the bounded exception: while holding the Run row lock they derive
+the next lifecycle evidence sequence, and ordinary appends take that same lock
+before insertion. Concurrent writers may insert different caller-assigned
+sequence values in either commit order; sequence remains the authoritative
+logical order, not insertion time, `occurred_at`, or `recorded_at`. PostgreSQL's
+unique constraint serializes a collision so exactly one same-sequence insert
+wins. Fetches always order by sequence, and Run Event v0 intentionally permits
+gaps.
 
 ## Migrations and local PostgreSQL
 
@@ -146,13 +150,13 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #6
+## Deferred beyond Issue #7
 
 - worker processes/daemons and automatic recovery scheduling;
 - downstream propagation of committed Run ownership/fencing identities to later
   business effects;
 - Campaign persistence and campaign statistics;
-- synthetic-company state, tools, fault activations, approvals, evaluators, SSE,
-  telemetry, exports, and deployment role creation;
+- agent-facing synthetic-company tools and mutation APIs, fault activations,
+  approvals, evaluators, SSE, telemetry, exports, and deployment role creation;
 - an actual versioned Agent Configuration document contract;
 - any report rebuild/version history policy.

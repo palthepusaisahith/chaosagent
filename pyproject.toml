@@ -22,6 +22,7 @@ build-constraint-dependencies = ["hatchling==1.32.0"]
 [tool.uv.workspace]
 members = [
     "packages/evidence",
+    "packages/fixtures",
     "packages/persistence",
     "packages/scenarios",
     "services/control-plane",
@@ -42,6 +43,7 @@ python_version = "3.12"
 strict = true
 files = [
     "packages/evidence/src",
+    "packages/fixtures/src",
     "packages/persistence/src",
     "packages/scenarios/src",
     "services/control-plane/src",

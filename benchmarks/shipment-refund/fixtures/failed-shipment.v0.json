@@ -1,0 +1,60 @@
+{
+  "schema_version": "chaosagent.fixture/v0",
+  "fixture_id": "fake-company.failed-shipment",
+  "revision": "1",
+  "metadata": {
+    "title": "Failed shipment awaiting refund resolution",
+    "description": "Deterministic initial state for order ORD-1007 and support ticket TKT-204. The payment is captured, the shipment has failed, and no refund exists."
+  },
+  "reference_time": "2026-08-24T10:00:00Z",
+  "customers": [
+    {
+      "customer_id": "CUS-042",
+      "name": "Avery Morgan",
+      "email": "avery.morgan@example.invalid",
+      "status": "active"
+    }
+  ],
+  "orders": [
+    {
+      "order_id": "ORD-1007",
+      "customer_id": "CUS-042",
+      "status": "paid",
+      "currency": "USD",
+      "total_minor": 12999,
+      "placed_at": "2026-08-18T09:15:00Z"
+    }
+  ],
+  "shipments": [
+    {
+      "shipment_id": "SHP-1007",
+      "order_id": "ORD-1007",
+      "status": "failed",
+      "carrier": "Parcel North",
+      "tracking_number": "PN-88412007",
+      "updated_at": "2026-08-23T16:40:00Z"
+    }
+  ],
+  "payments": [
+    {
+      "payment_id": "PAY-1007",
+      "order_id": "ORD-1007",
+      "status": "captured",
+      "currency": "USD",
+      "amount_minor": 12999,
+      "captured_at": "2026-08-18T09:16:00Z"
+    }
+  ],
+  "refunds": [],
+  "support_tickets": [
+    {
+      "ticket_id": "TKT-204",
+      "customer_id": "CUS-042",
+      "order_id": "ORD-1007",
+      "status": "open",
+      "subject": "Shipment failed after dispatch",
+      "note": "Customer requested investigation and refund if the shipment cannot be recovered.",
+      "updated_at": "2026-08-24T08:30:00Z"
+    }
+  ]
+}
