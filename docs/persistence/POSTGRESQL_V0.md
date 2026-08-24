@@ -18,13 +18,9 @@ The tables have deliberately different responsibilities:
   was independently verified. In particular, the all-zero digest in structural
   examples remains an explicit unresolved placeholder.
 - `runs` assigns a stable Run ID and freezes the Scenario and Agent
-  Configuration keys _and digests_. Its `status` column has the architecture's
-  allowed vocabulary and defaults to `queued`; Issue #5 provides no update or
-  transition API. Until Issue #6 implements the lifecycle state machine,
-  `runs.status` is structural and is not asserted to agree with a stored final
-  report. A Run Report's `run_status` is authoritative only for that immutable
-  report document; Issue #6 will make `runs.status` authoritative for live Run
-  lifecycle and define the cross-document terminal-status invariant.
+  Configuration keys _and digests_. Issue #6 now makes its `status`
+  authoritative through the documented lifecycle/lease protocol. A final report
+  can be inserted only for a matching terminal Run status.
 - `run_events` stores each validated Run Event document and the small set of
   envelope columns needed for identity, ordering, and later replay queries.
 - `run_reports` stores one validated, final Run Report document per Run. V0 does
@@ -81,8 +77,9 @@ own these tables and should receive only `SELECT`/`INSERT` on immutable tables.
 `TRUNCATE` and DDL must not be granted. The migration intentionally does not
 create cluster-global roles.
 
-Runs are not immutable at the database layer because Issue #6 will add guarded
-lifecycle transitions. This package currently exposes creation and fetch only.
+Runs are deliberately mutable only through the Issue #6 lifecycle CAS methods.
+See [`RUN_LIFECYCLE_LEASES.md`](RUN_LIFECYCLE_LEASES.md) for their state,
+ownership, recovery, and evidence guarantees.
 
 ## Transactions, conflicts, and event ordering
 
@@ -149,10 +146,11 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred to Issue #6 and later
+## Deferred beyond Issue #6
 
-- legal run-transition enforcement, optimistic versions, leases, workers,
-  heartbeat/reaper behavior, and sequence allocation ownership;
+- worker processes/daemons and automatic recovery scheduling;
+- downstream propagation of committed Run ownership/fencing identities to later
+  business effects;
 - Campaign persistence and campaign statistics;
 - synthetic-company state, tools, fault activations, approvals, evaluators, SSE,
   telemetry, exports, and deployment role creation;

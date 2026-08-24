@@ -4,22 +4,34 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import NoReturn, cast
 
 from chaosagent_evidence import (
     EvidenceValidationError,
     RunEvent,
     RunReport,
+    digest_payload_v0,
     loads_run_event,
     loads_run_report,
 )
 from chaosagent_scenarios import Scenario, ScenarioValidationError, loads_scenario
-from sqlalchemy import Engine, Select, create_engine, select
+from sqlalchemy import Engine, Select, create_engine, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .lifecycle import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
+    RunStatus,
+    parse_run_status,
+    require_claim_transition,
+    require_owned_transition,
+    require_recovery_transition,
+    require_unleased_transition,
+)
 from .models import (
     IDENTIFIER_CHECK,
     REVISION_CHECK,
@@ -75,6 +87,22 @@ class PersistenceProfileError(PersistenceError):
     """Raised when valid contract JSON cannot be represented by the V0 JSONB profile."""
 
 
+class LifecycleConflictError(PersistenceConflictError):
+    """Raised when a lifecycle compare-and-swap predicate is stale."""
+
+
+class StaleLeaseError(LifecycleConflictError):
+    """Raised when a worker no longer owns the current fencing generation."""
+
+
+class LeaseExpiredError(LifecycleConflictError):
+    """Raised when the otherwise-current lease is already expired."""
+
+
+class LeaseNotExpiredError(LifecycleConflictError):
+    """Raised when recovery is attempted before the database lease expires."""
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionReference:
     id: str
@@ -101,9 +129,45 @@ class RunRecord:
     run_id: str
     scenario: RevisionReference
     agent_configuration: RevisionReference
-    status: str
+    status: RunStatus
+    lifecycle_version: int
+    lease_owner: str | None
+    lease_token: str | None
+    lease_expires_at: datetime | None
+    heartbeat_at: datetime | None
+    attempt: int
     created_at: datetime
     created_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseIdentity:
+    """Opaque worker credentials plus the transactional attempt generation."""
+
+    run_id: str
+    worker_id: str
+    lease_token: str
+    attempt: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedRun:
+    """A Run snapshot paired with credentials needed for later mutations."""
+
+    run: RunRecord
+    lease: LeaseIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleEvidence:
+    """Caller-owned Event v0 fields excluding repository-allocated Run sequence."""
+
+    event_id: str
+    producer_component: str
+    producer_instance_id: str | None = None
+    correlation_id: str | None = None
+    causation_event_id: str | None = None
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,12 +382,268 @@ class PersistenceRepository:
         model = self._session.get(RunModel, run_id)
         return None if model is None else self._run_record(model)
 
+    def claim_next_run(
+        self,
+        worker_id: str,
+        *,
+        lease_duration_seconds: int,
+        evidence: LifecycleEvidence,
+        run_id: str | None = None,
+    ) -> ClaimedRun | None:
+        """Claim the oldest queued Run using ``FOR UPDATE SKIP LOCKED``.
+
+        The row lock and all writes remain part of the caller-owned transaction.
+        A matching lifecycle Event v0 insert is required in the same savepoint.
+        Omitting ``run_id`` selects from the global visible queue; supplying it
+        returns ``None`` when that specific Run is absent, locked, or ineligible.
+        """
+        _require_identifier(worker_id, "worker_id")
+        _require_lease_duration(lease_duration_seconds)
+        if run_id is not None:
+            _require_identifier(run_id, "run_id")
+        model: RunModel | None = None
+        lease_token = f"lease-{secrets.token_hex(16)}"
+        with self._session.begin_nested():
+            query = (
+                select(RunModel)
+                .where(RunModel.status == "queued")
+                .order_by(RunModel.created_at, RunModel.run_id)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+                .execution_options(populate_existing=True)
+            )
+            if run_id is not None:
+                query = query.where(RunModel.run_id == run_id)
+            candidate = self._session.scalar(query)
+            if candidate is None:
+                return None
+            source = parse_run_status(candidate.status)
+            require_claim_transition(source, "provisioning")
+            model = self._session.scalar(
+                update(RunModel)
+                .where(
+                    RunModel.run_id == candidate.run_id,
+                    RunModel.status == source,
+                    RunModel.lifecycle_version == candidate.lifecycle_version,
+                    RunModel.lease_owner.is_(None),
+                    RunModel.lease_token.is_(None),
+                )
+                .values(
+                    status="provisioning",
+                    lifecycle_version=RunModel.lifecycle_version + 1,
+                    lease_owner=worker_id,
+                    lease_token=lease_token,
+                    heartbeat_at=func.clock_timestamp(),
+                    lease_expires_at=text(
+                        "clock_timestamp() + make_interval(secs => :lease_duration_seconds)"
+                    ),
+                    attempt=RunModel.attempt + 1,
+                )
+                .returning(RunModel),
+                {"lease_duration_seconds": lease_duration_seconds},
+            )
+            if model is None:
+                raise LifecycleConflictError(
+                    f"queued run {candidate.run_id!r} changed while being claimed"
+                )
+            occurred_at = self._database_clock()
+            self._append_lifecycle_event(
+                model.run_id,
+                previous_state=source,
+                state="provisioning",
+                occurred_at=occurred_at,
+                evidence=evidence,
+            )
+        record = self._run_record(model)
+        return ClaimedRun(
+            record,
+            LeaseIdentity(model.run_id, worker_id, lease_token, model.attempt),
+        )
+
+    def heartbeat(
+        self,
+        lease: LeaseIdentity,
+        *,
+        expected_version: int,
+        lease_duration_seconds: int,
+    ) -> ClaimedRun:
+        """Extend only the current, unexpired lease generation using database time."""
+        _validate_lease_identity(lease)
+        _require_expected_version(expected_version)
+        _require_lease_duration(lease_duration_seconds)
+        model = self._session.scalar(
+            update(RunModel)
+            .where(
+                RunModel.run_id == lease.run_id,
+                RunModel.status.in_(ACTIVE_STATUSES),
+                RunModel.lifecycle_version == expected_version,
+                RunModel.lease_owner == lease.worker_id,
+                RunModel.lease_token == lease.lease_token,
+                RunModel.attempt == lease.attempt,
+                RunModel.lease_expires_at > func.clock_timestamp(),
+            )
+            .values(
+                lifecycle_version=RunModel.lifecycle_version + 1,
+                heartbeat_at=func.clock_timestamp(),
+                lease_expires_at=text(
+                    "clock_timestamp() + make_interval(secs => :lease_duration_seconds)"
+                ),
+            )
+            .returning(RunModel),
+            {"lease_duration_seconds": lease_duration_seconds},
+        )
+        if model is None:
+            self._raise_lease_mutation_failure(lease, expected_version)
+        return ClaimedRun(self._run_record(model), lease)
+
+    def transition_owned_run(
+        self,
+        lease: LeaseIdentity,
+        target_status: RunStatus,
+        *,
+        expected_version: int,
+        evidence: LifecycleEvidence,
+    ) -> RunRecord:
+        """CAS-transition a Run while proving the current, unexpired lease."""
+        _validate_lease_identity(lease)
+        _require_expected_version(expected_version)
+        current = self._fresh_run(lease.run_id)
+        source = parse_run_status(current.status)
+        require_owned_transition(source, target_status)
+        clearing_lease = target_status in TERMINAL_STATUSES
+        values: dict[str, object] = {
+            "status": target_status,
+            "lifecycle_version": RunModel.lifecycle_version + 1,
+        }
+        if clearing_lease:
+            values.update(
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+            )
+        with self._session.begin_nested():
+            model = self._session.scalar(
+                update(RunModel)
+                .where(
+                    RunModel.run_id == lease.run_id,
+                    RunModel.status == source,
+                    RunModel.lifecycle_version == expected_version,
+                    RunModel.lease_owner == lease.worker_id,
+                    RunModel.lease_token == lease.lease_token,
+                    RunModel.attempt == lease.attempt,
+                    RunModel.lease_expires_at > func.clock_timestamp(),
+                )
+                .values(**values)
+                .returning(RunModel)
+            )
+            if model is None:
+                self._raise_lease_mutation_failure(lease, expected_version)
+            self._append_lifecycle_event(
+                model.run_id,
+                previous_state=source,
+                state=target_status,
+                occurred_at=self._database_clock(),
+                evidence=evidence,
+            )
+        return self._run_record(model)
+
+    def cancel_queued_run(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        evidence: LifecycleEvidence,
+    ) -> RunRecord:
+        """Cancel an unclaimed queued Run with a lifecycle CAS and evidence."""
+        _require_expected_version(expected_version)
+        current = self._fresh_run(run_id)
+        source = parse_run_status(current.status)
+        require_unleased_transition(source, "cancelled")
+        with self._session.begin_nested():
+            model = self._session.scalar(
+                update(RunModel)
+                .where(
+                    RunModel.run_id == run_id,
+                    RunModel.status == source,
+                    RunModel.lifecycle_version == expected_version,
+                    RunModel.lease_owner.is_(None),
+                    RunModel.lease_token.is_(None),
+                )
+                .values(status="cancelled", lifecycle_version=RunModel.lifecycle_version + 1)
+                .returning(RunModel)
+            )
+            if model is None:
+                self._raise_unleased_mutation_failure(run_id, expected_version)
+            self._append_lifecycle_event(
+                model.run_id,
+                previous_state=source,
+                state="cancelled",
+                occurred_at=self._database_clock(),
+                evidence=evidence,
+            )
+        return self._run_record(model)
+
+    def requeue_expired_run(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        evidence: LifecycleEvidence,
+    ) -> RunRecord:
+        """Fence and requeue one expired active Run; no scheduler is implied."""
+        _require_expected_version(expected_version)
+        current = self._fresh_run(run_id)
+        source = parse_run_status(current.status)
+        require_recovery_transition(source, "queued")
+        with self._session.begin_nested():
+            model = self._session.scalar(
+                update(RunModel)
+                .where(
+                    RunModel.run_id == run_id,
+                    RunModel.status == source,
+                    RunModel.lifecycle_version == expected_version,
+                    RunModel.lease_expires_at <= func.clock_timestamp(),
+                )
+                .values(
+                    status="queued",
+                    lifecycle_version=RunModel.lifecycle_version + 1,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                )
+                .returning(RunModel)
+            )
+            if model is None:
+                refreshed = self._fresh_run(run_id)
+                if refreshed.lifecycle_version != expected_version:
+                    raise LifecycleConflictError(
+                        f"run {run_id!r} lifecycle version is now "
+                        f"{refreshed.lifecycle_version}, expected {expected_version}"
+                    )
+                raise LeaseNotExpiredError(f"run {run_id!r} lease has not expired")
+            self._append_lifecycle_event(
+                model.run_id,
+                previous_state=source,
+                state="queued",
+                occurred_at=self._database_clock(),
+                evidence=evidence,
+            )
+        return self._run_record(model)
+
     def append_event(self, event: RunEvent) -> RunEventRecord:
         document = event.to_dict()
         _validate_jsonb_persistence_profile(document, "run event")
         event_id = cast(str, document["event_id"])
         run_id = cast(str, document["run_id"])
-        if self._session.get(RunModel, run_id) is None:
+        # Serializing all evidence appends on the Run row makes the bounded
+        # lifecycle MAX(sequence)+1 allocator safe relative to caller-sequenced
+        # Event v0 appends. This does not allocate ordinary event sequences.
+        run_exists = self._session.scalar(
+            select(RunModel.run_id).where(RunModel.run_id == run_id).with_for_update()
+        )
+        if run_exists is None:
             raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
         model = RunEventModel(
             event_id=event_id,
@@ -367,9 +687,13 @@ class PersistenceRepository:
         _validate_jsonb_persistence_profile(document, "run report")
         report_id = cast(str, document["report_id"])
         run_id = cast(str, document["run_id"])
-        run = self._session.get(RunModel, run_id)
-        if run is None:
-            raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
+        run = self._fresh_run(run_id)
+        if parse_run_status(run.status) not in TERMINAL_STATUSES:
+            raise PersistenceIntegrityError(
+                f"final report cannot be stored while run {run_id!r} is {run.status!r}"
+            )
+        if document["run_status"] != run.status:
+            raise PersistenceIntegrityError("report run_status does not match the terminal run")
         self._verify_report_references(document, run)
 
         existing_run_report = self._session.scalar(
@@ -467,6 +791,103 @@ class PersistenceRepository:
             raise FinalReportConflictError(f"run {model.run_id!r} already has a different report")
         return self._report_record(model)
 
+    def _append_lifecycle_event(
+        self,
+        run_id: str,
+        *,
+        previous_state: RunStatus,
+        state: RunStatus,
+        occurred_at: datetime,
+        evidence: LifecycleEvidence,
+    ) -> None:
+        producer: dict[str, object] = {"component": evidence.producer_component}
+        if evidence.producer_instance_id is not None:
+            producer["instance_id"] = evidence.producer_instance_id
+        payload: dict[str, object] = {
+            "state": state,
+            "previous_state": previous_state,
+        }
+        if evidence.reason_code is not None:
+            payload["reason_code"] = evidence.reason_code
+        document: dict[str, object] = {
+            "schema_version": "chaosagent.run-event/v0",
+            "event_id": evidence.event_id,
+            "run_id": run_id,
+            "sequence": self._next_lifecycle_event_sequence(run_id),
+            "occurred_at": _event_timestamp(occurred_at),
+            "recorded_at": _event_timestamp(occurred_at),
+            "event_type": "run.lifecycle",
+            "producer": producer,
+            "correlation_id": evidence.correlation_id or run_id,
+            "payload": payload,
+            "payload_digest": digest_payload_v0(payload),
+        }
+        if evidence.causation_event_id is not None:
+            document["causation_event_id"] = evidence.causation_event_id
+        self.append_event(loads_run_event(json.dumps(document)))
+
+    def _next_lifecycle_event_sequence(self, run_id: str) -> int:
+        """Allocate only a lifecycle evidence sequence while the Run row is locked."""
+        current = self._session.scalar(
+            select(func.coalesce(func.max(RunEventModel.sequence), 0)).where(
+                RunEventModel.run_id == run_id
+            )
+        )
+        sequence = cast(int, current) + 1
+        if sequence > 9_007_199_254_740_991:
+            raise PersistenceIntegrityError(
+                f"run {run_id!r} exhausted the Event v0 safe-integer sequence range"
+            )
+        return sequence
+
+    def _raise_lease_mutation_failure(
+        self, lease: LeaseIdentity, expected_version: int
+    ) -> NoReturn:
+        current = self._fresh_run(lease.run_id)
+        if (
+            current.status not in ACTIVE_STATUSES
+            or current.lease_owner != lease.worker_id
+            or current.lease_token != lease.lease_token
+            or current.attempt != lease.attempt
+        ):
+            raise StaleLeaseError(
+                f"worker {lease.worker_id!r} no longer owns run {lease.run_id!r} "
+                f"attempt {lease.attempt}"
+            )
+        if current.lease_expires_at is None or current.lease_expires_at <= self._database_clock():
+            raise LeaseExpiredError(f"run {lease.run_id!r} lease has expired")
+        if current.lifecycle_version != expected_version:
+            raise LifecycleConflictError(
+                f"run {lease.run_id!r} lifecycle version is now "
+                f"{current.lifecycle_version}, expected {expected_version}"
+            )
+        raise LifecycleConflictError(f"run {lease.run_id!r} lifecycle mutation lost its CAS")
+
+    def _raise_unleased_mutation_failure(self, run_id: str, expected_version: int) -> NoReturn:
+        current = self._fresh_run(run_id)
+        if current.lifecycle_version != expected_version:
+            raise LifecycleConflictError(
+                f"run {run_id!r} lifecycle version is now "
+                f"{current.lifecycle_version}, expected {expected_version}"
+            )
+        raise LifecycleConflictError(f"run {run_id!r} is no longer eligible for mutation")
+
+    def _fresh_run(self, run_id: str) -> RunModel:
+        model = self._session.scalar(
+            select(RunModel)
+            .where(RunModel.run_id == run_id)
+            .execution_options(populate_existing=True)
+        )
+        if model is None:
+            raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
+        return model
+
+    def _database_clock(self) -> datetime:
+        value = self._session.scalar(select(func.clock_timestamp()))
+        if value is None:
+            raise PersistenceIntegrityError("PostgreSQL did not return its current timestamp")
+        return cast(datetime, value)
+
     @staticmethod
     def _verify_report_references(document: dict[str, object], run: RunModel) -> None:
         scenario = cast(dict[str, object], document["scenario"])
@@ -520,7 +941,13 @@ class PersistenceRepository:
                 model.agent_configuration_revision,
                 model.agent_configuration_digest,
             ),
-            status=model.status,
+            status=parse_run_status(model.status),
+            lifecycle_version=model.lifecycle_version,
+            lease_owner=model.lease_owner,
+            lease_token=model.lease_token,
+            lease_expires_at=model.lease_expires_at,
+            heartbeat_at=model.heartbeat_at,
+            attempt=model.attempt,
             created_at=model.created_at,
             created_by=model.created_by,
         )
@@ -551,3 +978,27 @@ def _timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("contract timestamp must include a timezone")
     return parsed
+
+
+def _require_expected_version(value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("expected_version must be a non-negative integer")
+
+
+def _require_lease_duration(value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 86_400:
+        raise ValueError("lease_duration_seconds must be between 1 and 86400")
+
+
+def _validate_lease_identity(lease: LeaseIdentity) -> None:
+    _require_identifier(lease.run_id, "lease.run_id")
+    _require_identifier(lease.worker_id, "lease.worker_id")
+    _require_identifier(lease.lease_token, "lease.lease_token")
+    if isinstance(lease.attempt, bool) or lease.attempt < 1:
+        raise ValueError("lease.attempt must be a positive integer")
+
+
+def _event_timestamp(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise PersistenceIntegrityError("database timestamp unexpectedly lacks a timezone")
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")

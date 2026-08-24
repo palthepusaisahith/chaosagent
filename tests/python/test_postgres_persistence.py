@@ -4,9 +4,10 @@ import json
 import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
+from time import monotonic
 from typing import cast
 from uuid import uuid4
 
@@ -20,16 +21,22 @@ from chaosagent_evidence import (
     loads_run_report,
 )
 from chaosagent_persistence import (
+    ClaimedRun,
     DuplicateEventIDError,
     EventIdentityAndSequenceConflictError,
     EventSequenceConflictError,
     FinalReportConflictError,
+    IllegalRunTransitionError,
+    LeaseExpiredError,
+    LifecycleConflictError,
+    LifecycleEvidence,
     PersistenceConflictError,
     PersistenceIntegrityError,
     PersistenceProfileError,
     PersistenceRepository,
     RevisionConflictError,
     RevisionReference,
+    StaleLeaseError,
     create_postgres_engine,
 )
 from chaosagent_scenarios import (
@@ -126,6 +133,45 @@ def _seed_run(session: Session, run_id: str) -> None:
     )
 
 
+def _lifecycle_evidence(sequence: int) -> LifecycleEvidence:
+    return LifecycleEvidence(
+        event_id=_unique(f"lifecycle-event-{sequence}"),
+        producer_component="run-controller",
+        producer_instance_id="test-worker",
+    )
+
+
+def _complete_run(
+    repository: PersistenceRepository, run_id: str, worker_id: str = "test-worker"
+) -> ClaimedRun:
+    claimed = repository.claim_next_run(
+        worker_id,
+        lease_duration_seconds=60,
+        evidence=_lifecycle_evidence(1),
+        run_id=run_id,
+    )
+    assert claimed is not None
+    running = repository.transition_owned_run(
+        claimed.lease,
+        "running",
+        expected_version=claimed.run.lifecycle_version,
+        evidence=_lifecycle_evidence(2),
+    )
+    evaluating = repository.transition_owned_run(
+        claimed.lease,
+        "evaluating",
+        expected_version=running.lifecycle_version,
+        evidence=_lifecycle_evidence(3),
+    )
+    completed = repository.transition_owned_run(
+        claimed.lease,
+        "completed",
+        expected_version=evaluating.lifecycle_version,
+        evidence=_lifecycle_evidence(4),
+    )
+    return ClaimedRun(completed, claimed.lease)
+
+
 def _assert_raw_insert_rejected(
     engine: Engine, statement: str, parameters: dict[str, object]
 ) -> None:
@@ -205,6 +251,26 @@ def _execute_raw_insert(
     connection.execute(text(statement), parameters)
 
 
+def _wait_for_database_block(engine: Engine, application_name: str) -> None:
+    """Wait until PostgreSQL proves the named test session is lock-blocked."""
+    deadline = monotonic() + 10
+    while monotonic() < deadline:
+        with engine.connect() as connection:
+            blocked = connection.scalar(
+                text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE application_name = :application_name "
+                    "AND cardinality(pg_blocking_pids(pid)) > 0)"
+                ),
+                {"application_name": application_name},
+            )
+        if blocked:
+            return
+        Event().wait(0.01)
+    raise AssertionError(f"session {application_name!r} never became lock-blocked")
+
+
 def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> None:
     configuration = Config(str(ALEMBIC_INI))
     command.downgrade(configuration, "base")
@@ -228,6 +294,136 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
         assert connection.scalar(
             text("SELECT to_regprocedure('public.chaosagent_reject_immutable_change()')")
         )
+    command.check(configuration)
+
+
+def test_lifecycle_migration_round_trips_to_issue_5(migrated_engine: Engine) -> None:
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0001_persistence_v0")
+    issue_5_columns = {
+        column["name"] for column in inspect(migrated_engine).get_columns("runs", schema="public")
+    }
+    assert "lifecycle_version" not in issue_5_columns
+    assert "lease_token" not in issue_5_columns
+    legacy_statuses = (
+        "queued",
+        "provisioning",
+        "running",
+        "evaluating",
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "infra_error",
+    )
+    terminal_statuses = ("completed", "failed", "timed_out", "cancelled", "infra_error")
+    unreported_runs = {status: _unique(f"legacy-unreported-{status}") for status in legacy_statuses}
+    reported_runs = {status: _unique(f"legacy-reported-{status}") for status in terminal_statuses}
+    scenario_id = _unique("pre-issue6-scenario")
+    digest = "sha256:" + "1" * 64
+    scenario_document = {
+        "scenario_id": scenario_id,
+        "revision": "1",
+        "schema_version": "chaosagent.scenario/v0",
+    }
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO public.scenario_revisions "
+                "(scenario_id, revision, schema_version, canonical_document, "
+                "canonical_digest, created_by) VALUES "
+                "(:scenario_id, '1', 'chaosagent.scenario/v0', CAST(:document AS jsonb), "
+                ":digest, 'migration-test')"
+            ),
+            {
+                "scenario_id": scenario_id,
+                "document": json.dumps(scenario_document),
+                "digest": digest,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public.agent_configuration_revisions "
+                "(agent_configuration_id, revision, digest, created_by) VALUES "
+                "(:id, :revision, :digest, 'migration-test')"
+            ),
+            {
+                "id": AGENT_REFERENCE.id,
+                "revision": AGENT_REFERENCE.revision,
+                "digest": AGENT_REFERENCE.digest,
+            },
+        )
+        legacy_rows = list(unreported_runs.items()) + [
+            ("queued", run_id) for run_id in reported_runs.values()
+        ]
+        for status, run_id in legacy_rows:
+            connection.execute(
+                text(
+                    "INSERT INTO public.runs "
+                    "(run_id, scenario_id, scenario_revision, scenario_digest, "
+                    "agent_configuration_id, agent_configuration_revision, "
+                    "agent_configuration_digest, status, created_by) VALUES "
+                    "(:run_id, :scenario_id, '1', :digest, :agent_id, :agent_revision, "
+                    ":agent_digest, :status, 'migration-test')"
+                ),
+                {
+                    "run_id": run_id,
+                    "scenario_id": scenario_id,
+                    "digest": digest,
+                    "agent_id": AGENT_REFERENCE.id,
+                    "agent_revision": AGENT_REFERENCE.revision,
+                    "agent_digest": AGENT_REFERENCE.digest,
+                    "status": status,
+                },
+            )
+        for terminal_status, reported_run_id in reported_runs.items():
+            report_document: dict[str, object] = {
+                "report_id": _unique(f"legacy-report-{terminal_status}"),
+                "run_id": reported_run_id,
+                "schema_version": "chaosagent.run-report/v0",
+                "scenario": {"id": scenario_id, "revision": "1", "digest": digest},
+                "agent_configuration": {
+                    "id": AGENT_REFERENCE.id,
+                    "revision": AGENT_REFERENCE.revision,
+                    "digest": AGENT_REFERENCE.digest,
+                },
+                "run_status": terminal_status,
+                "classification": "not_evaluated",
+                "generated_at": "2026-08-24T10:00:00Z",
+            }
+            connection.execute(
+                text(_RAW_REPORT_INSERT),
+                _raw_report_parameters(report_document),
+            )
+    command.upgrade(configuration, "head")
+    issue_6_columns = {
+        column["name"] for column in inspect(migrated_engine).get_columns("runs", schema="public")
+    }
+    assert {
+        "lifecycle_version",
+        "lease_owner",
+        "lease_token",
+        "lease_expires_at",
+        "heartbeat_at",
+        "attempt",
+    }.issubset(issue_6_columns)
+    with migrated_engine.connect() as connection:
+        for run_id in unreported_runs.values():
+            assert (
+                connection.scalar(
+                    text("SELECT status FROM public.runs WHERE run_id = :run_id"),
+                    {"run_id": run_id},
+                )
+                == "queued"
+            )
+        for expected_status, run_id in reported_runs.items():
+            assert (
+                connection.scalar(
+                    text("SELECT status FROM public.runs WHERE run_id = :run_id"),
+                    {"run_id": run_id},
+                )
+                == expected_status
+            )
     command.check(configuration)
 
 
@@ -417,6 +613,7 @@ def test_final_report_is_one_immutable_document_per_run(migrated_engine: Engine)
     with Session(migrated_engine) as session, session.begin():
         _seed_run(session, run_id)
         repository = PersistenceRepository(session)
+        _complete_run(repository, run_id)
         inserted = repository.store_final_report(report)
         repeated = repository.store_final_report(report)
         fetched = repository.get_final_report(run_id)
@@ -425,7 +622,7 @@ def test_final_report_is_one_immutable_document_per_run(migrated_engine: Engine)
         assert fetched.report.canonical_bytes == report.canonical_bytes
         run = repository.get_run(run_id)
         assert run is not None
-        assert run.status == "queued"
+        assert run.status == "completed"
         assert fetched.report.to_dict()["run_status"] == "completed"
         with pytest.raises(FinalReportConflictError):
             repository.store_final_report(_report(run_id))
@@ -437,6 +634,7 @@ def test_report_projection_constraints_reject_schema_and_nested_reference_mismat
     run_id = _unique("raw-report-run")
     with Session(migrated_engine) as session, session.begin():
         _seed_run(session, run_id)
+        _complete_run(PersistenceRepository(session), run_id)
 
     mutations = ("missing_scenario_id", "schema_mismatch", "agent_digest_mismatch")
     for mutation in mutations:
@@ -460,8 +658,9 @@ def test_corrupted_event_and_report_reads_raise_persistence_integrity(
     run_id = _unique("corrupt-read-run")
     with Session(migrated_engine) as session, session.begin():
         _seed_run(session, run_id)
+        _complete_run(PersistenceRepository(session), run_id)
 
-    event_document = _event(run_id, 1).to_dict()
+    event_document = _event(run_id, 5).to_dict()
     del event_document["producer"]
     report_document = _report(run_id).to_dict()
     del report_document["critical_gates"]
@@ -516,6 +715,639 @@ def test_concurrent_same_sequence_has_one_winner(migrated_engine: Engine) -> Non
     assert sorted(outcomes) == ["inserted", "sequence_conflict"]
     with Session(migrated_engine) as session:
         assert len(PersistenceRepository(session).fetch_events(run_id)) == 1
+
+
+def test_legal_lifecycle_path_versions_and_terminal_claim_rejection(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("lifecycle-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        claimed = repository.claim_next_run(
+            "worker-a",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+        assert claimed.run.status == "provisioning"
+        assert claimed.run.lifecycle_version == 1
+        assert claimed.run.attempt == 1
+        with pytest.raises(IllegalRunTransitionError):
+            repository.transition_owned_run(
+                claimed.lease,
+                "evaluating",
+                expected_version=1,
+                evidence=_lifecycle_evidence(2),
+            )
+        running = repository.transition_owned_run(
+            claimed.lease,
+            "running",
+            expected_version=1,
+            evidence=_lifecycle_evidence(2),
+        )
+        evaluating = repository.transition_owned_run(
+            claimed.lease,
+            "evaluating",
+            expected_version=2,
+            evidence=_lifecycle_evidence(3),
+        )
+        completed = repository.transition_owned_run(
+            claimed.lease,
+            "completed",
+            expected_version=3,
+            evidence=_lifecycle_evidence(4),
+        )
+        assert (running.lifecycle_version, evaluating.lifecycle_version) == (2, 3)
+        assert completed.lifecycle_version == 4
+        assert completed.lease_owner is None
+        assert completed.lease_token is None
+        assert (
+            repository.claim_next_run(
+                "worker-b",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(5),
+                run_id=run_id,
+            )
+            is None
+        )
+        events = repository.fetch_events(run_id)
+        assert [record.event.to_dict()["payload"] for record in events] == [
+            {"previous_state": "queued", "state": "provisioning"},
+            {"previous_state": "provisioning", "state": "running"},
+            {"previous_state": "running", "state": "evaluating"},
+            {"previous_state": "evaluating", "state": "completed"},
+        ]
+
+
+def test_lifecycle_sequence_follows_existing_caller_sequenced_evidence(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("lifecycle-sequence-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        repository.append_event(_event(run_id, 7))
+        claimed = repository.claim_next_run(
+            "sequence-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(8),
+            run_id=run_id,
+        )
+        assert claimed is not None
+        sequences = [
+            record.event.to_dict()["sequence"] for record in repository.fetch_events(run_id)
+        ]
+        assert sequences == [
+            7,
+            8,
+        ]
+
+
+def test_heartbeat_requires_current_owner_version_and_unexpired_lease(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("heartbeat-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        claimed = repository.claim_next_run(
+            "worker-a",
+            lease_duration_seconds=30,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+        original_expiry = claimed.run.lease_expires_at
+        heartbeat = repository.heartbeat(
+            claimed.lease,
+            expected_version=claimed.run.lifecycle_version,
+            lease_duration_seconds=60,
+        )
+        assert heartbeat.run.lifecycle_version == 2
+        assert heartbeat.run.lease_expires_at is not None
+        assert original_expiry is not None
+        assert heartbeat.run.lease_expires_at > original_expiry
+        with pytest.raises(StaleLeaseError):
+            repository.heartbeat(
+                replace(claimed.lease, worker_id="worker-b"),
+                expected_version=2,
+                lease_duration_seconds=60,
+            )
+        with pytest.raises(LifecycleConflictError):
+            repository.heartbeat(
+                claimed.lease,
+                expected_version=1,
+                lease_duration_seconds=60,
+            )
+
+
+def test_expiry_requeue_reclaim_fences_stale_worker(migrated_engine: Engine) -> None:
+    run_id = _unique("reclaim-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        first = repository.claim_next_run(
+            "worker-a",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert first is not None
+
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE public.runs SET "
+                "heartbeat_at = clock_timestamp() - interval '2 hours', "
+                "lease_expires_at = clock_timestamp() - interval '1 hour' "
+                "WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        with pytest.raises(LeaseExpiredError):
+            repository.heartbeat(
+                first.lease,
+                expected_version=first.run.lifecycle_version,
+                lease_duration_seconds=60,
+            )
+        queued = repository.requeue_expired_run(
+            run_id,
+            expected_version=first.run.lifecycle_version,
+            evidence=_lifecycle_evidence(2),
+        )
+        assert queued.status == "queued"
+        assert queued.lifecycle_version == 2
+
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        second = repository.claim_next_run(
+            "worker-b",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(3),
+            run_id=run_id,
+        )
+        assert second is not None
+        assert second.run.attempt == 2
+        assert second.lease.lease_token != first.lease.lease_token
+
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        with pytest.raises(StaleLeaseError):
+            repository.transition_owned_run(
+                first.lease,
+                "failed",
+                expected_version=first.run.lifecycle_version,
+                evidence=_lifecycle_evidence(4),
+            )
+
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        running = repository.transition_owned_run(
+            second.lease,
+            "running",
+            expected_version=second.run.lifecycle_version,
+            evidence=_lifecycle_evidence(4),
+        )
+        assert running.status == "running"
+
+
+def test_competing_claims_have_exactly_one_owner(migrated_engine: Engine) -> None:
+    run_id = _unique("claim-race-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+    barrier = Barrier(2)
+
+    def claim(worker_id: str) -> str:
+        with Session(migrated_engine) as session, session.begin():
+            barrier.wait()
+            claimed = PersistenceRepository(session).claim_next_run(
+                worker_id,
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(1),
+                run_id=run_id,
+            )
+            return "none" if claimed is None else claimed.lease.worker_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(claim, ["worker-a", "worker-b"]))
+    assert outcomes.count("none") == 1
+    winners = [outcome for outcome in outcomes if outcome != "none"]
+    assert len(winners) == 1
+    with Session(migrated_engine) as session:
+        run = PersistenceRepository(session).get_run(run_id)
+        assert run is not None
+        assert run.lease_owner == winners[0]
+        assert run.attempt == 1
+
+
+def test_generic_queue_skips_locked_run_and_claims_next_visible_run(
+    migrated_engine: Engine,
+) -> None:
+    run_ids = (_unique("generic-queue-a"), _unique("generic-queue-b"))
+    with Session(migrated_engine) as session, session.begin():
+        for run_id in run_ids:
+            _seed_run(session, run_id)
+        session.execute(
+            text(
+                "UPDATE public.runs SET created_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' "
+                "WHERE run_id = ANY(:run_ids)"
+            ),
+            {"run_ids": list(run_ids)},
+        )
+
+    first_claimed = Event()
+    release_first = Event()
+    results: dict[str, str] = {}
+
+    def hold_first_claim() -> None:
+        with Session(migrated_engine) as session:
+            transaction = session.begin()
+            claimed = PersistenceRepository(session).claim_next_run(
+                "generic-worker-a",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(1),
+            )
+            assert claimed is not None
+            results["first"] = claimed.run.run_id
+            first_claimed.set()
+            assert release_first.wait(timeout=10)
+            transaction.commit()
+
+    def claim_while_first_is_locked() -> None:
+        assert first_claimed.wait(timeout=10)
+        try:
+            with Session(migrated_engine) as session, session.begin():
+                claimed = PersistenceRepository(session).claim_next_run(
+                    "generic-worker-b",
+                    lease_duration_seconds=60,
+                    evidence=_lifecycle_evidence(1),
+                )
+                assert claimed is not None
+                results["second"] = claimed.run.run_id
+        finally:
+            release_first.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(hold_first_claim)
+        second = executor.submit(claim_while_first_is_locked)
+        first.result(timeout=15)
+        second.result(timeout=15)
+
+    assert {results["first"], results["second"]} == set(run_ids)
+    with Session(migrated_engine) as session:
+        for run_id in run_ids:
+            events = PersistenceRepository(session).fetch_events(run_id)
+            assert [record.event.to_dict()["sequence"] for record in events] == [1]
+
+
+def test_expired_requeue_wins_race_against_heartbeat(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("heartbeat-race-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        claimed = PersistenceRepository(session).claim_next_run(
+            "heartbeat-race-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+
+    recovery_done = Event()
+    release_recovery = Event()
+    heartbeat_started = Event()
+
+    def hold_expired_recovery() -> None:
+        with Session(migrated_engine) as session:
+            transaction = session.begin()
+            session.execute(
+                text(
+                    "UPDATE public.runs SET "
+                    "heartbeat_at = clock_timestamp() - interval '2 hours', "
+                    "lease_expires_at = clock_timestamp() - interval '1 hour' "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+            PersistenceRepository(session).requeue_expired_run(
+                run_id,
+                expected_version=claimed.run.lifecycle_version,
+                evidence=_lifecycle_evidence(2),
+            )
+            recovery_done.set()
+            assert release_recovery.wait(timeout=10)
+            transaction.commit()
+
+    def lose_heartbeat_race() -> str:
+        assert recovery_done.wait(timeout=10)
+        try:
+            with Session(migrated_engine) as session, session.begin():
+                session.execute(text("SET LOCAL application_name = 'issue6-heartbeat-requeue'"))
+                heartbeat_started.set()
+                PersistenceRepository(session).heartbeat(
+                    claimed.lease,
+                    expected_version=claimed.run.lifecycle_version,
+                    lease_duration_seconds=120,
+                )
+        except LifecycleConflictError:
+            return "conflict"
+        return "unexpected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(hold_expired_recovery)
+        loser = executor.submit(lose_heartbeat_race)
+        assert heartbeat_started.wait(timeout=10)
+        _wait_for_database_block(migrated_engine, "issue6-heartbeat-requeue")
+        release_recovery.set()
+        assert loser.result(timeout=15) == "conflict"
+        winner.result(timeout=15)
+
+    with Session(migrated_engine) as session:
+        run = PersistenceRepository(session).get_run(run_id)
+        assert run is not None
+        assert run.status == "queued"
+        assert run.lifecycle_version == 2
+
+
+def test_terminal_transition_wins_race_against_requeue(migrated_engine: Engine) -> None:
+    run_id = _unique("terminal-requeue-race")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        claimed = PersistenceRepository(session).claim_next_run(
+            "terminal-race-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+
+    transition_done = Event()
+    release_transition = Event()
+    terminal_requeue_started = Event()
+
+    def hold_terminal_transition() -> None:
+        with Session(migrated_engine) as session:
+            transaction = session.begin()
+            PersistenceRepository(session).transition_owned_run(
+                claimed.lease,
+                "failed",
+                expected_version=claimed.run.lifecycle_version,
+                evidence=_lifecycle_evidence(2),
+            )
+            transition_done.set()
+            assert release_transition.wait(timeout=10)
+            transaction.commit()
+
+    def lose_requeue_to_terminal() -> str:
+        assert transition_done.wait(timeout=10)
+        try:
+            with Session(migrated_engine) as session, session.begin():
+                session.execute(text("SET LOCAL application_name = 'issue6-terminal-requeue'"))
+                terminal_requeue_started.set()
+                PersistenceRepository(session).requeue_expired_run(
+                    run_id,
+                    expected_version=claimed.run.lifecycle_version,
+                    evidence=_lifecycle_evidence(3),
+                )
+        except LifecycleConflictError:
+            return "conflict"
+        finally:
+            release_transition.set()
+        return "unexpected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(hold_terminal_transition)
+        loser = executor.submit(lose_requeue_to_terminal)
+        assert terminal_requeue_started.wait(timeout=10)
+        assert loser.result(timeout=15) == "conflict"
+        winner.result(timeout=15)
+
+
+def test_two_expired_recovery_attempts_with_same_version_have_one_winner(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("recovery-race-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        claimed = PersistenceRepository(session).claim_next_run(
+            "recovery-race-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE public.runs SET heartbeat_at = clock_timestamp() - interval '2 hours', "
+                "lease_expires_at = clock_timestamp() - interval '1 hour' WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+
+    barrier = Barrier(2)
+
+    def recover(worker_number: int) -> str:
+        try:
+            with Session(migrated_engine) as session, session.begin():
+                barrier.wait(timeout=10)
+                PersistenceRepository(session).requeue_expired_run(
+                    run_id,
+                    expected_version=claimed.run.lifecycle_version,
+                    evidence=_lifecycle_evidence(worker_number + 1),
+                )
+            return "requeued"
+        except LifecycleConflictError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(recover, (1, 2)))
+    assert sorted(outcomes) == ["conflict", "requeued"]
+
+
+def test_heartbeat_and_terminal_transition_use_same_coordination_cas(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("heartbeat-terminal-race")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        claimed = PersistenceRepository(session).claim_next_run(
+            "coordination-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+
+    heartbeat_done = Event()
+    release_heartbeat = Event()
+    transition_started = Event()
+
+    def hold_heartbeat() -> None:
+        with Session(migrated_engine) as session:
+            transaction = session.begin()
+            PersistenceRepository(session).heartbeat(
+                claimed.lease,
+                expected_version=1,
+                lease_duration_seconds=120,
+            )
+            heartbeat_done.set()
+            assert release_heartbeat.wait(timeout=10)
+            transaction.commit()
+
+    def stale_terminal_transition() -> str:
+        assert heartbeat_done.wait(timeout=10)
+        try:
+            with Session(migrated_engine) as session, session.begin():
+                session.execute(text("SET LOCAL application_name = 'issue6-heartbeat-terminal'"))
+                transition_started.set()
+                PersistenceRepository(session).transition_owned_run(
+                    claimed.lease,
+                    "failed",
+                    expected_version=1,
+                    evidence=_lifecycle_evidence(2),
+                )
+        except LifecycleConflictError:
+            return "conflict"
+        return "unexpected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(hold_heartbeat)
+        loser = executor.submit(stale_terminal_transition)
+        assert transition_started.wait(timeout=10)
+        _wait_for_database_block(migrated_engine, "issue6-heartbeat-terminal")
+        release_heartbeat.set()
+        assert loser.result(timeout=15) == "conflict"
+        winner.result(timeout=15)
+
+
+def test_lifecycle_evidence_failure_rolls_back_state_but_not_outer_transaction(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("evidence-rollback-run")
+    first_evidence = _lifecycle_evidence(1)
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        claimed = repository.claim_next_run(
+            "worker-a",
+            lease_duration_seconds=60,
+            evidence=first_evidence,
+            run_id=run_id,
+        )
+        assert claimed is not None
+        duplicate = first_evidence
+        with pytest.raises(DuplicateEventIDError):
+            repository.transition_owned_run(
+                claimed.lease,
+                "running",
+                expected_version=claimed.run.lifecycle_version,
+                evidence=duplicate,
+            )
+        unchanged = repository.get_run(run_id)
+        assert unchanged is not None
+        assert unchanged.status == "provisioning"
+        assert unchanged.lifecycle_version == 1
+        running = repository.transition_owned_run(
+            claimed.lease,
+            "running",
+            expected_version=1,
+            evidence=_lifecycle_evidence(2),
+        )
+        assert running.status == "running"
+
+
+def test_failed_claim_evidence_releases_savepoint_lock_for_another_transaction(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("claim-lock-release-run")
+    duplicate_event_id = _unique("claim-lock-duplicate")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        PersistenceRepository(session).append_event(_event(run_id, 1, event_id=duplicate_event_id))
+
+    with Session(migrated_engine) as failed_session:
+        outer = failed_session.begin()
+        with pytest.raises(DuplicateEventIDError):
+            PersistenceRepository(failed_session).claim_next_run(
+                "failed-claim-worker",
+                lease_duration_seconds=60,
+                evidence=LifecycleEvidence(
+                    event_id=duplicate_event_id,
+                    producer_component="run-controller",
+                ),
+                run_id=run_id,
+            )
+        with Session(migrated_engine) as winner_session, winner_session.begin():
+            claimed = PersistenceRepository(winner_session).claim_next_run(
+                "replacement-worker",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(2),
+                run_id=run_id,
+            )
+            assert claimed is not None
+        assert failed_session.in_transaction()
+        outer.rollback()
+
+
+def test_claim_rollback_restores_queue_eligibility(migrated_engine: Engine) -> None:
+    run_id = _unique("claim-rollback-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+    with Session(migrated_engine) as session:
+        transaction = session.begin()
+        first = PersistenceRepository(session).claim_next_run(
+            "worker-a",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert first is not None
+        transaction.rollback()
+    with Session(migrated_engine) as session, session.begin():
+        second = PersistenceRepository(session).claim_next_run(
+            "worker-b",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert second is not None
+        assert second.run.attempt == 1
+
+
+def test_queued_cancellation_is_terminal_and_report_requires_matching_terminal_status(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("cancel-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        repository = PersistenceRepository(session)
+        with pytest.raises(PersistenceIntegrityError, match="cannot be stored"):
+            repository.store_final_report(_report(run_id))
+        cancelled = repository.cancel_queued_run(
+            run_id,
+            expected_version=0,
+            evidence=_lifecycle_evidence(1),
+        )
+        assert cancelled.status == "cancelled"
+        assert cancelled.lifecycle_version == 1
+        assert (
+            repository.claim_next_run(
+                "worker-a",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(2),
+                run_id=run_id,
+            )
+            is None
+        )
+        with pytest.raises(PersistenceIntegrityError, match="does not match"):
+            repository.store_final_report(_report(run_id))
 
 
 def test_non_postgresql_url_fails_closed() -> None:

@@ -114,8 +114,10 @@ docs/                      Project documentation
 ```
 
 Persistence responsibilities and local PostgreSQL setup are documented in
-[`docs/persistence/POSTGRESQL_V0.md`](docs/persistence/POSTGRESQL_V0.md). No run
-execution behavior is implemented.
+[`docs/persistence/POSTGRESQL_V0.md`](docs/persistence/POSTGRESQL_V0.md), with
+the Run state machine and lease/fencing protocol in
+[`docs/persistence/RUN_LIFECYCLE_LEASES.md`](docs/persistence/RUN_LIFECYCLE_LEASES.md).
+No agent or tool execution behavior is implemented.
 
 ## Developer commands
 

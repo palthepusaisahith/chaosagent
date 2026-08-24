@@ -19,6 +19,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .lifecycle import RUN_STATUSES, RunStatus
+
 NAMING_CONVENTION = {
     "ix": "ix_%(table_name)s_%(column_0_name)s",
     "uq": "uq_%(table_name)s_%(column_0_name)s",
@@ -30,17 +32,6 @@ NAMING_CONVENTION = {
 IDENTIFIER_CHECK = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
 REVISION_CHECK = r"^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$"
 DIGEST_CHECK = r"^sha256:[0-9a-f]{64}$"
-RUN_STATUSES = (
-    "queued",
-    "provisioning",
-    "running",
-    "evaluating",
-    "completed",
-    "failed",
-    "timed_out",
-    "cancelled",
-    "infra_error",
-)
 
 
 class Base(DeclarativeBase):
@@ -117,7 +108,7 @@ class AgentConfigurationRevisionModel(Base):
 
 
 class RunModel(Base):
-    """Run identity and frozen revision references; lifecycle behavior is deferred."""
+    """Run identity, frozen references, and Issue #6 coordination state."""
 
     __tablename__ = "runs"
     __table_args__ = (
@@ -145,6 +136,27 @@ class RunModel(Base):
         ),
         CheckConstraint("run_id ~ '" + IDENTIFIER_CHECK + "'", name="run_id_format"),
         CheckConstraint("status IN " + repr(RUN_STATUSES), name="status_value"),
+        CheckConstraint("lifecycle_version >= 0", name="lifecycle_version_nonnegative"),
+        CheckConstraint("attempt >= 0", name="attempt_nonnegative"),
+        CheckConstraint(
+            "lease_owner IS NULL OR lease_owner ~ '" + IDENTIFIER_CHECK + "'",
+            name="lease_owner_format",
+        ),
+        CheckConstraint(
+            "lease_token IS NULL OR lease_token ~ '" + IDENTIFIER_CHECK + "'",
+            name="lease_token_format",
+        ),
+        CheckConstraint(
+            "((status IN ('provisioning', 'running', 'evaluating')) "
+            "AND lease_owner IS NOT NULL AND lease_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL "
+            "AND lease_expires_at > heartbeat_at) OR "
+            "((status IN ('queued', 'completed', 'failed', 'timed_out', "
+            "'cancelled', 'infra_error')) AND lease_owner IS NULL "
+            "AND lease_token IS NULL AND lease_expires_at IS NULL "
+            "AND heartbeat_at IS NULL)",
+            name="lease_state_consistency",
+        ),
         UniqueConstraint(
             "run_id",
             "scenario_id",
@@ -153,9 +165,16 @@ class RunModel(Base):
             "agent_configuration_id",
             "agent_configuration_revision",
             "agent_configuration_digest",
+            "status",
             name="uq_run_frozen_references",
         ),
         Index("ix_runs_scenario_revision", "scenario_id", "scenario_revision"),
+        Index(
+            "ix_runs_claim_queue",
+            "created_at",
+            "run_id",
+            postgresql_where=text("status = 'queued'"),
+        ),
         {"schema": "public"},
     )
 
@@ -166,7 +185,15 @@ class RunModel(Base):
     agent_configuration_id: Mapped[str] = mapped_column(String(128), nullable=False)
     agent_configuration_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     agent_configuration_digest: Mapped[str] = mapped_column(String(71), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="queued")
+    status: Mapped[RunStatus] = mapped_column(String(32), nullable=False, server_default="queued")
+    lifecycle_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
@@ -248,6 +275,7 @@ class RunReportModel(Base):
                 "agent_configuration_id",
                 "agent_configuration_revision",
                 "agent_configuration_digest",
+                "run_status",
             ],
             [
                 "public.runs.run_id",
@@ -257,6 +285,7 @@ class RunReportModel(Base):
                 "public.runs.agent_configuration_id",
                 "public.runs.agent_configuration_revision",
                 "public.runs.agent_configuration_digest",
+                "public.runs.status",
             ],
             name="fk_run_reports_frozen_run",
         ),
