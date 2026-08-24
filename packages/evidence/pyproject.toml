@@ -1,0 +1,19 @@
+[project]
+name = "chaosagent-evidence"
+version = "0.0.0"
+description = "Versioned run event and report contracts for ChaosAgent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "jsonschema==4.26.0",
+    "rfc8785==0.1.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chaosagent_evidence"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/chaosagent_evidence/schema" = "chaosagent_evidence/schema"

@@ -5,6 +5,7 @@ requires-python = "==3.12.*"
 [manifest]
 members = [
     "chaosagent-control-plane",
+    "chaosagent-evidence",
     "chaosagent-scenarios",
     "chaosagent-workspace",
 ]
@@ -23,6 +24,21 @@ wheels = [
 name = "chaosagent-control-plane"
 version = "0.0.0"
 source = { editable = "services/control-plane" }
+
+[[package]]
+name = "chaosagent-evidence"
+version = "0.0.0"
+source = { editable = "packages/evidence" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "rfc8785" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+]
 
 [[package]]
 name = "chaosagent-scenarios"

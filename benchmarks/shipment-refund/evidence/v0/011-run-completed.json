@@ -1,0 +1,14 @@
+{
+  "schema_version": "chaosagent.run-event/v0",
+  "event_id": "evt-refund-011",
+  "run_id": "run-refund-001",
+  "sequence": 11,
+  "occurred_at": "2026-08-24T10:00:20.000Z",
+  "recorded_at": "2026-08-24T10:00:20.005Z",
+  "event_type": "run.lifecycle",
+  "producer": { "component": "run-controller", "instance_id": "worker-01" },
+  "correlation_id": "run-refund-001",
+  "causation_event_id": "evt-refund-010",
+  "payload": { "state": "completed", "previous_state": "evaluating" },
+  "payload_digest": "sha256:a802c60d3fc00c54d87beddf754a6c787e6ccb4949bc51cbeb7bff466cf287db"
+}

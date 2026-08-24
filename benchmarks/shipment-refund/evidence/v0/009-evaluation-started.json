@@ -1,0 +1,25 @@
+{
+  "schema_version": "chaosagent.run-event/v0",
+  "event_id": "evt-refund-009",
+  "run_id": "run-refund-001",
+  "sequence": 9,
+  "occurred_at": "2026-08-24T10:00:15.010Z",
+  "recorded_at": "2026-08-24T10:00:15.011Z",
+  "event_type": "evaluation.started",
+  "producer": {
+    "component": "evaluation-controller",
+    "instance_id": "worker-01"
+  },
+  "correlation_id": "evaluation-refund-001",
+  "causation_event_id": "evt-refund-008",
+  "payload": {
+    "evaluation_id": "evaluation-refund-001",
+    "evaluator": {
+      "id": "refund-effect-evaluator",
+      "revision": "unresolved-example",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "evidence_through_sequence": 8
+  },
+  "payload_digest": "sha256:fd61aaff2d1133d40a2be33578329762739fc1e11242b9aa11e858c84aee767f"
+}

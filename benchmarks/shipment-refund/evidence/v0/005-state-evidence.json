@@ -1,0 +1,20 @@
+{
+  "schema_version": "chaosagent.run-event/v0",
+  "event_id": "evt-refund-005",
+  "run_id": "run-refund-001",
+  "sequence": 5,
+  "occurred_at": "2026-08-24T10:00:02.190Z",
+  "recorded_at": "2026-08-24T10:00:02.195Z",
+  "event_type": "state.evidence_recorded",
+  "producer": { "component": "synthetic-company", "instance_id": "worker-01" },
+  "correlation_id": "logical-refund-001",
+  "causation_event_id": "evt-refund-002",
+  "payload": {
+    "evidence_id": "refund-effect-001",
+    "evidence_kind": "business_effect",
+    "fact_type": "refund.created",
+    "subject": { "type": "order", "id": "ORD-1007" },
+    "related_event_ids": ["evt-refund-002", "evt-refund-004"]
+  },
+  "payload_digest": "sha256:2066f9418bdca9d6974edf31fd55b8423381d1177eda40afc6f28cd5c823becd"
+}

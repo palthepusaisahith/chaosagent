@@ -1,0 +1,23 @@
+{
+  "schema_version": "chaosagent.run-event/v0",
+  "event_id": "evt-refund-006",
+  "run_id": "run-refund-001",
+  "sequence": 6,
+  "occurred_at": "2026-08-24T10:00:07.200Z",
+  "recorded_at": "2026-08-24T10:00:07.201Z",
+  "event_type": "tool.result",
+  "producer": { "component": "tool-runtime", "instance_id": "worker-01" },
+  "correlation_id": "logical-refund-001",
+  "causation_event_id": "evt-refund-002",
+  "payload": {
+    "logical_call_id": "logical-refund-001",
+    "request_event_id": "evt-refund-002",
+    "attempt_id": "attempt-refund-001",
+    "attempt_number": 1,
+    "tool_id": "payments.refund",
+    "outcome": "unknown",
+    "duration_ms": 5200,
+    "error_code": "acknowledgement_timeout"
+  },
+  "payload_digest": "sha256:153bba509b2e06ca9c868af3796b6a62049dc826540ddf73d91b5e62cc856df3"
+}

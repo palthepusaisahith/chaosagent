@@ -1,0 +1,432 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/run-report/v0/schema.json",
+  "title": "ChaosAgent Run Report v0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "report_id",
+    "run_id",
+    "generated_at",
+    "scenario",
+    "agent_configuration",
+    "run_status",
+    "classification",
+    "evidence_boundary",
+    "fault_observation",
+    "critical_gates",
+    "diagnostic_metrics",
+    "totals",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.run-report/v0" },
+    "report_id": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "generated_at": { "$ref": "#/$defs/timestamp" },
+    "scenario": { "$ref": "#/$defs/revisionRef" },
+    "agent_configuration": { "$ref": "#/$defs/revisionRef" },
+    "run_status": {
+      "enum": ["completed", "failed", "timed_out", "cancelled", "infra_error"]
+    },
+    "classification": { "enum": ["pass", "fail", "invalid", "not_evaluated"] },
+    "evidence_boundary": { "$ref": "#/$defs/evidenceBoundary" },
+    "fault_observation": { "$ref": "#/$defs/faultObservation" },
+    "critical_gates": {
+      "type": "array",
+      "x-chaosagent-array-semantics": "set",
+      "items": { "$ref": "#/$defs/gateResult" }
+    },
+    "diagnostic_metrics": {
+      "type": "array",
+      "x-chaosagent-array-semantics": "set",
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "totals": { "$ref": "#/$defs/totals" },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "classification": { "const": "pass" } } },
+      "then": {
+        "properties": {
+          "critical_gates": {
+            "items": {
+              "properties": { "status": { "enum": ["pass", "not_applicable"] } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "classification": { "const": "fail" } } },
+      "then": {
+        "properties": {
+          "critical_gates": {
+            "contains": {
+              "properties": { "status": { "const": "fail" } },
+              "required": ["status"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "classification": { "const": "pass" } } },
+      "then": {
+        "properties": {
+          "run_status": { "const": "completed" },
+          "provenance": { "required": ["evaluated_through_sequence"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "classification": { "const": "fail" } } },
+      "then": {
+        "properties": {
+          "provenance": { "required": ["evaluated_through_sequence"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "run_status": { "const": "infra_error" } } },
+      "then": {
+        "properties": {
+          "classification": { "enum": ["invalid", "not_evaluated"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "classification": { "const": "not_evaluated" } }
+      },
+      "then": {
+        "properties": {
+          "critical_gates": { "maxItems": 0 },
+          "provenance": {
+            "properties": { "evaluator_revisions": { "maxItems": 0 } },
+            "not": { "required": ["evaluated_through_sequence"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "critical_gates": {
+            "contains": {
+              "properties": { "status": { "const": "error" } },
+              "required": ["status"]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "classification": { "const": "invalid" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "catalogId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "revisionRef": {
+      "type": "object",
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/catalogId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "artifactEvidence": {
+      "type": "object",
+      "required": ["kind", "artifact_id", "digest", "media_type"],
+      "properties": {
+        "kind": { "const": "artifact" },
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "additionalProperties": false
+    },
+    "eventEvidence": {
+      "type": "object",
+      "required": ["kind", "event_id", "sequence"],
+      "properties": {
+        "kind": { "const": "event" },
+        "event_id": { "$ref": "#/$defs/id" },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "rangeEvidence": {
+      "type": "object",
+      "required": ["kind", "start_sequence", "end_sequence"],
+      "properties": {
+        "kind": { "const": "event_range" },
+        "start_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "end_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidenceRef": {
+      "oneOf": [
+        { "$ref": "#/$defs/eventEvidence" },
+        { "$ref": "#/$defs/rangeEvidence" },
+        { "$ref": "#/$defs/artifactEvidence" }
+      ]
+    },
+    "evidenceBoundary": {
+      "type": "object",
+      "required": ["first_sequence", "last_sequence", "event_count"],
+      "properties": {
+        "first_sequence": { "const": 1 },
+        "last_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "event_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "faultObservation": {
+      "type": "object",
+      "required": ["status", "fault_ids", "evidence"],
+      "properties": {
+        "status": {
+          "enum": [
+            "not_applicable",
+            "not_matched",
+            "matched_not_applied",
+            "applied_not_observed",
+            "observed",
+            "mixed"
+          ]
+        },
+        "fault_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/catalogId" }
+        },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "not_applicable" } } },
+          "then": {
+            "properties": {
+              "fault_ids": { "maxItems": 0 },
+              "evidence": { "maxItems": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "fault_ids": { "minItems": 1 },
+              "evidence": { "minItems": 1 }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "gateResult": {
+      "type": "object",
+      "required": ["gate_id", "status", "evaluator", "evidence"],
+      "properties": {
+        "gate_id": { "$ref": "#/$defs/name" },
+        "status": { "enum": ["pass", "fail", "not_applicable", "error"] },
+        "evaluator": { "$ref": "#/$defs/revisionRef" },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "reason_code": { "$ref": "#/$defs/name" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "enum": ["pass", "fail"] } }
+          },
+          "then": { "properties": { "evidence": { "minItems": 1 } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "metric": {
+      "type": "object",
+      "required": ["metric_id", "value", "unit", "interpretation", "evidence"],
+      "properties": {
+        "metric_id": { "$ref": "#/$defs/name" },
+        "value": { "type": "number" },
+        "unit": {
+          "enum": ["count", "ms", "ratio", "microusd", "tokens", "bytes"]
+        },
+        "interpretation": {
+          "enum": ["lower_better", "higher_better", "informational"]
+        },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "totals": {
+      "type": "object",
+      "properties": {
+        "usage": {
+          "type": "object",
+          "minProperties": 1,
+          "properties": {
+            "model_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "tool_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "input_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "output_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "reasoning_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
+        },
+        "latency": {
+          "type": "object",
+          "minProperties": 1,
+          "properties": {
+            "wall_time_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "model_time_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "tool_time_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
+        },
+        "cost": {
+          "type": "object",
+          "required": ["estimated_microusd", "currency", "is_estimate"],
+          "properties": {
+            "estimated_microusd": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "currency": { "const": "USD" },
+            "is_estimate": { "type": "boolean" },
+            "price_table": { "$ref": "#/$defs/revisionRef" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["generator", "evaluator_revisions"],
+      "properties": {
+        "generator": {
+          "type": "object",
+          "required": ["component", "version"],
+          "properties": {
+            "component": { "$ref": "#/$defs/name" },
+            "version": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "additionalProperties": false
+        },
+        "evaluator_revisions": {
+          "type": "array",
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/revisionRef" }
+        },
+        "evaluated_through_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

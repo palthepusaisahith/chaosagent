@@ -1,0 +1,18 @@
+{
+  "schema_version": "chaosagent.run-event/v0",
+  "event_id": "evt-refund-004",
+  "run_id": "run-refund-001",
+  "sequence": 4,
+  "occurred_at": "2026-08-24T10:00:02.200Z",
+  "recorded_at": "2026-08-24T10:00:02.201Z",
+  "event_type": "fault.applied",
+  "producer": { "component": "fault-controller", "instance_id": "worker-01" },
+  "correlation_id": "logical-refund-001",
+  "causation_event_id": "evt-refund-003",
+  "payload": {
+    "fault_id": "refund-ack-lost",
+    "activation_id": "activation-refund-001",
+    "related_event_ids": ["evt-refund-002", "evt-refund-003"]
+  },
+  "payload_digest": "sha256:12888d6985fc1c8773927644aadc1dd3e8230b8747d194b0d55866f5501d7a2e"
+}

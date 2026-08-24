@@ -1,0 +1,480 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/run-event/v0/schema.json",
+  "title": "ChaosAgent Run Event v0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "run_id",
+    "sequence",
+    "occurred_at",
+    "recorded_at",
+    "event_type",
+    "producer",
+    "correlation_id",
+    "payload",
+    "payload_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.run-event/v0" },
+    "event_id": { "$ref": "#/$defs/id" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "occurred_at": { "$ref": "#/$defs/timestamp" },
+    "recorded_at": { "$ref": "#/$defs/timestamp" },
+    "event_type": { "type": "string" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "trace_context": { "$ref": "#/$defs/traceContext" },
+    "correlation_id": { "$ref": "#/$defs/id" },
+    "causation_event_id": { "$ref": "#/$defs/id" },
+    "payload": { "type": "object" },
+    "payload_digest": { "$ref": "#/$defs/digest" }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "event_type": { "const": "run.lifecycle" },
+        "payload": { "$ref": "#/$defs/runLifecycle" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "agent.step" },
+        "payload": { "$ref": "#/$defs/agentStep" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "tool.requested" },
+        "payload": { "$ref": "#/$defs/toolRequested" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "tool.result" },
+        "payload": { "$ref": "#/$defs/toolResult" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "fault.not_matched" },
+        "payload": { "$ref": "#/$defs/faultNotMatched" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "fault.matched" },
+        "payload": { "$ref": "#/$defs/faultEvidence" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "fault.applied" },
+        "payload": { "$ref": "#/$defs/faultEvidence" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "fault.observed" },
+        "payload": { "$ref": "#/$defs/faultEvidence" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "state.evidence_recorded" },
+        "payload": { "$ref": "#/$defs/stateEvidence" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "policy.decision" },
+        "payload": { "$ref": "#/$defs/policyDecision" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "approval.requested" },
+        "payload": { "$ref": "#/$defs/approvalRequested" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "approval.resolved" },
+        "payload": { "$ref": "#/$defs/approvalResolved" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "evaluation.started" },
+        "payload": { "$ref": "#/$defs/evaluationStarted" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "evaluation.result_recorded" },
+        "payload": { "$ref": "#/$defs/evaluationResult" }
+      }
+    },
+    {
+      "properties": {
+        "event_type": { "const": "run.error" },
+        "payload": { "$ref": "#/$defs/runError" }
+      }
+    }
+  ],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "catalogId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "producer": {
+      "type": "object",
+      "required": ["component"],
+      "properties": {
+        "component": { "$ref": "#/$defs/name" },
+        "instance_id": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    },
+    "traceContext": {
+      "type": "object",
+      "required": ["trace_id", "span_id"],
+      "properties": {
+        "trace_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "span_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
+      },
+      "additionalProperties": false
+    },
+    "revisionRef": {
+      "type": "object",
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/catalogId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": ["artifact_id", "digest", "media_type"],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "additionalProperties": false
+    },
+    "runState": {
+      "enum": [
+        "queued",
+        "provisioning",
+        "running",
+        "evaluating",
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "infra_error"
+      ]
+    },
+    "runLifecycle": {
+      "type": "object",
+      "required": ["state", "previous_state"],
+      "properties": {
+        "state": { "$ref": "#/$defs/runState" },
+        "previous_state": {
+          "oneOf": [{ "$ref": "#/$defs/runState" }, { "type": "null" }]
+        },
+        "reason_code": { "$ref": "#/$defs/name" }
+      },
+      "additionalProperties": false
+    },
+    "agentStep": {
+      "type": "object",
+      "required": ["step_id", "step_number", "phase"],
+      "properties": {
+        "step_id": { "$ref": "#/$defs/id" },
+        "step_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "phase": { "enum": ["started", "completed", "failed"] },
+        "model_call_id": { "$ref": "#/$defs/id" },
+        "model": {
+          "type": "object",
+          "required": ["provider", "requested_model"],
+          "properties": {
+            "provider": { "$ref": "#/$defs/name" },
+            "requested_model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "resolved_model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "provider_request_id": { "$ref": "#/$defs/id" }
+          },
+          "additionalProperties": false
+        },
+        "input_digest": { "$ref": "#/$defs/digest" },
+        "output_digest": { "$ref": "#/$defs/digest" },
+        "input_artifact": { "$ref": "#/$defs/artifactRef" },
+        "output_artifact": { "$ref": "#/$defs/artifactRef" }
+      },
+      "dependentRequired": {
+        "model_call_id": ["model"],
+        "model": ["model_call_id"]
+      },
+      "additionalProperties": false
+    },
+    "toolRequested": {
+      "type": "object",
+      "required": [
+        "logical_call_id",
+        "attempt_id",
+        "attempt_number",
+        "tool_id",
+        "arguments_digest"
+      ],
+      "properties": {
+        "logical_call_id": { "$ref": "#/$defs/id" },
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "attempt_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "step_id": { "$ref": "#/$defs/id" },
+        "tool_id": { "$ref": "#/$defs/name" },
+        "arguments_digest": { "$ref": "#/$defs/digest" },
+        "arguments_artifact": { "$ref": "#/$defs/artifactRef" },
+        "idempotency_key_digest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": false
+    },
+    "toolResult": {
+      "type": "object",
+      "required": [
+        "logical_call_id",
+        "request_event_id",
+        "attempt_id",
+        "attempt_number",
+        "tool_id",
+        "outcome",
+        "duration_ms"
+      ],
+      "properties": {
+        "logical_call_id": { "$ref": "#/$defs/id" },
+        "request_event_id": { "$ref": "#/$defs/id" },
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "attempt_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "tool_id": { "$ref": "#/$defs/name" },
+        "outcome": {
+          "enum": ["succeeded", "failed", "timed_out", "denied", "unknown"]
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "response_digest": { "$ref": "#/$defs/digest" },
+        "response_artifact": { "$ref": "#/$defs/artifactRef" },
+        "error_code": { "$ref": "#/$defs/name" }
+      },
+      "additionalProperties": false
+    },
+    "faultNotMatched": {
+      "type": "object",
+      "required": ["fault_id", "reason_code"],
+      "properties": {
+        "fault_id": { "$ref": "#/$defs/catalogId" },
+        "reason_code": { "$ref": "#/$defs/name" }
+      },
+      "additionalProperties": false
+    },
+    "faultEvidence": {
+      "type": "object",
+      "required": ["fault_id", "activation_id", "related_event_ids"],
+      "properties": {
+        "fault_id": { "$ref": "#/$defs/catalogId" },
+        "activation_id": { "$ref": "#/$defs/id" },
+        "related_event_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/id" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "stateEvidence": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "evidence_kind",
+        "fact_type",
+        "subject",
+        "related_event_ids"
+      ],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "evidence_kind": { "enum": ["state_snapshot", "business_effect"] },
+        "fact_type": { "$ref": "#/$defs/name" },
+        "subject": {
+          "type": "object",
+          "required": ["type", "id"],
+          "properties": {
+            "type": { "$ref": "#/$defs/name" },
+            "id": { "$ref": "#/$defs/id" }
+          },
+          "additionalProperties": false
+        },
+        "related_event_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "x-chaosagent-array-semantics": "set",
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "detail_artifact": { "$ref": "#/$defs/artifactRef" }
+      },
+      "additionalProperties": false
+    },
+    "policyDecision": {
+      "type": "object",
+      "required": ["decision_id", "policy", "decision", "reason_code"],
+      "properties": {
+        "decision_id": { "$ref": "#/$defs/id" },
+        "policy": { "$ref": "#/$defs/revisionRef" },
+        "decision": { "enum": ["allow", "deny", "require_approval"] },
+        "reason_code": { "$ref": "#/$defs/name" },
+        "logical_call_id": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    },
+    "approvalRequested": {
+      "type": "object",
+      "required": ["approval_id", "decision_id", "action_digest"],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/id" },
+        "decision_id": { "$ref": "#/$defs/id" },
+        "action_digest": { "$ref": "#/$defs/digest" },
+        "expires_at": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "approvalResolved": {
+      "type": "object",
+      "required": [
+        "approval_id",
+        "request_event_id",
+        "result",
+        "responder_type"
+      ],
+      "properties": {
+        "approval_id": { "$ref": "#/$defs/id" },
+        "request_event_id": { "$ref": "#/$defs/id" },
+        "result": { "enum": ["approved", "denied", "timed_out", "cancelled"] },
+        "responder_type": { "enum": ["human", "simulated"] }
+      },
+      "additionalProperties": false
+    },
+    "evaluationStarted": {
+      "type": "object",
+      "required": ["evaluation_id", "evaluator", "evidence_through_sequence"],
+      "properties": {
+        "evaluation_id": { "$ref": "#/$defs/id" },
+        "evaluator": { "$ref": "#/$defs/revisionRef" },
+        "evidence_through_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "evaluationResult": {
+      "type": "object",
+      "required": [
+        "evaluation_id",
+        "evaluator",
+        "outcome",
+        "evidence_through_sequence"
+      ],
+      "properties": {
+        "evaluation_id": { "$ref": "#/$defs/id" },
+        "evaluator": { "$ref": "#/$defs/revisionRef" },
+        "outcome": { "enum": ["completed", "error"] },
+        "evidence_through_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "error_code": { "$ref": "#/$defs/name" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "outcome": { "const": "completed" } } },
+          "then": {
+            "not": { "required": ["error_code"] }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "error" } } },
+          "then": {
+            "required": ["error_code"]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "runError": {
+      "type": "object",
+      "required": ["classification", "error_code"],
+      "properties": {
+        "classification": { "enum": ["agent_error", "infrastructure_error"] },
+        "error_code": { "$ref": "#/$defs/name" },
+        "detail_artifact": { "$ref": "#/$defs/artifactRef" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

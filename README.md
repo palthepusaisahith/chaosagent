@@ -9,7 +9,8 @@ ChaosAgent is pre-1.0 and under active design.
 
 - **Implemented:** the Python/TypeScript monorepo bootstrap, reproducible
   developer tooling, Linux CI smoke checks, repository governance documents, and
-  the versioned Scenario v0 contract with validation and stable digests.
+  the versioned Scenario v0 contract with validation and stable digests, plus
+  versioned Run Event and Run Report v0 evidence contracts.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
@@ -104,6 +105,7 @@ make check
 apps/web/                  TypeScript web-package placeholder
 services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
+packages/evidence/         Run Event/Report v0 schemas and validated loaders
 packages/scenarios/        Scenario v0 schema, validation, and canonicalization
 tests/python/              Python smoke tests
 docs/                      Project documentation

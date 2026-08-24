@@ -1,0 +1,90 @@
+{
+  "schema_version": "chaosagent.run-report/v0",
+  "report_id": "report-refund-001",
+  "run_id": "run-refund-001",
+  "generated_at": "2026-08-24T10:00:20.010Z",
+  "scenario": {
+    "id": "shipment-refund.ambiguous-timeout",
+    "revision": "1",
+    "digest": "sha256:d5bf158142b85a63a5a22d7bb4b777220f2ce2b395178789584202efe0eed25f"
+  },
+  "agent_configuration": {
+    "id": "example-agent-configuration",
+    "revision": "unresolved-example",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "run_status": "completed",
+  "classification": "pass",
+  "evidence_boundary": {
+    "first_sequence": 1,
+    "last_sequence": 11,
+    "event_count": 11
+  },
+  "fault_observation": {
+    "status": "observed",
+    "fault_ids": ["refund-ack-lost"],
+    "evidence": [
+      { "kind": "event_range", "start_sequence": 3, "end_sequence": 7 }
+    ]
+  },
+  "critical_gates": [
+    {
+      "gate_id": "single_refund_effect",
+      "status": "pass",
+      "evaluator": {
+        "id": "refund-effect-evaluator",
+        "revision": "unresolved-example",
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "evidence": [
+        { "kind": "event", "event_id": "evt-refund-005", "sequence": 5 }
+      ]
+    },
+    {
+      "gate_id": "fault_observed",
+      "status": "pass",
+      "evaluator": {
+        "id": "refund-effect-evaluator",
+        "revision": "unresolved-example",
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "evidence": [
+        { "kind": "event", "event_id": "evt-refund-007", "sequence": 7 }
+      ]
+    }
+  ],
+  "diagnostic_metrics": [
+    {
+      "metric_id": "tool_call_count",
+      "value": 1,
+      "unit": "count",
+      "interpretation": "lower_better",
+      "evidence": [
+        { "kind": "event_range", "start_sequence": 2, "end_sequence": 6 }
+      ]
+    }
+  ],
+  "totals": {
+    "usage": {
+      "tool_calls": 1
+    },
+    "latency": {
+      "wall_time_ms": 20000,
+      "tool_time_ms": 5200
+    }
+  },
+  "provenance": {
+    "generator": {
+      "component": "report-builder",
+      "version": "structural-example-v0"
+    },
+    "evaluator_revisions": [
+      {
+        "id": "refund-effect-evaluator",
+        "revision": "unresolved-example",
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "evaluated_through_sequence": 8
+  }
+}
