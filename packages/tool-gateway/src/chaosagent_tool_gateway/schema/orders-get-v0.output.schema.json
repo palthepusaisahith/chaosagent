@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/orders.get/v0/output.json",
+  "title": "ChaosAgent orders.get v0 output",
+  "type": "object",
+  "required": [
+    "order_id",
+    "customer_id",
+    "status",
+    "total_minor",
+    "currency",
+    "placed_at"
+  ],
+  "properties": {
+    "order_id": { "$ref": "#/$defs/id" },
+    "customer_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["pending", "paid", "fulfilled", "cancelled"] },
+    "total_minor": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "placed_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

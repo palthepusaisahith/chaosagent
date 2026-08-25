@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import NoReturn, cast
@@ -528,6 +529,36 @@ class PersistenceRepository:
         model = self._session.get(RunModel, run_id)
         return None if model is None else self._run_record(model)
 
+    def lock_current_lease(self, lease: LeaseIdentity) -> RunRecord:
+        """Lock a Run and prove the caller holds its current unexpired lease.
+
+        The row lock is retained by the caller-owned transaction. This is the
+        fencing primitive for non-lifecycle work that must remain coherent with
+        requeue, reclaim, heartbeat, and lifecycle transitions.
+        """
+        _validate_lease_identity(lease)
+        model = self._session.scalar(
+            select(RunModel)
+            .where(RunModel.run_id == lease.run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if model is None:
+            raise ReferenceNotFoundError(f"run {lease.run_id!r} does not exist")
+        if (
+            model.status not in ACTIVE_STATUSES
+            or model.lease_owner != lease.worker_id
+            or model.lease_token != lease.lease_token
+            or model.attempt != lease.attempt
+        ):
+            raise StaleLeaseError(
+                f"worker {lease.worker_id!r} no longer owns run {lease.run_id!r} "
+                f"attempt {lease.attempt}"
+            )
+        if model.lease_expires_at is None or model.lease_expires_at <= self.database_time():
+            raise LeaseExpiredError(f"run {lease.run_id!r} lease has expired")
+        return self._run_record(model)
+
     def initialize_run_company_state(self, run_id: str) -> SyntheticCompanyState:
         """Materialize one deterministic Run-local copy before its first claim."""
         _require_identifier(run_id, "run_id")
@@ -583,6 +614,43 @@ class PersistenceRepository:
         """Read a deterministic immutable snapshot of one Run-local company state."""
         state = self._session.get(RunCompanyStateModel, run_id)
         return None if state is None else self._company_state_record(state)
+
+    def has_run_company_state(self, run_id: str) -> bool:
+        """Check materialization without reading any business entity as a tool result."""
+        return self._session.get(RunCompanyStateModel, run_id) is not None
+
+    def get_company_order(self, run_id: str, order_id: str) -> CompanyOrder | None:
+        """Read one Run-scoped synthetic order without exposing an ORM row."""
+        model = self._session.get(CompanyOrderModel, (run_id, order_id))
+        if model is None:
+            return None
+        return CompanyOrder(
+            model.order_id,
+            model.customer_id,
+            model.status,
+            model.currency,
+            model.total_minor,
+            model.placed_at,
+        )
+
+    def get_company_shipment_for_order(self, run_id: str, order_id: str) -> CompanyShipment | None:
+        """Read the sole Fixture v0 shipment associated with a Run-scoped order."""
+        model = self._session.scalar(
+            select(CompanyShipmentModel).where(
+                CompanyShipmentModel.run_id == run_id,
+                CompanyShipmentModel.order_id == order_id,
+            )
+        )
+        if model is None:
+            return None
+        return CompanyShipment(
+            model.shipment_id,
+            model.order_id,
+            model.status,
+            model.carrier,
+            model.tracking_number,
+            model.updated_at,
+        )
 
     def claim_next_run(
         self,
@@ -867,6 +935,46 @@ class PersistenceRepository:
                 error, event_id=event_id, run_id=run_id, sequence=model.sequence
             )
         return self._event_record(model)
+
+    def append_event_allocated(
+        self, run_id: str, event_factory: Callable[[int], RunEvent]
+    ) -> RunEventRecord:
+        """Allocate and append one Event v0 while serializing on the Run row.
+
+        The sequence is never exposed without its event append. Lifecycle and
+        tool producers therefore cannot abandon a reservation or separate
+        allocation from persistence. Caller-owned transaction semantics remain
+        unchanged.
+        """
+        run_exists = self._session.scalar(
+            select(RunModel.run_id).where(RunModel.run_id == run_id).with_for_update()
+        )
+        if run_exists is None:
+            raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
+        current = self._session.scalar(
+            select(func.coalesce(func.max(RunEventModel.sequence), 0)).where(
+                RunEventModel.run_id == run_id
+            )
+        )
+        sequence = cast(int, current) + 1
+        if sequence > 9_007_199_254_740_991:
+            raise PersistenceIntegrityError(
+                f"run {run_id!r} exhausted the Event v0 safe-integer sequence range"
+            )
+        event = event_factory(sequence)
+        document = event.to_dict()
+        if document["run_id"] != run_id or document["sequence"] != sequence:
+            raise PersistenceIntegrityError(
+                "allocated Event factory changed the authoritative run or sequence"
+            )
+        return self.append_event(event)
+
+    def database_time(self) -> datetime:
+        """Return PostgreSQL wall time for lease-sensitive orchestration."""
+        value = self._session.scalar(select(func.clock_timestamp()))
+        if value is None:
+            raise PersistenceIntegrityError("PostgreSQL did not return its current timestamp")
+        return cast(datetime, value)
 
     def fetch_events(
         self, run_id: str, *, after_sequence: int = 0, through_sequence: int | None = None
@@ -1207,36 +1315,26 @@ class PersistenceRepository:
         }
         if evidence.reason_code is not None:
             payload["reason_code"] = evidence.reason_code
-        document: dict[str, object] = {
-            "schema_version": "chaosagent.run-event/v0",
-            "event_id": evidence.event_id,
-            "run_id": run_id,
-            "sequence": self._next_lifecycle_event_sequence(run_id),
-            "occurred_at": _event_timestamp(occurred_at),
-            "recorded_at": _event_timestamp(occurred_at),
-            "event_type": "run.lifecycle",
-            "producer": producer,
-            "correlation_id": evidence.correlation_id or run_id,
-            "payload": payload,
-            "payload_digest": digest_payload_v0(payload),
-        }
-        if evidence.causation_event_id is not None:
-            document["causation_event_id"] = evidence.causation_event_id
-        self.append_event(loads_run_event(json.dumps(document)))
 
-    def _next_lifecycle_event_sequence(self, run_id: str) -> int:
-        """Allocate only a lifecycle evidence sequence while the Run row is locked."""
-        current = self._session.scalar(
-            select(func.coalesce(func.max(RunEventModel.sequence), 0)).where(
-                RunEventModel.run_id == run_id
-            )
-        )
-        sequence = cast(int, current) + 1
-        if sequence > 9_007_199_254_740_991:
-            raise PersistenceIntegrityError(
-                f"run {run_id!r} exhausted the Event v0 safe-integer sequence range"
-            )
-        return sequence
+        def event_factory(sequence: int) -> RunEvent:
+            document: dict[str, object] = {
+                "schema_version": "chaosagent.run-event/v0",
+                "event_id": evidence.event_id,
+                "run_id": run_id,
+                "sequence": sequence,
+                "occurred_at": _event_timestamp(occurred_at),
+                "recorded_at": _event_timestamp(occurred_at),
+                "event_type": "run.lifecycle",
+                "producer": producer,
+                "correlation_id": evidence.correlation_id or run_id,
+                "payload": payload,
+                "payload_digest": digest_payload_v0(payload),
+            }
+            if evidence.causation_event_id is not None:
+                document["causation_event_id"] = evidence.causation_event_id
+            return loads_run_event(json.dumps(document))
+
+        self.append_event_allocated(run_id, event_factory)
 
     def _raise_lease_mutation_failure(
         self, lease: LeaseIdentity, expected_version: int
@@ -1281,10 +1379,7 @@ class PersistenceRepository:
         return model
 
     def _database_clock(self) -> datetime:
-        value = self._session.scalar(select(func.clock_timestamp()))
-        if value is None:
-            raise PersistenceIntegrityError("PostgreSQL did not return its current timestamp")
-        return cast(datetime, value)
+        return self.database_time()
 
     @staticmethod
     def _verify_report_references(document: dict[str, object], run: RunModel) -> None:

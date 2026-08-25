@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/shipping.get_status/v0/output.json",
+  "title": "ChaosAgent shipping.get_status v0 output",
+  "type": "object",
+  "required": [
+    "shipment_id",
+    "order_id",
+    "status",
+    "carrier",
+    "tracking_number",
+    "updated_at"
+  ],
+  "properties": {
+    "shipment_id": { "$ref": "#/$defs/id" },
+    "order_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["pending", "in_transit", "delivered", "failed"] },
+    "carrier": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "tracking_number": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "updated_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

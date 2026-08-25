@@ -9,6 +9,7 @@ members = [
     "chaosagent-fixtures",
     "chaosagent-persistence",
     "chaosagent-scenarios",
+    "chaosagent-tool-gateway",
     "chaosagent-workspace",
 ]
 build-constraints = [{ name = "hatchling", specifier = "==1.32.0" }]
@@ -107,6 +108,25 @@ dependencies = [
 requires-dist = [
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "rfc8785", specifier = "==0.1.4" },
+]
+
+[[package]]
+name = "chaosagent-tool-gateway"
+version = "0.0.0"
+source = { editable = "packages/tool-gateway" }
+dependencies = [
+    { name = "chaosagent-evidence" },
+    { name = "chaosagent-persistence" },
+    { name = "jsonschema" },
+    { name = "sqlalchemy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-persistence", editable = "packages/persistence" },
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "sqlalchemy", specifier = "==2.0.52" },
 ]
 
 [[package]]

@@ -1,0 +1,31 @@
+{
+  "note": "Structural golden calls over fake-company.failed-shipment revision 1; no execution transcript is implied.",
+  "calls": [
+    {
+      "tool_id": "orders.get",
+      "contract_version": "chaosagent.tool/orders.get/v0",
+      "arguments": { "order_id": "ORD-1007" },
+      "expected_output": {
+        "order_id": "ORD-1007",
+        "customer_id": "CUS-042",
+        "status": "paid",
+        "total_minor": 12999,
+        "currency": "USD",
+        "placed_at": "2026-08-18T09:15:00.000Z"
+      }
+    },
+    {
+      "tool_id": "shipping.get_status",
+      "contract_version": "chaosagent.tool/shipping.get_status/v0",
+      "arguments": { "order_id": "ORD-1007" },
+      "expected_output": {
+        "shipment_id": "SHP-1007",
+        "order_id": "ORD-1007",
+        "status": "failed",
+        "carrier": "Parcel North",
+        "tracking_number": "PN-88412007",
+        "updated_at": "2026-08-23T16:40:00.000Z"
+      }
+    }
+  ]
+}

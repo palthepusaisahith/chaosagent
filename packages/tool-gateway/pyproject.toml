@@ -1,0 +1,22 @@
+[project]
+name = "chaosagent-tool-gateway"
+version = "0.0.0"
+description = "Run-scoped read-only synthetic-company tool gateway for ChaosAgent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "chaosagent-evidence",
+    "chaosagent-persistence",
+    "jsonschema==4.26.0",
+    "sqlalchemy==2.0.52",
+]
+
+[tool.uv.sources]
+chaosagent-evidence = { workspace = true }
+chaosagent-persistence = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chaosagent_tool_gateway"]
