@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/payments.refund/v0/input.json",
+  "title": "ChaosAgent payments.refund v0 input",
+  "type": "object",
+  "required": [
+    "order_id",
+    "payment_id",
+    "amount_minor",
+    "reason",
+    "idempotency_key"
+  ],
+  "properties": {
+    "order_id": { "$ref": "#/$defs/id" },
+    "payment_id": { "$ref": "#/$defs/id" },
+    "amount_minor": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "idempotency_key": { "$ref": "#/$defs/idempotencyKey" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

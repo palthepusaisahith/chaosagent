@@ -9,13 +9,16 @@ import pytest
 from chaosagent_persistence import LeaseIdentity
 from chaosagent_tool_gateway import (
     ORDERS_GET_V0,
+    PAYMENTS_REFUND_V0,
     SCENARIO_V0_SCHEMA_VERSION,
     SCENARIO_V0_TOOL_VERSIONS,
     SHIPPING_GET_STATUS_V0,
+    SUPPORT_UPDATE_TICKET_V0,
     ToolGateway,
     ToolRegistry,
     default_tool_registry,
 )
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from sqlalchemy.orm import Session
 
 
@@ -25,12 +28,13 @@ def test_default_registry_is_explicit_deterministic_and_valid() -> None:
 
     assert [(item.tool_id, item.contract_version) for item in first.definitions] == [
         ("orders.get", ORDERS_GET_V0),
+        ("payments.refund", PAYMENTS_REFUND_V0),
         ("shipping.get_status", SHIPPING_GET_STATUS_V0),
+        ("support.update_ticket", SUPPORT_UPDATE_TICKET_V0),
     ]
     assert first.definitions == second.definitions
     for definition in first.definitions:
-        assert definition.capability == "read"
-        assert definition.read_only is True
+        assert definition.read_only is (definition.capability == "read")
         # Registry construction already checks each immutable bundled schema.
         assert definition.input_schema["type"] == "object"
         assert definition.output_schema["type"] == "object"
@@ -57,7 +61,9 @@ def test_scenario_v0_has_a_frozen_tool_v0_compatibility_mapping() -> None:
     assert SCENARIO_V0_SCHEMA_VERSION == "chaosagent.scenario/v0"
     assert dict(SCENARIO_V0_TOOL_VERSIONS) == {
         "orders.get": ORDERS_GET_V0,
+        "payments.refund": PAYMENTS_REFUND_V0,
         "shipping.get_status": SHIPPING_GET_STATUS_V0,
+        "support.update_ticket": SUPPORT_UPDATE_TICKET_V0,
     }
     with pytest.raises(TypeError):
         cast(dict[str, str], SCENARIO_V0_TOOL_VERSIONS)["orders.get"] = (
@@ -101,21 +107,25 @@ def test_invalid_unknown_and_wrong_version_calls_fail_before_database_access() -
         logical_call_id="logical-1",
         attempt_id="attempt-1",
     )
-    retry = gateway.execute(
-        lease,
+    assert unknown.error is not None and unknown.error.code == "unsupported_tool"
+    assert wrong_version.error is not None and wrong_version.error.code == "unsupported_tool"
+    for result in (missing, extra):
+        assert result.error is not None and result.error.code == "invalid_request"
+        assert result.request_event_id is None
+
+
+def test_positive_physical_attempt_number_is_structurally_accepted() -> None:
+    result = ToolGateway(Session()).execute(
+        _unused_lease(),
         tool_id="orders.get",
         contract_version=ORDERS_GET_V0,
         arguments={"order_id": "ORD-1007"},
         logical_call_id="logical-1",
-        attempt_id="attempt-1",
+        attempt_id="attempt-2",
         attempt_number=2,
     )
-
-    assert unknown.error is not None and unknown.error.code == "unsupported_tool"
-    assert wrong_version.error is not None and wrong_version.error.code == "unsupported_tool"
-    for result in (missing, extra, retry):
-        assert result.error is not None and result.error.code == "invalid_request"
-        assert result.request_event_id is None
+    assert result.error is not None
+    assert result.error.code == "infrastructure_error"
 
 
 @pytest.mark.parametrize(
@@ -132,7 +142,7 @@ def test_invalid_unknown_and_wrong_version_calls_fail_before_database_access() -
         ("logical-1", "attempt-1", 0),
         ("logical-1", "attempt-1", True),
         ("logical-1", "attempt-1", "1"),
-        ("logical-1", "attempt-1", 2),
+        ("logical-1", "attempt-1", 9_007_199_254_740_992),
     ],
 )
 def test_malformed_runtime_invocation_identity_is_structured_invalid_request(
@@ -207,6 +217,8 @@ def test_golden_read_only_calls_use_registered_contracts() -> None:
     root = Path(__file__).resolve().parents[2]
     golden = root / "benchmarks/shipment-refund/tools/v0/read-only-calls.json"
     assert golden.is_file()
+    mutation_golden = root / "benchmarks/shipment-refund/tools/v0/mutation-calls.json"
+    assert mutation_golden.is_file()
 
 
 def test_all_tool_schema_resources_are_packaged() -> None:
@@ -216,8 +228,56 @@ def test_all_tool_schema_resources_are_packaged() -> None:
         "orders-get-v0.output.schema.json",
         "shipping-get-status-v0.input.schema.json",
         "shipping-get-status-v0.output.schema.json",
+        "payments-refund-v0.input.schema.json",
+        "payments-refund-v0.output.schema.json",
+        "support-update-ticket-v0.input.schema.json",
+        "support-update-ticket-v0.output.schema.json",
     ):
         assert resources.joinpath(name).is_file()
+
+
+def test_mutation_contracts_are_strict_and_use_integer_money() -> None:
+    definitions = {item.tool_id: item for item in default_tool_registry().definitions}
+    refund = definitions["payments.refund"]
+    ticket = definitions["support.update_ticket"]
+    valid_refund = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 12999,
+        "reason": "Shipment failed",
+        "idempotency_key": "refund-ord-1007",
+    }
+    assert not list(Draft202012Validator(dict(refund.input_schema)).iter_errors(valid_refund))
+    assert list(
+        Draft202012Validator(dict(refund.input_schema)).iter_errors(
+            {**valid_refund, "amount_minor": 12.99}
+        )
+    )
+    assert list(
+        Draft202012Validator(dict(refund.input_schema)).iter_errors(
+            {**valid_refund, "unexpected": True}
+        )
+    )
+    assert not list(
+        Draft202012Validator(dict(ticket.input_schema)).iter_errors(
+            {
+                "ticket_id": "TKT-204",
+                "status": "closed",
+                "note": "Refund completed.",
+                "idempotency_key": "ticket-ord-1007",
+            }
+        )
+    )
+    wrong_version = ToolGateway(Session()).execute(
+        _unused_lease(),
+        tool_id="payments.refund",
+        contract_version="chaosagent.tool/payments.refund/v1",
+        arguments=valid_refund,
+        logical_call_id="logical-refund",
+        attempt_id="attempt-refund",
+    )
+    assert wrong_version.error is not None
+    assert wrong_version.error.code == "unsupported_tool"
 
 
 def _unused_lease() -> LeaseIdentity:

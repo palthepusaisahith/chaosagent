@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import NoReturn, cast
 
 from chaosagent_evidence import (
@@ -39,6 +42,7 @@ from .models import (
     REVISION_CHECK,
     AgentConfigurationRevisionModel,
     CompanyCustomerModel,
+    CompanyEffectModel,
     CompanyOrderModel,
     CompanyPaymentModel,
     CompanyRefundModel,
@@ -115,6 +119,14 @@ class LeaseNotExpiredError(LifecycleConflictError):
 
 class CompanyStateInitializationError(PersistenceError):
     """Raised when a Run-local company state cannot be initialized safely."""
+
+
+class IdempotencyConflictError(PersistenceConflictError):
+    """Raised when an idempotency identity is reused for a different request."""
+
+
+class BusinessRuleViolationError(PersistenceError):
+    """Raised when a valid mutation request violates synthetic business state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +287,25 @@ class SyntheticCompanyState:
     payments: tuple[CompanyPayment, ...]
     refunds: tuple[CompanyRefund, ...]
     support_tickets: tuple[CompanySupportTicket, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyEffect:
+    run_id: str
+    tool_id: str
+    contract_version: str
+    idempotency_key_digest: str
+    request_digest: str
+    effect_id: str
+    effect_kind: str
+    subject_type: str
+    subject_id: str
+    result: Mapping[str, object]
+    logical_call_id: str
+    first_attempt_id: str
+    lease_attempt: int
+    created_at: datetime
+    newly_applied: bool
 
 
 def create_postgres_engine(database_url: str, *, echo: bool = False) -> Engine:
@@ -619,6 +650,14 @@ class PersistenceRepository:
         """Check materialization without reading any business entity as a tool result."""
         return self._session.get(RunCompanyStateModel, run_id) is not None
 
+    def _lock_company_mutation_run(self, run_id: str) -> None:
+        _require_identifier(run_id, "run_id")
+        locked = self._session.scalar(
+            select(RunModel.run_id).where(RunModel.run_id == run_id).with_for_update()
+        )
+        if locked is None:
+            raise ReferenceNotFoundError(f"run {run_id!r} does not exist")
+
     def get_company_order(self, run_id: str, order_id: str) -> CompanyOrder | None:
         """Read one Run-scoped synthetic order without exposing an ORM row."""
         model = self._session.get(CompanyOrderModel, (run_id, order_id))
@@ -651,6 +690,462 @@ class PersistenceRepository:
             model.tracking_number,
             model.updated_at,
         )
+
+    def get_company_payment(self, run_id: str, payment_id: str) -> CompanyPayment | None:
+        """Read one Run-scoped payment without exposing mutable ORM state."""
+        model = self._session.get(CompanyPaymentModel, (run_id, payment_id))
+        if model is None:
+            return None
+        return CompanyPayment(
+            model.payment_id,
+            model.order_id,
+            model.status,
+            model.currency,
+            model.amount_minor,
+            model.captured_at,
+        )
+
+    def get_company_support_ticket(
+        self, run_id: str, ticket_id: str
+    ) -> CompanySupportTicket | None:
+        """Read one Run-scoped support ticket without exposing mutable ORM state."""
+        model = self._session.get(CompanySupportTicketModel, (run_id, ticket_id))
+        if model is None:
+            return None
+        return CompanySupportTicket(
+            model.ticket_id,
+            model.customer_id,
+            model.order_id,
+            model.status,
+            model.subject,
+            model.note,
+            model.updated_at,
+        )
+
+    def get_company_effect(
+        self,
+        run_id: str,
+        tool_id: str,
+        contract_version: str,
+        idempotency_key_digest: str,
+    ) -> CompanyEffect | None:
+        """Fetch an immutable effect by its complete idempotency identity."""
+        model = self._session.get(
+            CompanyEffectModel,
+            (run_id, tool_id, contract_version, idempotency_key_digest),
+            populate_existing=True,
+        )
+        return None if model is None else self._company_effect_record(model, newly_applied=False)
+
+    def verify_company_effect(
+        self,
+        claimed: CompanyEffect,
+        *,
+        expected_arguments: Mapping[str, object],
+    ) -> CompanyEffect:
+        """Independently verify the ledger and transaction-visible business projection."""
+        model = self._session.get(
+            CompanyEffectModel,
+            (
+                claimed.run_id,
+                claimed.tool_id,
+                claimed.contract_version,
+                claimed.idempotency_key_digest,
+            ),
+            populate_existing=True,
+        )
+        if model is None:
+            raise PersistenceIntegrityError("mutation effect ledger row is missing")
+        trusted = self._company_effect_record(model, newly_applied=claimed.newly_applied)
+        expected_request_digest = digest_payload_v0(
+            {
+                "tool_id": trusted.tool_id,
+                "contract_version": trusted.contract_version,
+                "arguments": dict(expected_arguments),
+            }
+        )
+        key = expected_arguments.get("idempotency_key")
+        if (
+            not isinstance(key, str)
+            or trusted.request_digest != expected_request_digest
+            or trusted.idempotency_key_digest != digest_payload_v0(key)
+        ):
+            raise PersistenceIntegrityError("mutation effect request identity is inconsistent")
+        if (
+            trusted.run_id,
+            trusted.tool_id,
+            trusted.contract_version,
+            trusted.idempotency_key_digest,
+            trusted.request_digest,
+            trusted.effect_id,
+            trusted.effect_kind,
+            trusted.subject_type,
+            trusted.subject_id,
+            dict(trusted.result),
+            trusted.logical_call_id,
+            trusted.first_attempt_id,
+            trusted.lease_attempt,
+            trusted.created_at,
+        ) != (
+            claimed.run_id,
+            claimed.tool_id,
+            claimed.contract_version,
+            claimed.idempotency_key_digest,
+            claimed.request_digest,
+            claimed.effect_id,
+            claimed.effect_kind,
+            claimed.subject_type,
+            claimed.subject_id,
+            dict(claimed.result),
+            claimed.logical_call_id,
+            claimed.first_attempt_id,
+            claimed.lease_attempt,
+            claimed.created_at,
+        ):
+            raise PersistenceIntegrityError("mutation handler effect disagrees with the ledger")
+
+        result = trusted.result
+        if trusted.tool_id == "payments.refund":
+            expected = (
+                expected_arguments.get("order_id"),
+                expected_arguments.get("payment_id"),
+                expected_arguments.get("amount_minor"),
+            )
+            actual = (result["order_id"], result["payment_id"], result["amount_minor"])
+            if actual != expected:
+                raise PersistenceIntegrityError("refund effect disagrees with its request")
+            refund = self._session.get(
+                CompanyRefundModel, (trusted.run_id, trusted.subject_id), populate_existing=True
+            )
+            payment = self._session.get(
+                CompanyPaymentModel,
+                (trusted.run_id, cast(str, result["payment_id"])),
+                populate_existing=True,
+            )
+            total_refunded = self._session.scalar(
+                select(func.coalesce(func.sum(CompanyRefundModel.amount_minor), 0)).where(
+                    CompanyRefundModel.run_id == trusted.run_id,
+                    CompanyRefundModel.payment_id == result["payment_id"],
+                    CompanyRefundModel.status == "succeeded",
+                )
+            )
+            expected_payment_status = (
+                "refunded"
+                if payment is not None and cast(int, total_refunded) == payment.amount_minor
+                else "partially_refunded"
+            )
+            if (
+                refund is None
+                or payment is None
+                or not 1 <= cast(int, total_refunded) <= payment.amount_minor
+                or (
+                    refund.origin,
+                    refund.effect_id,
+                    refund.refund_id,
+                    refund.order_id,
+                    refund.payment_id,
+                    refund.amount_minor,
+                    refund.status,
+                    refund.reason,
+                    payment.order_id,
+                    payment.currency,
+                    payment.status,
+                )
+                != (
+                    "mutation",
+                    trusted.effect_id,
+                    result["refund_id"],
+                    result["order_id"],
+                    result["payment_id"],
+                    result["amount_minor"],
+                    result["status"],
+                    expected_arguments.get("reason"),
+                    result["order_id"],
+                    result["currency"],
+                    expected_payment_status,
+                )
+            ):
+                raise PersistenceIntegrityError("refund effect has no matching business projection")
+        elif trusted.tool_id == "support.update_ticket":
+            if (
+                result["ticket_id"],
+                result["status"],
+                result["note"],
+            ) != (
+                expected_arguments.get("ticket_id"),
+                expected_arguments.get("status"),
+                expected_arguments.get("note"),
+            ):
+                raise PersistenceIntegrityError("ticket effect disagrees with its request")
+            ticket = self._session.get(
+                CompanySupportTicketModel,
+                (trusted.run_id, trusted.subject_id),
+                populate_existing=True,
+            )
+            if ticket is None:
+                raise PersistenceIntegrityError("ticket effect has no business subject")
+            if trusted.newly_applied and (
+                ticket.last_effect_id,
+                ticket.status,
+                ticket.note,
+                _event_timestamp(ticket.updated_at),
+            ) != (
+                trusted.effect_id,
+                result["status"],
+                result["note"],
+                result["updated_at"],
+            ):
+                raise PersistenceIntegrityError("new ticket effect is not the current projection")
+        else:
+            raise PersistenceIntegrityError("stored mutation tool is unsupported")
+        return trusted
+
+    def apply_refund_effect(
+        self,
+        run_id: str,
+        *,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        order_id: str,
+        payment_id: str,
+        amount_minor: int,
+        reason: str,
+        logical_call_id: str,
+        attempt_id: str,
+        lease_attempt: int,
+    ) -> CompanyEffect:
+        """Serialize a refund mutation on its Run without owning the outer transaction."""
+        try:
+            with self._session.begin_nested():
+                self._lock_company_mutation_run(run_id)
+                return self._apply_refund_effect_locked(
+                    run_id,
+                    contract_version=contract_version,
+                    idempotency_key_digest=idempotency_key_digest,
+                    request_digest=request_digest,
+                    order_id=order_id,
+                    payment_id=payment_id,
+                    amount_minor=amount_minor,
+                    reason=reason,
+                    logical_call_id=logical_call_id,
+                    attempt_id=attempt_id,
+                    lease_attempt=lease_attempt,
+                )
+        except IntegrityError as error:
+            raise PersistenceIntegrityError("refund effect could not be persisted") from error
+
+    def _apply_refund_effect_locked(
+        self,
+        run_id: str,
+        *,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        order_id: str,
+        payment_id: str,
+        amount_minor: int,
+        reason: str,
+        logical_call_id: str,
+        attempt_id: str,
+        lease_attempt: int,
+    ) -> CompanyEffect:
+        """Create or replay one idempotent refund while locking its payment row."""
+        if type(amount_minor) is not int or not 1 <= amount_minor <= 9_007_199_254_740_991:
+            raise ValueError("amount_minor must be an exact positive safe integer")
+        existing = self.get_company_effect(
+            run_id, "payments.refund", contract_version, idempotency_key_digest
+        )
+        if existing is not None:
+            if existing.request_digest != request_digest:
+                raise IdempotencyConflictError(
+                    "idempotency key is already bound to a different payments.refund request"
+                )
+            return existing
+
+        payment = self._session.scalar(
+            select(CompanyPaymentModel)
+            .where(
+                CompanyPaymentModel.run_id == run_id,
+                CompanyPaymentModel.payment_id == payment_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if payment is None or payment.order_id != order_id:
+            raise ReferenceNotFoundError("Run-local order/payment reference was not found")
+        if payment.status not in {"captured", "partially_refunded"}:
+            raise BusinessRuleViolationError("payment is not refundable")
+        refunded = self._session.scalar(
+            select(func.coalesce(func.sum(CompanyRefundModel.amount_minor), 0)).where(
+                CompanyRefundModel.run_id == run_id,
+                CompanyRefundModel.payment_id == payment_id,
+                CompanyRefundModel.status == "succeeded",
+            )
+        )
+        total_after = cast(int, refunded) + amount_minor
+        if total_after > payment.amount_minor:
+            raise BusinessRuleViolationError("refund would exceed captured payment amount")
+
+        effect_id = _effect_identity(
+            run_id, "payments.refund", contract_version, idempotency_key_digest
+        )
+        refund_id = f"RFD-{effect_id.removeprefix('effect-')}"
+        applied_at = self.database_time()
+        result: dict[str, object] = {
+            "effect_id": effect_id,
+            "refund_id": refund_id,
+            "order_id": order_id,
+            "payment_id": payment_id,
+            "status": "succeeded",
+            "amount_minor": amount_minor,
+            "currency": payment.currency,
+            "application": "newly_applied",
+        }
+        effect = CompanyEffectModel(
+            run_id=run_id,
+            tool_id="payments.refund",
+            contract_version=contract_version,
+            idempotency_key_digest=idempotency_key_digest,
+            request_digest=request_digest,
+            effect_id=effect_id,
+            effect_kind="refund.created",
+            subject_type="refund",
+            subject_id=refund_id,
+            effect_state="applied",
+            result_document=result,
+            logical_call_id=logical_call_id,
+            first_attempt_id=attempt_id,
+            lease_attempt=lease_attempt,
+            created_at=applied_at,
+        )
+        self._session.add(effect)
+        self._session.flush()
+        self._session.add(
+            CompanyRefundModel(
+                run_id=run_id,
+                refund_id=refund_id,
+                payment_id=payment_id,
+                order_id=order_id,
+                status="succeeded",
+                amount_minor=amount_minor,
+                reason=reason,
+                created_at=applied_at,
+                origin="mutation",
+                effect_id=effect_id,
+            )
+        )
+        payment.status = "refunded" if total_after == payment.amount_minor else "partially_refunded"
+        self._session.flush()
+        return self._company_effect_record(effect, newly_applied=True)
+
+    def apply_support_ticket_effect(
+        self,
+        run_id: str,
+        *,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        ticket_id: str,
+        status: str,
+        note: str,
+        logical_call_id: str,
+        attempt_id: str,
+        lease_attempt: int,
+    ) -> CompanyEffect:
+        """Serialize a ticket mutation on its Run without owning the outer transaction."""
+        try:
+            with self._session.begin_nested():
+                self._lock_company_mutation_run(run_id)
+                return self._apply_support_ticket_effect_locked(
+                    run_id,
+                    contract_version=contract_version,
+                    idempotency_key_digest=idempotency_key_digest,
+                    request_digest=request_digest,
+                    ticket_id=ticket_id,
+                    status=status,
+                    note=note,
+                    logical_call_id=logical_call_id,
+                    attempt_id=attempt_id,
+                    lease_attempt=lease_attempt,
+                )
+        except IntegrityError as error:
+            raise PersistenceIntegrityError("ticket effect could not be persisted") from error
+
+    def _apply_support_ticket_effect_locked(
+        self,
+        run_id: str,
+        *,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        ticket_id: str,
+        status: str,
+        note: str,
+        logical_call_id: str,
+        attempt_id: str,
+        lease_attempt: int,
+    ) -> CompanyEffect:
+        """Create or replay one idempotent support-ticket state update."""
+        existing = self.get_company_effect(
+            run_id, "support.update_ticket", contract_version, idempotency_key_digest
+        )
+        if existing is not None:
+            if existing.request_digest != request_digest:
+                raise IdempotencyConflictError(
+                    "idempotency key is already bound to a different support.update_ticket request"
+                )
+            return existing
+
+        ticket = self._session.scalar(
+            select(CompanySupportTicketModel)
+            .where(
+                CompanySupportTicketModel.run_id == run_id,
+                CompanySupportTicketModel.ticket_id == ticket_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if ticket is None:
+            raise ReferenceNotFoundError("Run-local support ticket was not found")
+
+        effect_id = _effect_identity(
+            run_id, "support.update_ticket", contract_version, idempotency_key_digest
+        )
+        applied_at = self.database_time()
+        result: dict[str, object] = {
+            "effect_id": effect_id,
+            "ticket_id": ticket_id,
+            "status": status,
+            "note": note,
+            "updated_at": _event_timestamp(applied_at),
+            "application": "newly_applied",
+        }
+        effect = CompanyEffectModel(
+            run_id=run_id,
+            tool_id="support.update_ticket",
+            contract_version=contract_version,
+            idempotency_key_digest=idempotency_key_digest,
+            request_digest=request_digest,
+            effect_id=effect_id,
+            effect_kind="support_ticket.updated",
+            subject_type="support_ticket",
+            subject_id=ticket_id,
+            effect_state="applied",
+            result_document=result,
+            logical_call_id=logical_call_id,
+            first_attempt_id=attempt_id,
+            lease_attempt=lease_attempt,
+            created_at=applied_at,
+        )
+        self._session.add(effect)
+        self._session.flush()
+        ticket.status = status
+        ticket.note = note
+        ticket.updated_at = applied_at
+        ticket.last_effect_id = effect_id
+        self._session.flush()
+        return self._company_effect_record(effect, newly_applied=True)
 
     def claim_next_run(
         self,
@@ -1116,6 +1611,7 @@ class PersistenceRepository:
                 amount_minor=cast(int, row["amount_minor"]),
                 reason=cast(str, row["reason"]),
                 created_at=_timestamp(cast(str, row["created_at"])),
+                origin="fixture",
             )
             for row in refunds
         )
@@ -1425,6 +1921,29 @@ class PersistenceRepository:
         return FixtureRevisionRecord(fixture, model.created_at, model.created_by)
 
     @staticmethod
+    def _company_effect_record(model: CompanyEffectModel, *, newly_applied: bool) -> CompanyEffect:
+        _validate_company_effect_model(model)
+        result = deepcopy(model.result_document)
+        result["application"] = "newly_applied" if newly_applied else "already_applied"
+        return CompanyEffect(
+            run_id=model.run_id,
+            tool_id=model.tool_id,
+            contract_version=model.contract_version,
+            idempotency_key_digest=model.idempotency_key_digest,
+            request_digest=model.request_digest,
+            effect_id=model.effect_id,
+            effect_kind=model.effect_kind,
+            subject_type=model.subject_type,
+            subject_id=model.subject_id,
+            result=MappingProxyType(result),
+            logical_call_id=model.logical_call_id,
+            first_attempt_id=model.first_attempt_id,
+            lease_attempt=model.lease_attempt,
+            created_at=model.created_at,
+            newly_applied=newly_applied,
+        )
+
+    @staticmethod
     def _agent_configuration_record(
         model: AgentConfigurationRevisionModel,
     ) -> AgentConfigurationRevisionRecord:
@@ -1488,6 +2007,83 @@ class PersistenceRepository:
         return RunReportRecord(report, model.inserted_at)
 
 
+def _validate_company_effect_model(model: CompanyEffectModel) -> None:
+    result = model.result_document
+    if type(result) is not dict:
+        raise PersistenceIntegrityError("stored effect result is not an object")
+    common_valid = (
+        isinstance(model.run_id, str)
+        and isinstance(model.tool_id, str)
+        and isinstance(model.contract_version, str)
+        and _DIGEST_RE.fullmatch(model.idempotency_key_digest) is not None
+        and _DIGEST_RE.fullmatch(model.request_digest) is not None
+        and isinstance(model.effect_id, str)
+        and model.effect_id
+        == _effect_identity(
+            model.run_id,
+            model.tool_id,
+            model.contract_version,
+            model.idempotency_key_digest,
+        )
+        and result.get("effect_id") == model.effect_id
+        and result.get("application") == "newly_applied"
+        and type(model.lease_attempt) is int
+        and model.lease_attempt >= 1
+    )
+    if not common_valid:
+        raise PersistenceIntegrityError("stored effect identity/result projection is corrupt")
+    if model.tool_id == "payments.refund":
+        if set(result) != {
+            "effect_id",
+            "refund_id",
+            "order_id",
+            "payment_id",
+            "status",
+            "amount_minor",
+            "currency",
+            "application",
+        } or not (
+            model.contract_version == "chaosagent.tool/payments.refund/v0"
+            and model.effect_kind == "refund.created"
+            and model.subject_type == "refund"
+            and result.get("refund_id") == model.subject_id
+            and model.subject_id == f"RFD-{model.effect_id.removeprefix('effect-')}"
+            and all(isinstance(result.get(key), str) for key in ("order_id", "payment_id"))
+            and result.get("status") == "succeeded"
+            and type(result.get("amount_minor")) is int
+            and 1 <= cast(int, result["amount_minor"]) <= 9_007_199_254_740_991
+            and isinstance(result.get("currency"), str)
+            and re.fullmatch(r"[A-Z]{3}", cast(str, result["currency"])) is not None
+        ):
+            raise PersistenceIntegrityError("stored refund effect result is corrupt")
+        return
+    if model.tool_id == "support.update_ticket":
+        if set(result) != {
+            "effect_id",
+            "ticket_id",
+            "status",
+            "note",
+            "updated_at",
+            "application",
+        } or not (
+            model.contract_version == "chaosagent.tool/support.update_ticket/v0"
+            and model.effect_kind == "support_ticket.updated"
+            and model.subject_type == "support_ticket"
+            and result.get("ticket_id") == model.subject_id
+            and result.get("status") in {"open", "pending", "closed"}
+            and isinstance(result.get("note"), str)
+            and 1 <= len(cast(str, result["note"])) <= 4000
+            and isinstance(result.get("updated_at"), str)
+        ):
+            raise PersistenceIntegrityError("stored support-ticket effect result is corrupt")
+        try:
+            _timestamp(cast(str, result["updated_at"]))
+        except (TypeError, ValueError) as error:
+            raise PersistenceIntegrityError("stored support-ticket timestamp is corrupt") from error
+        return
+    raise PersistenceIntegrityError("stored effect tool is unsupported")
+
+
 def _timestamp(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -1517,3 +2113,10 @@ def _event_timestamp(value: datetime) -> str:
     if value.tzinfo is None:
         raise PersistenceIntegrityError("database timestamp unexpectedly lacks a timezone")
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _effect_identity(
+    run_id: str, tool_id: str, contract_version: str, idempotency_key_digest: str
+) -> str:
+    identity = "\x1f".join((run_id, tool_id, contract_version, idempotency_key_digest))
+    return f"effect-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"

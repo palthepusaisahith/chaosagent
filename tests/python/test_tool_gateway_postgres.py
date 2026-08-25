@@ -7,8 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC
 from pathlib import Path
-from threading import Barrier
-from typing import cast
+from threading import Barrier, Event
+from types import MappingProxyType
+from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
@@ -18,6 +19,7 @@ from chaosagent_evidence import RunEvent, digest_payload_v0, validate_run_event_
 from chaosagent_fixtures import load_fixture
 from chaosagent_persistence import (
     ClaimedRun,
+    CompanyEffect,
     LeaseIdentity,
     LifecycleEvidence,
     PersistenceError,
@@ -29,8 +31,11 @@ from chaosagent_persistence import (
 from chaosagent_scenarios import loads_scenario
 from chaosagent_tool_gateway import (
     ORDERS_GET_V0,
+    PAYMENTS_REFUND_V0,
     SHIPPING_GET_STATUS_V0,
+    SUPPORT_UPDATE_TICKET_V0,
     ReadOnlyCompanyState,
+    RefundMutationIntent,
     ToolExecutionResult,
     ToolGateway,
     ToolRegistry,
@@ -38,6 +43,7 @@ from chaosagent_tool_gateway import (
 )
 from sqlalchemy import Engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.postgres
@@ -82,6 +88,8 @@ def _scenario_document(*, allowed_tools: list[str] | None = None) -> dict[str, o
         document["scenario_id"] = _unique("scenario")
         document["revision"] = "1"
         cast(dict[str, object], document["agent"])["allowed_tools"] = allowed_tools
+        if "payments.refund" not in allowed_tools:
+            document["faults"] = []
     return document
 
 
@@ -144,6 +152,56 @@ def _call(
         arguments={"order_id": "ORD-1007"} if arguments is None else arguments,
         logical_call_id=logical_call_id or _unique("logical"),
         attempt_id=_unique("attempt"),
+    )
+
+
+def _refund_arguments(
+    *, key: str = "refund-ord-1007", amount_minor: int = 5000
+) -> dict[str, object]:
+    return {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": amount_minor,
+        "reason": "Shipment failed",
+        "idempotency_key": key,
+    }
+
+
+def _refund(
+    gateway: ToolGateway,
+    lease: LeaseIdentity,
+    *,
+    arguments: object | None = None,
+    logical_call_id: str | None = None,
+) -> ToolExecutionResult:
+    return _call(
+        gateway,
+        lease,
+        tool_id="payments.refund",
+        version=PAYMENTS_REFUND_V0,
+        arguments=_refund_arguments() if arguments is None else arguments,
+        logical_call_id=logical_call_id,
+    )
+
+
+def _update_ticket(
+    gateway: ToolGateway,
+    lease: LeaseIdentity,
+    *,
+    key: str = "ticket-ord-1007",
+    note: str = "Refund completed for the failed shipment.",
+) -> ToolExecutionResult:
+    return _call(
+        gateway,
+        lease,
+        tool_id="support.update_ticket",
+        version=SUPPORT_UPDATE_TICKET_V0,
+        arguments={
+            "ticket_id": "TKT-204",
+            "status": "closed",
+            "note": note,
+            "idempotency_key": key,
+        },
     )
 
 
@@ -258,11 +316,19 @@ def test_authorization_readiness_and_lease_fail_closed(gateway_engine: Engine) -
         wrong_token = _call(
             ToolGateway(session), replace(disallowed.lease, lease_token="lease-wrong")
         )
+        mutation_not_running = _refund(ToolGateway(session), provisioning.lease)
+        mutation_wrong_owner = _refund(
+            ToolGateway(session), replace(disallowed.lease, worker_id="wrong-worker")
+        )
         assert denied.error is not None and denied.error.code == "tool_not_allowed"
         assert not_initialized.error is not None and not_initialized.error.code == "run_not_ready"
         assert not_running.error is not None and not_running.error.code == "run_not_ready"
         assert wrong.error is not None and wrong.error.code == "stale_lease"
         assert wrong_token.error is not None and wrong_token.error.code == "stale_lease"
+        assert mutation_not_running.error is not None
+        assert mutation_not_running.error.code == "run_not_ready"
+        assert mutation_wrong_owner.error is not None
+        assert mutation_wrong_owner.error.code == "stale_lease"
         assert len(PersistenceRepository(session).fetch_events(disallowed_run)) == 2
         assert len(PersistenceRepository(session).fetch_events(missing_run)) == 2
 
@@ -313,7 +379,7 @@ def test_substituted_handler_receives_only_run_bound_read_capabilities(
         assert after == before
 
 
-def test_scenario_v0_rejects_hypothetical_v1_and_unmapped_tool(
+def test_scenario_v0_rejects_hypothetical_tool_v1(
     gateway_engine: Engine,
 ) -> None:
     run_id, claimed = _create_running_run(gateway_engine)
@@ -332,13 +398,7 @@ def test_scenario_v0_rejects_hypothetical_v1_and_unmapped_tool(
         contract_version="chaosagent.tool/orders.get/v1",
         handler=forbidden_handler,
     )
-    unmapped = replace(
-        order_v0,
-        tool_id="payments.refund",
-        contract_version="chaosagent.tool/payments.refund/v0",
-        handler=forbidden_handler,
-    )
-    registry = ToolRegistry((order_v0, order_v1, unmapped))
+    registry = ToolRegistry((order_v0, order_v1))
     with Session(gateway_engine) as session, session.begin():
         gateway = ToolGateway(session, registry=registry)
         v1 = _call(
@@ -346,15 +406,7 @@ def test_scenario_v0_rejects_hypothetical_v1_and_unmapped_tool(
             claimed.lease,
             version="chaosagent.tool/orders.get/v1",
         )
-        unknown_mapping = _call(
-            gateway,
-            claimed.lease,
-            tool_id="payments.refund",
-            version="chaosagent.tool/payments.refund/v0",
-        )
         assert v1.error is not None and v1.error.code == "unsupported_tool"
-        assert unknown_mapping.error is not None
-        assert unknown_mapping.error.code == "unsupported_tool"
         assert not called
         assert len(PersistenceRepository(session).fetch_events(run_id)) == 2
 
@@ -562,3 +614,1020 @@ def test_two_runs_read_only_their_run_partition(gateway_engine: Engine) -> None:
         assert dict(first.output or {})["status"] == "paid"
         assert dict(second.output or {})["status"] == "fulfilled"
         assert run_a != run_b
+
+
+def test_refund_success_replay_conflict_and_authoritative_evidence(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments()
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        first = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        replay = _refund(
+            ToolGateway(session), claimed.lease, arguments=dict(reversed(arguments.items()))
+        )
+        conflict = _refund(
+            ToolGateway(session),
+            claimed.lease,
+            arguments={**arguments, "amount_minor": 4000},
+        )
+
+        assert first.outcome == replay.outcome == "succeeded"
+        assert first.output is not None and replay.output is not None
+        assert first.output["application"] == "newly_applied"
+        assert replay.output["application"] == "already_applied"
+        assert first.output["effect_id"] == replay.output["effect_id"]
+        assert first.output["refund_id"] == replay.output["refund_id"]
+        assert first.state_evidence_event_id is not None
+        assert replay.state_evidence_event_id is None
+        assert conflict.error is not None and conflict.error.code == "idempotency_conflict"
+
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 1
+        assert state.refunds[0].refund_id == first.output["refund_id"]
+        payment = repository.get_company_payment(run_id, "PAY-1007")
+        assert payment is not None and payment.status == "partially_refunded"
+        key_digest = digest_payload_v0("refund-ord-1007")
+        effect = repository.get_company_effect(
+            run_id, "payments.refund", PAYMENTS_REFUND_V0, key_digest
+        )
+        assert effect is not None and effect.effect_id == first.output["effect_id"]
+        assert effect.request_digest == digest_payload_v0(
+            {
+                "tool_id": "payments.refund",
+                "contract_version": PAYMENTS_REFUND_V0,
+                "arguments": arguments,
+            }
+        )
+
+        mutation_events = [record.event.to_dict() for record in repository.fetch_events(run_id)[2:]]
+        assert [event["event_type"] for event in mutation_events] == [
+            "tool.requested",
+            "tool.result",
+            "state.evidence_recorded",
+            "tool.requested",
+            "tool.result",
+            "tool.requested",
+            "tool.result",
+        ]
+        evidence = cast(dict[str, object], mutation_events[2]["payload"])
+        assert evidence["evidence_id"] == effect.effect_id
+        assert evidence["fact_type"] == "refund.created"
+        assert cast(dict[str, object], evidence["subject"])["id"] == effect.subject_id
+        requested = cast(dict[str, object], mutation_events[0]["payload"])
+        assert requested["arguments_digest"] == digest_payload_v0(arguments)
+        assert requested["idempotency_key_digest"] == key_digest
+
+
+def test_mutation_handler_receives_only_pure_intent_arguments(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    refund_definition = next(
+        definition
+        for definition in default_tool_registry().definitions
+        if definition.tool_id == "payments.refund"
+    )
+    inspected = False
+
+    def handler(arguments: Mapping[str, object]) -> RefundMutationIntent:
+        nonlocal inspected
+        inspected = True
+        assert set(arguments) == {
+            "order_id",
+            "payment_id",
+            "amount_minor",
+            "reason",
+            "idempotency_key",
+        }
+        return RefundMutationIntent(
+            order_id=cast(str, arguments["order_id"]),
+            payment_id=cast(str, arguments["payment_id"]),
+            amount_minor=cast(int, arguments["amount_minor"]),
+            reason=cast(str, arguments["reason"]),
+        )
+
+    registry = ToolRegistry((replace(refund_definition, handler=handler),))
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(ToolGateway(session, registry=registry), claimed.lease)
+        assert result.outcome == "succeeded"
+        assert inspected
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 1
+
+
+def test_refund_business_rules_missing_entities_and_integer_contract(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        missing = _refund(
+            gateway,
+            claimed.lease,
+            arguments={**_refund_arguments(key="missing"), "payment_id": "PAY-MISSING"},
+        )
+        too_much = _refund(
+            gateway,
+            claimed.lease,
+            arguments=_refund_arguments(key="too-much", amount_minor=13000),
+        )
+        floating = _refund(
+            gateway,
+            claimed.lease,
+            arguments={**_refund_arguments(key="float"), "amount_minor": 12.99},
+        )
+        assert missing.error is not None and missing.error.code == "entity_not_found"
+        assert too_much.error is not None and too_much.error.code == "business_rule_violation"
+        assert floating.error is not None and floating.error.code == "invalid_request"
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+
+
+@pytest.mark.parametrize(
+    "amount_minor",
+    [5000.0, json.loads("5e3"), True, False, 0, -1, "5000"],
+    ids=["integral-float", "exponent-float", "true", "false", "zero", "negative", "string"],
+)
+def test_refund_runtime_requires_exact_positive_integer_before_evidence(
+    gateway_engine: Engine, amount_minor: object
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(
+            ToolGateway(session),
+            claimed.lease,
+            arguments={**_refund_arguments(), "amount_minor": amount_minor},
+        )
+        assert result.error is not None and result.error.code == "invalid_request"
+        repository = PersistenceRepository(session)
+        assert len(repository.fetch_events(run_id)) == 2
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert (
+            repository.get_company_effect(
+                run_id,
+                "payments.refund",
+                PAYMENTS_REFUND_V0,
+                digest_payload_v0("refund-ord-1007"),
+            )
+            is None
+        )
+
+
+def test_fabricated_mutation_handler_cannot_apply_or_emit_authoritative_evidence(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    refund_definition = next(
+        definition
+        for definition in default_tool_registry().definitions
+        if definition.tool_id == "payments.refund"
+    )
+
+    def fabricated(_arguments: Mapping[str, object]) -> CompanyEffect:
+        return CompanyEffect(
+            run_id=run_id,
+            tool_id="payments.refund",
+            contract_version=PAYMENTS_REFUND_V0,
+            idempotency_key_digest="sha256:" + "b" * 64,
+            request_digest="sha256:" + "c" * 64,
+            effect_id="effect-fabricated",
+            effect_kind="refund.created",
+            subject_type="refund",
+            subject_id="RFD-fabricated",
+            result=MappingProxyType({"application": "newly_applied"}),
+            logical_call_id="fabricated",
+            first_attempt_id="fabricated",
+            lease_attempt=1,
+            created_at=claimed.run.created_at,
+            newly_applied=True,
+        )
+
+    registry = ToolRegistry((replace(refund_definition, handler=fabricated),))  # type: ignore[arg-type]
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(ToolGateway(session, registry=registry), claimed.lease)
+        assert result.error is not None and result.error.code == "infrastructure_error"
+        assert result.state_evidence_event_id is None
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert [
+            record.event.to_dict()["event_type"] for record in repository.fetch_events(run_id)
+        ] == [
+            "run.lifecycle",
+            "run.lifecycle",
+            "tool.requested",
+            "tool.result",
+        ]
+
+
+@pytest.mark.parametrize("fabrication", ["identity", "subject", "result"])
+def test_authoritative_verification_rejects_fabricated_repository_effect(
+    gateway_engine: Engine, fabrication: str
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        original = gateway._repository.apply_refund_effect
+
+        def fabricated_apply(*args: object, **kwargs: object) -> CompanyEffect:
+            applied = original(*args, **kwargs)  # type: ignore[arg-type]
+            if fabrication == "identity":
+                return replace(applied, effect_id="effect-fabricated")
+            if fabrication == "subject":
+                return replace(applied, subject_id="RFD-fabricated")
+            changed = dict(applied.result)
+            changed["amount_minor"] = 1
+            return replace(applied, result=MappingProxyType(changed))
+
+        gateway._repository.apply_refund_effect = fabricated_apply  # type: ignore[method-assign]
+        result = _refund(gateway, claimed.lease)
+        assert result.error is not None and result.error.code == "infrastructure_error"
+        assert result.state_evidence_event_id is None
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert (
+            repository.get_company_effect(
+                run_id,
+                "payments.refund",
+                PAYMENTS_REFUND_V0,
+                digest_payload_v0("refund-ord-1007"),
+            )
+            is None
+        )
+
+
+def test_support_update_success_replay_conflict_and_missing_ticket(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        first = _update_ticket(gateway, claimed.lease)
+        replay = _update_ticket(gateway, claimed.lease)
+        conflict = _update_ticket(gateway, claimed.lease, note="Changed note")
+        missing = _call(
+            gateway,
+            claimed.lease,
+            tool_id="support.update_ticket",
+            version=SUPPORT_UPDATE_TICKET_V0,
+            arguments={
+                "ticket_id": "TKT-MISSING",
+                "status": "closed",
+                "note": "No ticket",
+                "idempotency_key": "missing-ticket",
+            },
+        )
+        assert first.output is not None and replay.output is not None
+        assert first.output["effect_id"] == replay.output["effect_id"]
+        assert first.output["application"] == "newly_applied"
+        assert replay.output["application"] == "already_applied"
+        assert conflict.error is not None and conflict.error.code == "idempotency_conflict"
+        assert missing.error is not None and missing.error.code == "entity_not_found"
+        ticket = PersistenceRepository(session).get_company_support_ticket(run_id, "TKT-204")
+        assert ticket is not None
+        assert ticket.status == "closed"
+        assert ticket.note == "Refund completed for the failed shipment."
+        evidence = [
+            record.event.to_dict()
+            for record in PersistenceRepository(session).fetch_events(run_id)
+            if record.event.to_dict()["event_type"] == "state.evidence_recorded"
+        ]
+        assert len(evidence) == 1
+        assert cast(dict[str, object], evidence[0]["payload"])["fact_type"] == (
+            "support_ticket.updated"
+        )
+
+
+def test_historical_ticket_replay_does_not_revert_newer_effect_or_emit_state_evidence(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        first = _call(
+            gateway,
+            claimed.lease,
+            tool_id="support.update_ticket",
+            version=SUPPORT_UPDATE_TICKET_V0,
+            arguments={
+                "ticket_id": "TKT-204",
+                "status": "pending",
+                "note": "First historical update.",
+                "idempotency_key": "ticket-history-a",
+            },
+        )
+        second = _call(
+            gateway,
+            claimed.lease,
+            tool_id="support.update_ticket",
+            version=SUPPORT_UPDATE_TICKET_V0,
+            arguments={
+                "ticket_id": "TKT-204",
+                "status": "closed",
+                "note": "Current update.",
+                "idempotency_key": "ticket-history-b",
+            },
+        )
+        replay = _call(
+            gateway,
+            claimed.lease,
+            tool_id="support.update_ticket",
+            version=SUPPORT_UPDATE_TICKET_V0,
+            arguments={
+                "ticket_id": "TKT-204",
+                "status": "pending",
+                "note": "First historical update.",
+                "idempotency_key": "ticket-history-a",
+            },
+        )
+        assert first.output is not None and second.output is not None and replay.output is not None
+        assert replay.output["effect_id"] == first.output["effect_id"]
+        assert replay.output["application"] == "already_applied"
+        assert replay.state_evidence_event_id is None
+        ticket = PersistenceRepository(session).get_company_support_ticket(run_id, "TKT-204")
+        assert ticket is not None and (ticket.status, ticket.note) == (
+            "closed",
+            "Current update.",
+        )
+
+
+def test_historical_refund_replay_does_not_reapply_or_revert_payment_state(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        first = _refund(
+            gateway,
+            claimed.lease,
+            arguments=_refund_arguments(key="refund-history-a", amount_minor=4000),
+        )
+        second = _refund(
+            gateway,
+            claimed.lease,
+            arguments=_refund_arguments(key="refund-history-b", amount_minor=8000),
+        )
+        replay = _refund(
+            gateway,
+            claimed.lease,
+            arguments=_refund_arguments(key="refund-history-a", amount_minor=4000),
+        )
+        assert first.output is not None and second.output is not None and replay.output is not None
+        assert replay.output["effect_id"] == first.output["effect_id"]
+        assert replay.output["application"] == "already_applied"
+        assert replay.state_evidence_event_id is None
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 2
+        assert sum(refund.amount_minor for refund in state.refunds) == 12000
+        payment = repository.get_company_payment(run_id, "PAY-1007")
+        assert payment is not None and payment.status == "partially_refunded"
+
+
+def test_support_update_is_run_isolated(gateway_engine: Engine) -> None:
+    run_a, claimed_a = _create_running_run(gateway_engine)
+    run_b, _claimed_b = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        result = _update_ticket(ToolGateway(session), claimed_a.lease)
+        assert result.outcome == "succeeded"
+        repository = PersistenceRepository(session)
+        ticket_a = repository.get_company_support_ticket(run_a, "TKT-204")
+        ticket_b = repository.get_company_support_ticket(run_b, "TKT-204")
+        assert ticket_a is not None and ticket_a.status == "closed"
+        assert ticket_b is not None and ticket_b.status == "open"
+
+
+def test_unauthorized_mutation_and_caller_rollback_leave_no_effect(
+    gateway_engine: Engine,
+) -> None:
+    denied_run, denied_claimed = _create_running_run(gateway_engine, allowed_tools=["orders.get"])
+    rolled_back_run, rolled_back_claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        denied = _refund(ToolGateway(session), denied_claimed.lease)
+        assert denied.error is not None and denied.error.code == "tool_not_allowed"
+        assert len(PersistenceRepository(session).fetch_events(denied_run)) == 2
+
+    with Session(gateway_engine) as session:
+        transaction = session.begin()
+        applied = _refund(ToolGateway(session), rolled_back_claimed.lease)
+        assert applied.outcome == "succeeded"
+        transaction.rollback()
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(rolled_back_run)
+        assert state is not None and state.refunds == ()
+        assert len(repository.fetch_events(rolled_back_run)) == 2
+
+
+def test_concurrent_refunds_enforce_idempotency_conflicts_and_capture_limit(
+    gateway_engine: Engine,
+) -> None:
+    def race(
+        lease: LeaseIdentity,
+        arguments: dict[str, object],
+        barrier: Barrier,
+    ) -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _refund(ToolGateway(session), lease, arguments=arguments)
+
+    same_run, same_claimed = _create_running_run(gateway_engine)
+    same_barrier = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(race, same_claimed.lease, _refund_arguments(key="same-key"), same_barrier)
+            for _ in range(2)
+        ]
+        same = [future.result(timeout=20) for future in futures]
+    assert sorted(cast(str, result.output["application"]) for result in same if result.output) == [
+        "already_applied",
+        "newly_applied",
+    ]
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(same_run)
+        assert state is not None and len(state.refunds) == 1
+
+    conflict_run, conflict_claimed = _create_running_run(gateway_engine)
+    conflict_barrier = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                race,
+                conflict_claimed.lease,
+                _refund_arguments(key="conflict-key", amount_minor=amount),
+                conflict_barrier,
+            )
+            for amount in (4000, 5000)
+        ]
+        conflict_results = [future.result(timeout=20) for future in futures]
+    assert sorted(result.outcome for result in conflict_results) == ["failed", "succeeded"]
+    assert any(
+        result.error is not None and result.error.code == "idempotency_conflict"
+        for result in conflict_results
+    )
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(conflict_run)
+        assert state is not None and len(state.refunds) == 1
+
+    limited_run, limited_claimed = _create_running_run(gateway_engine)
+    limited_barrier = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                race,
+                limited_claimed.lease,
+                _refund_arguments(key=f"distinct-{index}", amount_minor=8000),
+                limited_barrier,
+            )
+            for index in range(2)
+        ]
+        limited = [future.result(timeout=20) for future in futures]
+    assert sorted(result.outcome for result in limited) == ["failed", "succeeded"]
+    assert any(
+        result.error is not None and result.error.code == "business_rule_violation"
+        for result in limited
+    )
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(limited_run)
+        assert state is not None
+        assert sum(refund.amount_minor for refund in state.refunds) == 8000
+
+
+def test_direct_repository_same_key_waits_for_run_lock_and_survives_first_rollback(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    first_applied = Event()
+    second_entered = Event()
+    release_first = Event()
+    key_digest = digest_payload_v0("direct-rollback-key")
+    arguments = _refund_arguments(key="direct-rollback-key")
+    request_digest = digest_payload_v0(
+        {
+            "tool_id": "payments.refund",
+            "contract_version": PAYMENTS_REFUND_V0,
+            "arguments": arguments,
+        }
+    )
+
+    def apply_direct(session: Session, attempt_id: str) -> CompanyEffect:
+        return PersistenceRepository(session).apply_refund_effect(
+            run_id,
+            contract_version=PAYMENTS_REFUND_V0,
+            idempotency_key_digest=key_digest,
+            request_digest=request_digest,
+            order_id="ORD-1007",
+            payment_id="PAY-1007",
+            amount_minor=5000,
+            reason="Customer requested refund after failed delivery.",
+            logical_call_id=f"logical-{attempt_id}",
+            attempt_id=attempt_id,
+            lease_attempt=claimed.lease.attempt,
+        )
+
+    def first_writer() -> None:
+        with Session(gateway_engine) as session:
+            transaction = session.begin()
+            apply_direct(session, "direct-first")
+            assert session.scalar(text("SELECT 1")) == 1
+            first_applied.set()
+            assert release_first.wait(timeout=10)
+            transaction.rollback()
+
+    def second_writer() -> CompanyEffect:
+        assert first_applied.wait(timeout=10)
+        with Session(gateway_engine) as session, session.begin():
+            second_entered.set()
+            effect = apply_direct(session, "direct-second")
+            assert session.scalar(text("SELECT 1")) == 1
+            return effect
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_writer)
+        second_future = pool.submit(second_writer)
+        assert second_entered.wait(timeout=10)
+        release_first.set()
+        first_future.result(timeout=20)
+        winner = second_future.result(timeout=20)
+    assert winner.newly_applied
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 1
+
+
+def test_concurrent_support_same_key_applies_once(gateway_engine: Engine) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    barrier = Barrier(2)
+
+    def update() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _update_ticket(ToolGateway(session), claimed.lease)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            future.result(timeout=20) for future in (pool.submit(update), pool.submit(update))
+        ]
+    assert sorted(
+        cast(str, result.output["application"]) for result in results if result.output
+    ) == [
+        "already_applied",
+        "newly_applied",
+    ]
+    with Session(gateway_engine) as session:
+        ticket = PersistenceRepository(session).get_company_support_ticket(run_id, "TKT-204")
+        assert ticket is not None and ticket.status == "closed"
+
+
+def test_mutation_is_run_isolated_and_stale_worker_cannot_apply_after_reclaim(
+    gateway_engine: Engine,
+) -> None:
+    run_a, claimed_a = _create_running_run(gateway_engine)
+    run_b, claimed_b = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        first = _refund(
+            ToolGateway(session),
+            claimed_a.lease,
+            arguments=_refund_arguments(key="shared-cross-run-key"),
+        )
+        second = _refund(
+            ToolGateway(session),
+            claimed_b.lease,
+            arguments=_refund_arguments(key="shared-cross-run-key"),
+        )
+        assert first.output is not None and second.output is not None
+        assert first.output["effect_id"] != second.output["effect_id"]
+        state_a = PersistenceRepository(session).get_run_company_state(run_a)
+        state_b = PersistenceRepository(session).get_run_company_state(run_b)
+        assert state_a is not None and len(state_a.refunds) == 1
+        assert state_b is not None and len(state_b.refunds) == 1
+
+    stale_run, stale_claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        session.execute(
+            text(
+                "UPDATE public.runs SET "
+                "heartbeat_at = clock_timestamp() - interval '2 hours', "
+                "lease_expires_at = clock_timestamp() - interval '1 hour' "
+                "WHERE run_id = :run_id"
+            ),
+            {"run_id": stale_run},
+        )
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        queued = repository.requeue_expired_run(
+            stale_run,
+            expected_version=stale_claimed.run.lifecycle_version,
+            evidence=_evidence("requeue-mutation"),
+        )
+        reclaimed = repository.claim_next_run(
+            "replacement-worker",
+            lease_duration_seconds=600,
+            evidence=_evidence("reclaim-mutation"),
+            run_id=stale_run,
+        )
+        assert reclaimed is not None
+        running = repository.transition_owned_run(
+            reclaimed.lease,
+            "running",
+            expected_version=reclaimed.run.lifecycle_version,
+            evidence=_evidence("rerunning-mutation"),
+        )
+        assert queued.attempt < running.attempt
+        reclaimed = ClaimedRun(running, reclaimed.lease)
+    with Session(gateway_engine) as session, session.begin():
+        stale = _refund(ToolGateway(session), stale_claimed.lease)
+        current = _refund(ToolGateway(session), reclaimed.lease)
+        assert stale.error is not None and stale.error.code == "stale_lease"
+        assert current.outcome == "succeeded"
+        state = PersistenceRepository(session).get_run_company_state(stale_run)
+        assert state is not None and len(state.refunds) == 1
+
+
+def test_effect_evidence_failure_rolls_back_mutation_and_outer_transaction_remains_usable(
+    gateway_engine: Engine,
+) -> None:
+    class FailingEvidenceGateway(ToolGateway):
+        def _append_event(
+            self,
+            run_id: str,
+            event_id: str,
+            event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
+            payload: dict[str, object],
+            *,
+            correlation_id: str,
+            causation_event_id: str | None,
+        ) -> None:
+            if event_type == "state.evidence_recorded":
+                raise PersistenceError("forced authoritative evidence failure")
+            super()._append_event(
+                run_id,
+                event_id,
+                event_type,
+                payload,
+                correlation_id=correlation_id,
+                causation_event_id=causation_event_id,
+            )
+
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        failed = _refund(FailingEvidenceGateway(session), claimed.lease)
+        assert failed.error is not None and failed.error.code == "infrastructure_error"
+        read = _call(ToolGateway(session), claimed.lease)
+        assert read.outcome == "succeeded"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        event_types = [
+            record.event.to_dict()["event_type"] for record in repository.fetch_events(run_id)
+        ]
+        assert event_types == [
+            "run.lifecycle",
+            "run.lifecycle",
+            "tool.requested",
+            "tool.result",
+        ]
+
+
+@pytest.mark.parametrize("stage", ["ledger", "business", "output"])
+def test_mutation_internal_failure_stages_rollback_and_preserve_outer_transaction(
+    gateway_engine: Engine, stage: str
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        original_apply = gateway._repository.apply_refund_effect
+        original_verify = gateway._repository.verify_company_effect
+
+        if stage == "ledger":
+
+            def fail_apply(*_args: object, **_kwargs: object) -> CompanyEffect:
+                raise PersistenceError("forced ledger failure")
+
+            gateway._repository.apply_refund_effect = fail_apply  # type: ignore[method-assign]
+        elif stage == "business":
+
+            def fail_after_apply(*args: object, **kwargs: object) -> CompanyEffect:
+                original_apply(*args, **kwargs)  # type: ignore[arg-type]
+                raise PersistenceError("forced business projection failure")
+
+            gateway._repository.apply_refund_effect = fail_after_apply  # type: ignore[method-assign]
+        else:
+
+            def invalid_verified_output(
+                claimed: CompanyEffect, *, expected_arguments: Mapping[str, object]
+            ) -> CompanyEffect:
+                verified = original_verify(claimed, expected_arguments=expected_arguments)
+                changed = dict(verified.result)
+                changed["status"] = "fabricated"
+                return replace(verified, result=MappingProxyType(changed))
+
+            gateway._repository.verify_company_effect = invalid_verified_output  # type: ignore[method-assign]
+
+        failed = _refund(gateway, claimed.lease)
+        assert failed.error is not None and failed.error.code == "infrastructure_error"
+        assert session.scalar(text("SELECT 1")) == 1
+        read = _call(ToolGateway(session), claimed.lease)
+        assert read.outcome == "succeeded"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert (
+            repository.get_company_effect(
+                run_id,
+                "payments.refund",
+                PAYMENTS_REFUND_V0,
+                digest_payload_v0("refund-ord-1007"),
+            )
+            is None
+        )
+
+
+def test_mutation_result_evidence_failure_rolls_back_request_and_effect(
+    gateway_engine: Engine,
+) -> None:
+    class FailingResultGateway(ToolGateway):
+        def _append_event(
+            self,
+            run_id: str,
+            event_id: str,
+            event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
+            payload: dict[str, object],
+            *,
+            correlation_id: str,
+            causation_event_id: str | None,
+        ) -> None:
+            if event_type == "tool.result":
+                raise PersistenceError("forced result evidence failure")
+            super()._append_event(
+                run_id,
+                event_id,
+                event_type,
+                payload,
+                correlation_id=correlation_id,
+                causation_event_id=causation_event_id,
+            )
+
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(FailingResultGateway(session), claimed.lease)
+        assert result.error is not None and result.error.code == "infrastructure_error"
+        assert session.scalar(text("SELECT 1")) == 1
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert len(repository.fetch_events(run_id)) == 2
+
+
+def test_effect_ledger_database_constraints_and_immutability(gateway_engine: Engine) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(ToolGateway(session), claimed.lease)
+        assert result.output is not None
+        effect_id = cast(str, result.output["effect_id"])
+
+    for statement in (
+        "UPDATE public.company_effects SET effect_state = 'applied' "
+        "WHERE run_id = :run_id AND effect_id = :effect_id",
+        "DELETE FROM public.company_effects WHERE run_id = :run_id AND effect_id = :effect_id",
+    ):
+        with gateway_engine.connect() as connection:
+            transaction = connection.begin()
+            with pytest.raises(DBAPIError, match="append-only"):
+                connection.execute(text(statement), {"run_id": run_id, "effect_id": effect_id})
+            transaction.rollback()
+
+    invalid = {
+        "run_id": run_id,
+        "tool_id": "payments.refund",
+        "contract_version": PAYMENTS_REFUND_V0,
+        "idempotency_key_digest": "sha256:" + "b" * 64,
+        "request_digest": "sha256:" + "a" * 64,
+        "effect_id": "effect-invalid",
+        "effect_kind": "refund.created",
+        "subject_type": "refund",
+        "subject_id": "RFD-invalid",
+        "effect_state": "applied",
+        "result_document": json.dumps(
+            {
+                "effect_id": "effect-invalid",
+                "refund_id": "RFD-invalid",
+                "order_id": "ORD-1007",
+                "payment_id": "PAY-1007",
+                "status": "succeeded",
+                "amount_minor": 1,
+                "currency": "USD",
+                "application": "newly_applied",
+            }
+        ),
+        "logical_call_id": "logical-invalid",
+        "first_attempt_id": "attempt-invalid",
+        "lease_attempt": 1,
+    }
+    insert = text(
+        "INSERT INTO public.company_effects ("
+        "run_id, tool_id, contract_version, idempotency_key_digest, request_digest, "
+        "effect_id, effect_kind, subject_type, subject_id, effect_state, "
+        "result_document, logical_call_id, first_attempt_id, lease_attempt"
+        ") VALUES ("
+        ":run_id, :tool_id, :contract_version, :idempotency_key_digest, "
+        ":request_digest, :effect_id, :effect_kind, :subject_type, :subject_id, "
+        ":effect_state, CAST(:result_document AS jsonb), :logical_call_id, "
+        ":first_attempt_id, :lease_attempt)"
+    )
+    for changes in (
+        {"idempotency_key_digest": "not-a-digest"},
+        {"result_document": json.dumps({})},
+        {
+            "result_document": json.dumps(
+                {
+                    "effect_id": "effect-invalid",
+                    "refund_id": "RFD-invalid",
+                    "order_id": "ORD-1007",
+                    "payment_id": "PAY-1007",
+                    "status": "succeeded",
+                    "amount_minor": 1,
+                    "application": "newly_applied",
+                }
+            )
+        },
+        {
+            "result_document": json.dumps(
+                {
+                    "effect_id": "effect-invalid",
+                    "refund_id": "RFD-invalid",
+                    "order_id": "ORD-1007",
+                    "payment_id": "PAY-1007",
+                    "status": "succeeded",
+                    "amount_minor": 1.0,
+                    "currency": "USD",
+                    "application": "newly_applied",
+                }
+            )
+        },
+    ):
+        with gateway_engine.connect() as connection:
+            transaction = connection.begin()
+            with pytest.raises(IntegrityError):
+                connection.execute(insert, {**invalid, **changes})
+            transaction.rollback()
+
+    with gateway_engine.connect() as connection:
+        transaction = connection.begin()
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO public.company_refunds ("
+                    "run_id, refund_id, payment_id, order_id, status, amount_minor, reason, "
+                    "created_at, origin, effect_id) VALUES ("
+                    ":run_id, 'RFD-orphan', 'PAY-1007', 'ORD-1007', 'succeeded', 1, "
+                    "'orphan', clock_timestamp(), 'mutation', NULL)"
+                ),
+                {"run_id": run_id},
+            )
+        transaction.rollback()
+
+
+def test_corrupt_stored_effect_fails_replay_closed_without_success_evidence(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session, session.begin():
+        first = _refund(ToolGateway(session), claimed.lease)
+        assert first.outcome == "succeeded"
+
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.company_effects DISABLE TRIGGER company_effects_immutable")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.company_effects SET result_document = "
+                "result_document || '{\"unexpected\": true}'::jsonb "
+                "WHERE run_id = :run_id AND tool_id = 'payments.refund'"
+            ),
+            {"run_id": run_id},
+        )
+        connection.execute(
+            text("ALTER TABLE public.company_effects ENABLE TRIGGER company_effects_immutable")
+        )
+
+    with Session(gateway_engine) as session, session.begin():
+        replay = _refund(ToolGateway(session), claimed.lease)
+        assert replay.error is not None and replay.error.code == "infrastructure_error"
+        assert replay.output is None and replay.state_evidence_event_id is None
+        events = PersistenceRepository(session).fetch_events(run_id)
+        assert [event.event.to_dict()["event_type"] for event in events[-2:]] == [
+            "tool.requested",
+            "tool.result",
+        ]
+        assert (
+            cast(dict[str, object], events[-1].event.to_dict()["payload"])["error_code"]
+            == "infrastructure_error"
+        )
+
+
+def test_mutation_and_lifecycle_race_preserves_unique_event_sequence(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    barrier = Barrier(2)
+
+    def mutate() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _refund(ToolGateway(session), claimed.lease)
+
+    def transition() -> None:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            PersistenceRepository(session).transition_owned_run(
+                claimed.lease,
+                "evaluating",
+                expected_version=claimed.run.lifecycle_version,
+                evidence=_evidence("evaluating-mutation-race"),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        mutation_future = pool.submit(mutate)
+        transition_future = pool.submit(transition)
+        transition_future.result(timeout=20)
+        mutation = mutation_future.result(timeout=20)
+
+    with Session(gateway_engine) as session:
+        documents = [
+            record.event.to_dict() for record in PersistenceRepository(session).fetch_events(run_id)
+        ]
+        sequences = [cast(int, document["sequence"]) for document in documents]
+        assert sequences == list(range(1, len(sequences) + 1))
+        assert len(sequences) == len(set(sequences))
+        mutation_types = [
+            document["event_type"]
+            for document in documents
+            if document["event_type"]
+            in {
+                "tool.requested",
+                "tool.result",
+                "state.evidence_recorded",
+            }
+        ]
+        if mutation.outcome == "succeeded":
+            assert mutation_types == [
+                "tool.requested",
+                "tool.result",
+                "state.evidence_recorded",
+            ]
+        else:
+            assert mutation.error is not None and mutation.error.code == "run_not_ready"
+            assert mutation_types == []
+
+
+def test_concurrent_read_mutation_and_lifecycle_share_one_sequence_domain(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    barrier = Barrier(3)
+
+    def read() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _call(ToolGateway(session), claimed.lease)
+
+    def mutate() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _refund(ToolGateway(session), claimed.lease)
+
+    def transition() -> None:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            PersistenceRepository(session).transition_owned_run(
+                claimed.lease,
+                "evaluating",
+                expected_version=claimed.run.lifecycle_version,
+                evidence=_evidence("evaluating-three-way-race"),
+            )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        read_future = pool.submit(read)
+        mutation_future = pool.submit(mutate)
+        transition_future = pool.submit(transition)
+        transition_future.result(timeout=20)
+        read_result = read_future.result(timeout=20)
+        mutation_result = mutation_future.result(timeout=20)
+
+    for result in (read_result, mutation_result):
+        if result.outcome != "succeeded":
+            assert result.error is not None and result.error.code == "run_not_ready"
+    with Session(gateway_engine) as session:
+        events = PersistenceRepository(session).fetch_events(run_id)
+        sequences = [cast(int, record.event.to_dict()["sequence"]) for record in events]
+        assert sequences == list(range(1, len(sequences) + 1))
+        assert len(sequences) == len(set(sequences))

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/support.update_ticket/v0/input.json",
+  "title": "ChaosAgent support.update_ticket v0 input",
+  "type": "object",
+  "required": ["ticket_id", "status", "note", "idempotency_key"],
+  "properties": {
+    "ticket_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["open", "pending", "closed"] },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "idempotency_key": { "$ref": "#/$defs/idempotencyKey" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

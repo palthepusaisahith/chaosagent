@@ -3,10 +3,11 @@
 ## Scope and ownership
 
 This package is the PostgreSQL adapter introduced by Issue #5 and extended by
-Issues #6–#7. It persists validated Scenario and Fixture revisions, unresolved
-Agent Configuration revision references, Runs, isolated Run-local synthetic
-company state, Run Event evidence, and one final Run Report per Run. It does not
-implement workers, evaluation, agent-facing tools, fault behavior, or streaming.
+Issues #6–#7 and #9. It persists validated Scenario and Fixture revisions,
+unresolved Agent Configuration revision references, Runs, isolated Run-local
+synthetic company state, Run Event evidence, and one final Run Report per Run.
+It does not implement workers, evaluation, agent-facing tools, fault behavior,
+or streaming.
 
 The tables have deliberately different responsibilities:
 
@@ -29,6 +30,9 @@ The tables have deliberately different responsibilities:
 - `run_reports` stores one validated, final Run Report document per Run. V0 does
   not support replacing or rebuilding a report. A future versioned-report policy
   requires an explicit migration and contract decision.
+- `company_effects` stores the immutable Issue #9 idempotency/effect ledger for
+  the two synthetic mutation tools. Its full identity, locking, evidence, and
+  exactly-once scope are documented in the mutation-tool contract.
 
 Campaigns remain outside this package. Scenario v0's trial intent does not
 become campaign persistence here, preserving the boundary established in Issue
@@ -150,13 +154,13 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #7
+## Deferred beyond Issue #9
 
 - worker processes/daemons and automatic recovery scheduling;
-- downstream propagation of committed Run ownership/fencing identities to later
-  business effects;
+- external side-effect fencing or reconciliation beyond the committed local
+  synthetic effect ledger;
 - Campaign persistence and campaign statistics;
-- agent-facing synthetic-company tools and mutation APIs, fault activations,
-  approvals, evaluators, SSE, telemetry, exports, and deployment role creation;
+- fault activations, approvals, evaluators, SSE, telemetry, exports, and
+  deployment role creation;
 - an actual versioned Agent Configuration document contract;
 - any report rebuild/version history policy.

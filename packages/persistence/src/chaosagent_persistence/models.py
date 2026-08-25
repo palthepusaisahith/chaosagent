@@ -555,6 +555,12 @@ class CompanyRefundModel(Base):
     __tablename__ = "company_refunds"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'succeeded', 'failed')", name="status_value"),
+        CheckConstraint("origin IN ('fixture', 'mutation')", name="origin_value"),
+        CheckConstraint(
+            "(origin = 'fixture' AND effect_id IS NULL) OR "
+            "(origin = 'mutation' AND effect_id IS NOT NULL)",
+            name="origin_effect",
+        ),
         CheckConstraint("amount_minor BETWEEN 1 AND 9007199254740991", name="amount_minor_safe"),
         ForeignKeyConstraint(
             ["run_id", "payment_id", "order_id"],
@@ -564,6 +570,17 @@ class CompanyRefundModel(Base):
                 "public.company_payments.order_id",
             ],
             name="fk_company_refunds_payment_order",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "effect_id"],
+            ["public.company_effects.run_id", "public.company_effects.effect_id"],
+            name="fk_company_refunds_effect",
+        ),
+        Index(
+            "ix_company_refunds_run_payment_succeeded",
+            "run_id",
+            "payment_id",
+            postgresql_where=text("status = 'succeeded'"),
         ),
         {"schema": "public"},
     )
@@ -576,6 +593,8 @@ class CompanyRefundModel(Base):
     amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False)
+    effect_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class CompanySupportTicketModel(Base):
@@ -591,6 +610,11 @@ class CompanySupportTicketModel(Base):
             ],
             name="fk_company_support_tickets_order_customer",
         ),
+        ForeignKeyConstraint(
+            ["run_id", "last_effect_id"],
+            ["public.company_effects.run_id", "public.company_effects.effect_id"],
+            name="fk_company_support_tickets_effect",
+        ),
         {"schema": "public"},
     )
 
@@ -602,3 +626,92 @@ class CompanySupportTicketModel(Base):
     subject: Mapped[str] = mapped_column(String(500), nullable=False)
     note: Mapped[str] = mapped_column(String(4000), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_effect_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class CompanyEffectModel(Base):
+    """Immutable idempotency/effect record for one applied synthetic mutation."""
+
+    __tablename__ = "company_effects"
+    __table_args__ = (
+        CheckConstraint("tool_id IN ('payments.refund', 'support.update_ticket')", name="tool_id"),
+        CheckConstraint(
+            "contract_version IN ("
+            "'chaosagent.tool/payments.refund/v0', "
+            "'chaosagent.tool/support.update_ticket/v0')",
+            name="contract_version",
+        ),
+        CheckConstraint("idempotency_key_digest ~ '" + DIGEST_CHECK + "'", name="key_digest"),
+        CheckConstraint("request_digest ~ '" + DIGEST_CHECK + "'", name="request_digest"),
+        CheckConstraint("effect_id ~ '" + IDENTIFIER_CHECK + "'", name="effect_id"),
+        CheckConstraint(
+            "effect_kind IN ('refund.created', 'support_ticket.updated')", name="effect_kind"
+        ),
+        CheckConstraint("subject_type IN ('refund', 'support_ticket')", name="subject_type"),
+        CheckConstraint("subject_id ~ '" + IDENTIFIER_CHECK + "'", name="subject_id"),
+        CheckConstraint("effect_state = 'applied'", name="effect_state"),
+        CheckConstraint("jsonb_typeof(result_document) = 'object'", name="result_object"),
+        CheckConstraint(
+            "(result_document ->> 'effect_id') IS NOT DISTINCT FROM effect_id",
+            name="result_effect_id",
+        ),
+        CheckConstraint(
+            "(result_document ->> 'application') IS NOT DISTINCT FROM 'newly_applied'",
+            name="result_application",
+        ),
+        CheckConstraint(
+            "(tool_id <> 'payments.refund') OR ("
+            "jsonb_typeof(result_document -> 'order_id') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(result_document -> 'payment_id') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(result_document -> 'refund_id') IS NOT DISTINCT FROM 'string' AND "
+            "(result_document ->> 'status') IS NOT DISTINCT FROM 'succeeded' AND "
+            "jsonb_typeof(result_document -> 'amount_minor') IS NOT DISTINCT FROM 'number' AND "
+            "(result_document ->> 'amount_minor') ~ '^[1-9][0-9]*$' AND "
+            "jsonb_typeof(result_document -> 'currency') IS NOT DISTINCT FROM 'string' AND "
+            "(result_document ->> 'currency') ~ '^[A-Z]{3}$')",
+            name="refund_result_shape",
+        ),
+        CheckConstraint(
+            "(tool_id <> 'support.update_ticket') OR ("
+            "jsonb_typeof(result_document -> 'ticket_id') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(result_document -> 'status') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(result_document -> 'note') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(result_document -> 'updated_at') IS NOT DISTINCT FROM 'string')",
+            name="ticket_result_shape",
+        ),
+        CheckConstraint(
+            "(tool_id = 'payments.refund' "
+            "AND contract_version = 'chaosagent.tool/payments.refund/v0' "
+            "AND effect_kind = 'refund.created' AND subject_type = 'refund' "
+            "AND (result_document ->> 'refund_id') IS NOT DISTINCT FROM subject_id) OR "
+            "(tool_id = 'support.update_ticket' "
+            "AND contract_version = 'chaosagent.tool/support.update_ticket/v0' "
+            "AND effect_kind = 'support_ticket.updated' AND subject_type = 'support_ticket' "
+            "AND (result_document ->> 'ticket_id') IS NOT DISTINCT FROM subject_id)",
+            name="tool_subject_projection",
+        ),
+        CheckConstraint("lease_attempt >= 1", name="lease_attempt_positive"),
+        ForeignKeyConstraint(
+            ["run_id"], ["public.run_company_state.run_id"], name="fk_company_effects_state"
+        ),
+        UniqueConstraint("run_id", "effect_id", name="uq_company_effect_run_effect_id"),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tool_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    contract_version: Mapped[str] = mapped_column(String(256), primary_key=True)
+    idempotency_key_digest: Mapped[str] = mapped_column(String(71), primary_key=True)
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    effect_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    effect_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    effect_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    logical_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    lease_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )

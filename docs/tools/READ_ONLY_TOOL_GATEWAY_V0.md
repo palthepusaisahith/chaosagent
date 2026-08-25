@@ -12,7 +12,9 @@ The fixed catalog contains exactly:
 - `orders.get`, contract `chaosagent.tool/orders.get/v0`
 - `shipping.get_status`, contract `chaosagent.tool/shipping.get_status/v0`
 
-Refunds, support mutations, policy execution, approvals, faults, retries,
+Issue #9 subsequently added refunds and support mutations through a separate
+narrow capability; it does not weaken this read-only handler boundary. See
+`MUTATION_TOOLS_EFFECT_LEDGER_V0.md`. Policy execution, approvals, faults,
 models, and the agent loop remain deferred.
 
 ## Contracts and registry
@@ -65,7 +67,8 @@ a caller-supplied Run ID separate from the lease binding.
 
 Logical call ID and physical attempt ID are runtime-required and must match the
 Event v0 identifier profile. Optional step and causation IDs use the same
-profile, and Issue #8 accepts only physical attempt number 1. Malformed dynamic
+profile. Issue #9 permits any positive JSON-safe physical attempt number so a
+caller can represent replay without adding retry policy. Malformed dynamic
 fields return `invalid_request` before Event construction. Producer component
 and optional instance identity are validated when the gateway is constructed, so
 invalid trusted configuration fails immediately.
@@ -83,9 +86,8 @@ exceptions, and stack traces are not agent-visible.
 ## Evidence and transactions
 
 Every accepted attempt appends one `tool.requested` and one `tool.result` Event
-v0. Issue #8 does not introduce retries, so `attempt_number` must be 1. The
-result carries the same logical call ID, physical attempt ID/number, and tool
-ID, links `request_event_id`, and uses the request as its causation event.
+v0. The result carries the same logical call ID, physical attempt ID/number, and
+tool ID, links `request_event_id`, and uses the request as its causation event.
 Arguments and responses are represented in evidence by real RFC 8785 SHA-256
 digests through the committed evidence contract; raw values are returned to the
 caller but are not embedded as uncontrolled event payload state.
@@ -124,7 +126,7 @@ from Fixture revision 1 and deliberately do not pretend an execution occurred.
 
 ## Deferred
 
-Issue #9+ owns mutation tools, idempotency/effect ledgers, policy/approval,
-fault mediation, external-effect fencing, retry semantics, network
-protocols/adapters, the runtime, evaluators, telemetry, and UI. No migration or
-new persistent table is required by Issue #8.
+Issue #9 now owns the mutation tools and local effect ledger described in the
+companion document. Policy/approval, fault mediation, external-effect
+integration, retry policy, network protocols/adapters, the runtime, evaluators,
+telemetry, and UI remain deferred. No persistent table was required by Issue #8.

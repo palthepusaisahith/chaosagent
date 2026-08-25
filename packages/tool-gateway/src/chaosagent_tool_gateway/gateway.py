@@ -1,4 +1,4 @@
-"""Strict, transactional read-only tool boundary for the synthetic company."""
+"""Strict transactional tool boundary for the synthetic company."""
 
 from __future__ import annotations
 
@@ -22,11 +22,15 @@ from chaosagent_evidence import (
     loads_run_event,
 )
 from chaosagent_persistence import (
+    BusinessRuleViolationError,
+    CompanyEffect,
     CompanyOrder,
     CompanyShipment,
+    IdempotencyConflictError,
     LeaseExpiredError,
     LeaseIdentity,
     PersistenceError,
+    PersistenceIntegrityError,
     PersistenceRepository,
     ReferenceNotFoundError,
     StaleLeaseError,
@@ -43,6 +47,8 @@ type ToolErrorCode = Literal[
     "run_not_ready",
     "stale_lease",
     "entity_not_found",
+    "business_rule_violation",
+    "idempotency_conflict",
     "infrastructure_error",
 ]
 
@@ -50,6 +56,8 @@ TOOL_EVENT_SCHEMA_VERSION = "chaosagent.run-event/v0"
 SCENARIO_V0_SCHEMA_VERSION = "chaosagent.scenario/v0"
 ORDERS_GET_V0 = "chaosagent.tool/orders.get/v0"
 SHIPPING_GET_STATUS_V0 = "chaosagent.tool/shipping.get_status/v0"
+PAYMENTS_REFUND_V0 = "chaosagent.tool/payments.refund/v0"
+SUPPORT_UPDATE_TICKET_V0 = "chaosagent.tool/support.update_ticket/v0"
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _CONTRACT_VERSION_RE = re.compile(r"^chaosagent\.tool/[a-z0-9._-]+/v[0-9]+$")
@@ -57,8 +65,14 @@ SCENARIO_V0_TOOL_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
         "orders.get": ORDERS_GET_V0,
         "shipping.get_status": SHIPPING_GET_STATUS_V0,
+        "payments.refund": PAYMENTS_REFUND_V0,
+        "support.update_ticket": SUPPORT_UPDATE_TICKET_V0,
     }
 )
+
+
+class _LeaseLostDuringExecution(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +92,7 @@ class ToolExecutionResult:
     error: ToolError | None
     request_event_id: str | None
     result_event_id: str | None
+    state_evidence_event_id: str | None
 
 
 class ReadOnlyCompanyState(Protocol):
@@ -102,7 +117,33 @@ class _RunBoundCompanyState:
         return self.__repository.get_company_shipment_for_order(self.__run_id, order_id)
 
 
-type ToolHandler = Callable[[ReadOnlyCompanyState, Mapping[str, object]], dict[str, object] | None]
+@dataclass(frozen=True, slots=True)
+class RefundMutationIntent:
+    """Pure validated intent; it carries no persistence capability."""
+
+    order_id: str
+    payment_id: str
+    amount_minor: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SupportTicketMutationIntent:
+    """Pure validated intent; it carries no persistence capability."""
+
+    ticket_id: str
+    status: str
+    note: str
+
+
+type MutationIntent = RefundMutationIntent | SupportTicketMutationIntent
+
+
+type ReadToolHandler = Callable[
+    [ReadOnlyCompanyState, Mapping[str, object]], Mapping[str, object] | None
+]
+type MutationToolHandler = Callable[[Mapping[str, object]], MutationIntent]
+type ToolHandler = ReadToolHandler | MutationToolHandler
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,8 +151,8 @@ class ToolDefinition:
     tool_id: str
     contract_version: str
     description: str
-    capability: Literal["read"]
-    read_only: Literal[True]
+    capability: Literal["read", "mutation"]
+    read_only: bool
     input_schema: Mapping[str, object]
     output_schema: Mapping[str, object]
     handler: ToolHandler
@@ -137,8 +178,10 @@ class ToolRegistry:
                 raise ValueError(f"invalid tool contract version {definition.contract_version!r}")
             if not isinstance(definition.description, str) or not definition.description.strip():
                 raise ValueError("tool definition description must not be empty")
-            if definition.capability != "read" or definition.read_only is not True:
-                raise ValueError("Issue #8 registry accepts only read-only tool definitions")
+            if definition.capability not in {"read", "mutation"}:
+                raise ValueError("tool capability must be read or mutation")
+            if (definition.capability == "read") != (definition.read_only is True):
+                raise ValueError("tool capability and read_only metadata disagree")
             if not callable(definition.handler):
                 raise ValueError("tool definition handler must be callable")
             frozen_definition = replace(
@@ -169,7 +212,7 @@ def _schema_resource(name: str) -> Mapping[str, object]:
     return cast(Mapping[str, object], _freeze_json(_schema_resource_cached(name)))
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _schema_resource_cached(name: str) -> dict[str, object]:
     parsed = cast(
         object,
@@ -221,8 +264,25 @@ def _shipping_get_status(
     }
 
 
+def _payments_refund(arguments: Mapping[str, object]) -> RefundMutationIntent:
+    return RefundMutationIntent(
+        order_id=cast(str, arguments["order_id"]),
+        payment_id=cast(str, arguments["payment_id"]),
+        amount_minor=cast(int, arguments["amount_minor"]),
+        reason=cast(str, arguments["reason"]),
+    )
+
+
+def _support_update_ticket(arguments: Mapping[str, object]) -> SupportTicketMutationIntent:
+    return SupportTicketMutationIntent(
+        ticket_id=cast(str, arguments["ticket_id"]),
+        status=cast(str, arguments["status"]),
+        note=cast(str, arguments["note"]),
+    )
+
+
 def default_tool_registry() -> ToolRegistry:
-    """Return the fixed Issue #8 catalog; no dynamic discovery occurs."""
+    """Return the frozen Scenario v0 tool catalog; no dynamic discovery occurs."""
     return ToolRegistry(
         (
             ToolDefinition(
@@ -245,12 +305,32 @@ def default_tool_registry() -> ToolRegistry:
                 output_schema=_schema_resource("shipping-get-status-v0.output.schema.json"),
                 handler=_shipping_get_status,
             ),
+            ToolDefinition(
+                tool_id="payments.refund",
+                contract_version=PAYMENTS_REFUND_V0,
+                description="Create or replay one idempotent synthetic payment refund.",
+                capability="mutation",
+                read_only=False,
+                input_schema=_schema_resource("payments-refund-v0.input.schema.json"),
+                output_schema=_schema_resource("payments-refund-v0.output.schema.json"),
+                handler=_payments_refund,
+            ),
+            ToolDefinition(
+                tool_id="support.update_ticket",
+                contract_version=SUPPORT_UPDATE_TICKET_V0,
+                description="Apply or replay one idempotent synthetic support-ticket update.",
+                capability="mutation",
+                read_only=False,
+                input_schema=_schema_resource("support-update-ticket-v0.input.schema.json"),
+                output_schema=_schema_resource("support-update-ticket-v0.output.schema.json"),
+                handler=_support_update_ticket,
+            ),
         )
     )
 
 
 class ToolGateway:
-    """Execute one read-only call and append coherent Event v0 evidence."""
+    """Authorize one tool attempt and atomically persist its evidence/effect."""
 
     def __init__(
         self,
@@ -325,6 +405,16 @@ class ToolGateway:
                 "invalid_request",
                 f"invalid tool request: {request_error}",
             )
+        if (
+            tool_id == "payments.refund"
+            and type(cast(dict[str, object], arguments).get("amount_minor")) is not int
+        ):
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "invalid_request",
+                "invalid tool request: amount_minor must be an exact JSON integer",
+            )
         arguments_snapshot = cast(dict[str, object], deepcopy(arguments))
 
         try:
@@ -384,6 +474,18 @@ class ToolGateway:
                     )
 
                 request_event_id = _event_id()
+                request_digest = digest_payload_v0(
+                    {
+                        "tool_id": tool_id,
+                        "contract_version": contract_version,
+                        "arguments": arguments_snapshot,
+                    }
+                )
+                idempotency_key_digest: str | None = None
+                if definition.capability == "mutation":
+                    idempotency_key_digest = digest_payload_v0(
+                        cast(str, arguments_snapshot["idempotency_key"])
+                    )
                 request_payload: dict[str, object] = {
                     "logical_call_id": logical_call_id,
                     "attempt_id": attempt_id,
@@ -393,6 +495,8 @@ class ToolGateway:
                 }
                 if step_id is not None:
                     request_payload["step_id"] = step_id
+                if idempotency_key_digest is not None:
+                    request_payload["idempotency_key_digest"] = idempotency_key_digest
                 self._append_event(
                     run.run_id,
                     request_event_id,
@@ -405,26 +509,79 @@ class ToolGateway:
                 started = monotonic_ns()
                 output: dict[str, object] | None = None
                 tool_error: ToolError | None = None
-                company = _RunBoundCompanyState(self._repository, run.run_id)
+                effect: CompanyEffect | None = None
                 try:
                     with self._session.begin_nested():
-                        output = definition.handler(company, arguments_snapshot)
-                        if output is None:
-                            tool_error = ToolError(
-                                "entity_not_found",
-                                "requested synthetic-company entity was not found",
+                        if definition.capability == "read":
+                            read_handler = cast(ReadToolHandler, definition.handler)
+                            read_output = read_handler(
+                                _RunBoundCompanyState(self._repository, run.run_id),
+                                arguments_snapshot,
                             )
+                            output = None if read_output is None else dict(read_output)
+                            if read_output is None:
+                                tool_error = ToolError(
+                                    "entity_not_found",
+                                    "requested synthetic-company entity was not found",
+                                )
                         else:
+                            assert idempotency_key_digest is not None
+                            mutation_handler = cast(MutationToolHandler, definition.handler)
+                            intent = mutation_handler(arguments_snapshot)
+                            effect = self._apply_mutation_intent(
+                                intent,
+                                run_id=run.run_id,
+                                tool_id=tool_id,
+                                contract_version=contract_version,
+                                idempotency_key_digest=idempotency_key_digest,
+                                request_digest=request_digest,
+                                arguments=arguments_snapshot,
+                                logical_call_id=logical_call_id,
+                                attempt_id=attempt_id,
+                                lease_attempt=lease.attempt,
+                            )
+                            effect = self._repository.verify_company_effect(
+                                effect, expected_arguments=arguments_snapshot
+                            )
+                            output = dict(effect.result)
+                        if output is not None:
                             output_error = _validate_instance(output, definition.output_schema)
                             if output_error is not None:
                                 raise ValueError(
                                     f"handler output violated its contract: {output_error}"
                                 )
+                except IdempotencyConflictError:
+                    output = None
+                    effect = None
+                    tool_error = ToolError(
+                        "idempotency_conflict",
+                        "idempotency key is already bound to a different request",
+                    )
+                except BusinessRuleViolationError:
+                    output = None
+                    effect = None
+                    tool_error = ToolError(
+                        "business_rule_violation",
+                        "mutation was rejected by synthetic business rules",
+                    )
+                except ReferenceNotFoundError:
+                    output = None
+                    effect = None
+                    tool_error = ToolError(
+                        "entity_not_found",
+                        "requested synthetic-company entity was not found",
+                    )
                 except Exception:
                     output = None
+                    effect = None
                     tool_error = ToolError(
                         "infrastructure_error", "tool execution failed internally"
                     )
+                if effect is not None:
+                    try:
+                        self._repository.lock_current_lease(lease)
+                    except (StaleLeaseError, LeaseExpiredError) as error:
+                        raise _LeaseLostDuringExecution from error
                 duration_ms = max(0, (monotonic_ns() - started) // 1_000_000)
                 result_event_id = _event_id()
                 result_payload: dict[str, object] = {
@@ -449,6 +606,26 @@ class ToolGateway:
                     correlation_id=logical_call_id,
                     causation_event_id=request_event_id,
                 )
+                state_evidence_event_id: str | None = None
+                if effect is not None and effect.newly_applied:
+                    state_evidence_event_id = _event_id()
+                    self._append_event(
+                        run.run_id,
+                        state_evidence_event_id,
+                        "state.evidence_recorded",
+                        {
+                            "evidence_id": effect.effect_id,
+                            "evidence_kind": "business_effect",
+                            "fact_type": effect.effect_kind,
+                            "subject": {
+                                "type": effect.subject_type,
+                                "id": effect.subject_id,
+                            },
+                            "related_event_ids": [request_event_id, result_event_id],
+                        },
+                        correlation_id=logical_call_id,
+                        causation_event_id=result_event_id,
+                    )
                 return ToolExecutionResult(
                     tool_id=tool_id,
                     contract_version=contract_version,
@@ -457,7 +634,15 @@ class ToolGateway:
                     error=tool_error,
                     request_event_id=request_event_id,
                     result_event_id=result_event_id,
+                    state_evidence_event_id=state_evidence_event_id,
                 )
+        except _LeaseLostDuringExecution:
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "stale_lease",
+                "caller lost the Run lease before the mutation could commit",
+            )
         except (EvidenceValidationError, PersistenceError, SQLAlchemyError):
             return self._rejected(
                 tool_id,
@@ -466,11 +651,77 @@ class ToolGateway:
                 "tool evidence could not be persisted",
             )
 
+    def _apply_mutation_intent(
+        self,
+        intent: MutationIntent,
+        *,
+        run_id: str,
+        tool_id: str,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        attempt_id: str,
+        lease_attempt: int,
+    ) -> CompanyEffect:
+        """Translate a pure trusted handler intent into one repository mutation."""
+        if tool_id == "payments.refund":
+            if type(intent) is not RefundMutationIntent or (
+                intent.order_id,
+                intent.payment_id,
+                intent.amount_minor,
+                intent.reason,
+            ) != (
+                arguments["order_id"],
+                arguments["payment_id"],
+                arguments["amount_minor"],
+                arguments["reason"],
+            ):
+                raise PersistenceIntegrityError("mutation handler returned an inconsistent intent")
+            return self._repository.apply_refund_effect(
+                run_id,
+                order_id=intent.order_id,
+                payment_id=intent.payment_id,
+                amount_minor=intent.amount_minor,
+                reason=intent.reason,
+                contract_version=contract_version,
+                idempotency_key_digest=idempotency_key_digest,
+                request_digest=request_digest,
+                logical_call_id=logical_call_id,
+                attempt_id=attempt_id,
+                lease_attempt=lease_attempt,
+            )
+        if tool_id == "support.update_ticket":
+            if type(intent) is not SupportTicketMutationIntent or (
+                intent.ticket_id,
+                intent.status,
+                intent.note,
+            ) != (
+                arguments["ticket_id"],
+                arguments["status"],
+                arguments["note"],
+            ):
+                raise PersistenceIntegrityError("mutation handler returned an inconsistent intent")
+            return self._repository.apply_support_ticket_effect(
+                run_id,
+                ticket_id=intent.ticket_id,
+                status=intent.status,
+                note=intent.note,
+                contract_version=contract_version,
+                idempotency_key_digest=idempotency_key_digest,
+                request_digest=request_digest,
+                logical_call_id=logical_call_id,
+                attempt_id=attempt_id,
+                lease_attempt=lease_attempt,
+            )
+        raise PersistenceIntegrityError("mutation tool has no persistence implementation")
+
     def _append_event(
         self,
         run_id: str,
         event_id: str,
-        event_type: Literal["tool.requested", "tool.result"],
+        event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
         payload: dict[str, object],
         *,
         correlation_id: str,
@@ -516,6 +767,7 @@ class ToolGateway:
             error=ToolError(code, message),
             request_event_id=None,
             result_event_id=None,
+            state_evidence_event_id=None,
         )
 
 
@@ -555,8 +807,12 @@ def _validate_call_fields(
     for name, value in (("step_id", step_id), ("causation_event_id", causation_event_id)):
         if value is not None and (not isinstance(value, str) or _ID_RE.fullmatch(value) is None):
             return f"{name} is malformed"
-    if isinstance(attempt_number, bool) or attempt_number != 1:
-        return "attempt_number must be 1; retries are deferred"
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or not 1 <= attempt_number <= 9_007_199_254_740_991
+    ):
+        return "attempt_number must be a positive JSON safe integer"
     return None
 
 

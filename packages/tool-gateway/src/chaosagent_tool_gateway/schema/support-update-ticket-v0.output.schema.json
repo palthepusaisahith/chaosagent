@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/support.update_ticket/v0/output.json",
+  "title": "ChaosAgent support.update_ticket v0 output",
+  "type": "object",
+  "required": [
+    "effect_id",
+    "ticket_id",
+    "status",
+    "note",
+    "updated_at",
+    "application"
+  ],
+  "properties": {
+    "effect_id": { "$ref": "#/$defs/id" },
+    "ticket_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["open", "pending", "closed"] },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "updated_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "application": { "enum": ["newly_applied", "already_applied"] }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

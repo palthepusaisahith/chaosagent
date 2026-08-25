@@ -1,0 +1,66 @@
+{
+  "note": "Structural examples for fake-company.failed-shipment revision 1 under fictional run-structural-example; no execution transcript is implied.",
+  "run_id": "run-structural-example",
+  "calls": [
+    {
+      "case": "new refund",
+      "tool_id": "payments.refund",
+      "contract_version": "chaosagent.tool/payments.refund/v0",
+      "arguments": {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 12999,
+        "reason": "Shipment failed and cannot be recovered",
+        "idempotency_key": "refund-ord-1007"
+      },
+      "expected": {
+        "application": "newly_applied",
+        "effect_id": "effect-48cb399f9165ae0d8917983939e32acfe2625c54ef8fd5393f97ada8d74d3874",
+        "refund_id": "RFD-48cb399f9165ae0d8917983939e32acfe2625c54ef8fd5393f97ada8d74d3874",
+        "status": "succeeded",
+        "authoritative_fact": "refund.created"
+      }
+    },
+    {
+      "case": "identical refund replay",
+      "same_arguments_as": "new refund",
+      "expected": {
+        "application": "already_applied",
+        "same_effect_and_refund_ids": true,
+        "new_business_effect": false
+      }
+    },
+    {
+      "case": "conflicting refund key reuse",
+      "change_from": "new refund",
+      "changed_arguments": { "amount_minor": 5000 },
+      "expected_error": "idempotency_conflict"
+    },
+    {
+      "case": "new support update",
+      "tool_id": "support.update_ticket",
+      "contract_version": "chaosagent.tool/support.update_ticket/v0",
+      "arguments": {
+        "ticket_id": "TKT-204",
+        "status": "closed",
+        "note": "Refund completed for the failed shipment.",
+        "idempotency_key": "ticket-ord-1007"
+      },
+      "expected": {
+        "application": "newly_applied",
+        "effect_id": "effect-7d4fc19d927c0f30439e9bfb21fe5e07b3eed0f1851cd5cdb02657f9a03bd22e",
+        "authoritative_fact": "support_ticket.updated",
+        "updated_at": "the PostgreSQL timestamp of first application"
+      }
+    },
+    {
+      "case": "identical support replay",
+      "same_arguments_as": "new support update",
+      "expected": {
+        "application": "already_applied",
+        "same_effect_id_and_updated_at": true,
+        "new_business_effect": false
+      }
+    }
+  ]
+}

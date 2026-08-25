@@ -296,6 +296,7 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
     assert {
         "agent_configuration_revisions",
         "company_customers",
+        "company_effects",
         "company_orders",
         "company_payments",
         "company_refunds",
@@ -467,6 +468,37 @@ def test_fixture_migration_round_trips_to_issue_6(migrated_engine: Engine) -> No
         "company_refunds",
         "company_support_tickets",
     }.issubset(tables)
+    command.check(configuration)
+
+
+def test_mutation_ledger_migration_round_trips_to_issue_8(migrated_engine: Engine) -> None:
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0003_fixture_company_state")
+    inspector = inspect(migrated_engine)
+    assert "company_effects" not in inspector.get_table_names(schema="public")
+    assert "effect_id" not in {
+        column["name"] for column in inspector.get_columns("company_refunds", schema="public")
+    }
+    assert "origin" not in {
+        column["name"] for column in inspector.get_columns("company_refunds", schema="public")
+    }
+    assert "last_effect_id" not in {
+        column["name"]
+        for column in inspector.get_columns("company_support_tickets", schema="public")
+    }
+    command.upgrade(configuration, "head")
+    inspector = inspect(migrated_engine)
+    assert "company_effects" in inspector.get_table_names(schema="public")
+    assert {"effect_id", "origin"}.issubset(
+        {column["name"] for column in inspector.get_columns("company_refunds", schema="public")}
+    )
+    assert "ix_company_refunds_run_payment_succeeded" in {
+        index["name"] for index in inspector.get_indexes("company_refunds", schema="public")
+    }
+    assert "last_effect_id" in {
+        column["name"]
+        for column in inspector.get_columns("company_support_tickets", schema="public")
+    }
     command.check(configuration)
 
 

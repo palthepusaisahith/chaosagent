@@ -1,7 +1,7 @@
 [project]
 name = "chaosagent-tool-gateway"
 version = "0.0.0"
-description = "Run-scoped read-only synthetic-company tool gateway for ChaosAgent"
+description = "Run-scoped synthetic-company tool contracts and gateway for ChaosAgent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "chaosagent-evidence",

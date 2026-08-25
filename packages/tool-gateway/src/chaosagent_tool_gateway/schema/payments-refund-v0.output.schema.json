@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/tools/payments.refund/v0/output.json",
+  "title": "ChaosAgent payments.refund v0 output",
+  "type": "object",
+  "required": [
+    "effect_id",
+    "refund_id",
+    "order_id",
+    "payment_id",
+    "status",
+    "amount_minor",
+    "currency",
+    "application"
+  ],
+  "properties": {
+    "effect_id": { "$ref": "#/$defs/id" },
+    "refund_id": { "$ref": "#/$defs/id" },
+    "order_id": { "$ref": "#/$defs/id" },
+    "payment_id": { "$ref": "#/$defs/id" },
+    "status": { "const": "succeeded" },
+    "amount_minor": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "application": { "enum": ["newly_applied", "already_applied"] }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}
