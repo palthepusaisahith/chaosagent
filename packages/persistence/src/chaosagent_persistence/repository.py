@@ -51,6 +51,7 @@ from .models import (
     CompanyRefundModel,
     CompanyShipmentModel,
     CompanySupportTicketModel,
+    ExecutionCheckpointModel,
     FixtureRevisionModel,
     PolicyRevisionModel,
     RunCompanyStateModel,
@@ -139,6 +140,10 @@ class ApprovalConflictError(PersistenceConflictError):
 
 class ApprovalAlreadyResolvedError(PersistenceConflictError):
     """Raised when an immutable approval resolution already exists."""
+
+
+class CheckpointConflictError(PersistenceConflictError):
+    """Raised when a stale executor attempts to replace a newer checkpoint."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +357,17 @@ class ApprovalRequestRecord:
     newly_created: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionCheckpointRecord:
+    run_id: str
+    checkpoint_version: int
+    lease_attempt: int
+    last_event_sequence: int
+    document: Mapping[str, object]
+    document_digest: str
+    updated_at: datetime
+
+
 def create_postgres_engine(database_url: str, *, echo: bool = False) -> Engine:
     """Create a SQLAlchemy engine and fail closed for non-PostgreSQL URLs."""
     engine = create_engine(database_url, echo=echo, pool_pre_ping=True)
@@ -363,6 +379,14 @@ def create_postgres_engine(database_url: str, *, echo: bool = False) -> Engine:
 
 def _json_text(document: dict[str, object]) -> str:
     return json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+
+
+def _freeze_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
 
 
 def _require_identifier(value: str, field: str) -> None:
@@ -437,6 +461,11 @@ def _validate_jsonb_persistence_profile(value: object, contract: str, path: str 
                     "which PostgreSQL JSONB cannot store"
                 )
             _validate_jsonb_persistence_profile(item, contract, f"{path}.{key}")
+
+
+def validate_jsonb_persistence_profile(value: object, contract: str) -> None:
+    """Fail before SQL when a JSON value is not representable by PostgreSQL JSONB."""
+    _validate_jsonb_persistence_profile(value, contract)
 
 
 def _constraint_name(error: IntegrityError) -> str | None:
@@ -1593,6 +1622,104 @@ class PersistenceRepository:
             raise PersistenceIntegrityError("PostgreSQL did not return its current timestamp")
         return cast(datetime, value)
 
+    def get_execution_checkpoint(self, run_id: str) -> ExecutionCheckpointRecord | None:
+        """Return an immutable checkpoint snapshot and verify its stored digest."""
+        _require_identifier(run_id, "run_id")
+        model = self._session.get(ExecutionCheckpointModel, run_id)
+        return None if model is None else self._checkpoint_record(model)
+
+    def _store_execution_checkpoint(
+        self,
+        lease: LeaseIdentity,
+        document: Mapping[str, object],
+        *,
+        expected_version: int,
+    ) -> ExecutionCheckpointRecord:
+        """Internal CAS-write for the runtime's already-validated checkpoint.
+
+        The runtime owns JSON Schema and evidence-semantic validation. The
+        caller must include every Event committed in this transaction in
+        ``last_event_sequence``.  The Run row lock shares the evidence sequence
+        serialization and fences lifecycle/reclaim operations.
+        """
+        if expected_version < 0:
+            raise ValueError("expected checkpoint version must be non-negative")
+        snapshot = deepcopy(dict(document))
+        _validate_jsonb_persistence_profile(snapshot, "execution checkpoint")
+        run = self.lock_current_lease(lease)
+        if run.status != "running":
+            raise LifecycleConflictError("execution checkpoints require a running Run")
+        if snapshot.get("schema_version") != "chaosagent.execution-checkpoint/v0":
+            raise PersistenceIntegrityError("unsupported execution checkpoint version")
+        if snapshot.get("run_id") != run.run_id:
+            raise PersistenceIntegrityError("execution checkpoint belongs to another Run")
+        next_version = expected_version + 1
+        if snapshot.get("checkpoint_version") != next_version:
+            raise PersistenceIntegrityError("checkpoint document version does not match CAS")
+        if snapshot.get("lease_attempt") != lease.attempt:
+            raise PersistenceIntegrityError("checkpoint document lease attempt is stale")
+        last_sequence = snapshot.get("last_event_sequence")
+        if type(last_sequence) is not int or last_sequence < 1:
+            raise PersistenceIntegrityError("checkpoint last event sequence is invalid")
+        latest = cast(
+            int,
+            self._session.scalar(
+                select(func.coalesce(func.max(RunEventModel.sequence), 0)).where(
+                    RunEventModel.run_id == run.run_id
+                )
+            ),
+        )
+        if last_sequence != latest:
+            raise PersistenceIntegrityError(
+                "checkpoint does not point at the latest committed Run evidence"
+            )
+        digest = digest_payload_v0(snapshot)
+        existing = self._session.scalar(
+            select(ExecutionCheckpointModel)
+            .where(ExecutionCheckpointModel.run_id == run.run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        model: ExecutionCheckpointModel
+        with self._session.begin_nested():
+            if existing is None:
+                if expected_version != 0:
+                    raise CheckpointConflictError("execution checkpoint does not yet exist")
+                model = ExecutionCheckpointModel(
+                    run_id=run.run_id,
+                    schema_version="chaosagent.execution-checkpoint/v0",
+                    checkpoint_version=next_version,
+                    lease_attempt=lease.attempt,
+                    last_event_sequence=last_sequence,
+                    document=snapshot,
+                    document_digest=digest,
+                )
+                self._session.add(model)
+                self._session.flush()
+            else:
+                updated_model = self._session.scalar(
+                    update(ExecutionCheckpointModel)
+                    .where(
+                        ExecutionCheckpointModel.run_id == run.run_id,
+                        ExecutionCheckpointModel.checkpoint_version == expected_version,
+                    )
+                    .values(
+                        checkpoint_version=next_version,
+                        lease_attempt=lease.attempt,
+                        last_event_sequence=last_sequence,
+                        document=snapshot,
+                        document_digest=digest,
+                        updated_at=func.clock_timestamp(),
+                    )
+                    .returning(ExecutionCheckpointModel)
+                )
+                if updated_model is None:
+                    raise CheckpointConflictError(
+                        "execution checkpoint was advanced by another executor"
+                    )
+                model = updated_model
+        return self._checkpoint_record(model)
+
     def get_approval_request(self, approval_id: str) -> ApprovalRequestRecord | None:
         model = self._session.get(ApprovalRequestModel, approval_id)
         return None if model is None else self._approval_record(model)
@@ -2707,6 +2834,21 @@ class PersistenceRepository:
             attempt=model.attempt,
             created_at=model.created_at,
             created_by=model.created_by,
+        )
+
+    @staticmethod
+    def _checkpoint_record(model: ExecutionCheckpointModel) -> ExecutionCheckpointRecord:
+        expected = digest_payload_v0(model.document)
+        if expected != model.document_digest:
+            raise PersistenceIntegrityError("stored execution checkpoint digest is corrupt")
+        return ExecutionCheckpointRecord(
+            model.run_id,
+            model.checkpoint_version,
+            model.lease_attempt,
+            model.last_event_sequence,
+            cast(Mapping[str, object], _freeze_json_value(deepcopy(model.document))),
+            model.document_digest,
+            model.updated_at,
         )
 
     @staticmethod

@@ -1,0 +1,27 @@
+[project]
+name = "chaosagent-agent-runtime"
+version = "0.0.0"
+description = "Provider-neutral deterministic execution loop for ChaosAgent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "chaosagent-evidence",
+    "chaosagent-persistence",
+    "chaosagent-tool-gateway",
+    "jsonschema==4.26.0",
+    "sqlalchemy==2.0.52",
+]
+
+[tool.uv.sources]
+chaosagent-evidence = { workspace = true }
+chaosagent-persistence = { workspace = true }
+chaosagent-tool-gateway = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chaosagent_agent_runtime"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/chaosagent_agent_runtime/schema" = "chaosagent_agent_runtime/schema"

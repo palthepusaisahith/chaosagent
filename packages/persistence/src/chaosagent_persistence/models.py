@@ -304,6 +304,73 @@ class RunModel(Base):
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
 
 
+class ExecutionCheckpointModel(Base):
+    """Mutable, CAS-protected Issue #11 trajectory for one Run."""
+
+    __tablename__ = "execution_checkpoints"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'chaosagent.execution-checkpoint/v0'",
+            name="schema_version_value",
+        ),
+        CheckConstraint(
+            "checkpoint_version BETWEEN 1 AND 9007199254740991",
+            name="checkpoint_version_positive",
+        ),
+        CheckConstraint(
+            "lease_attempt BETWEEN 1 AND 9007199254740991", name="lease_attempt_positive"
+        ),
+        CheckConstraint(
+            "last_event_sequence BETWEEN 1 AND 9007199254740991",
+            name="last_event_sequence_positive",
+        ),
+        CheckConstraint("document_digest ~ '" + DIGEST_CHECK + "'", name="document_digest"),
+        CheckConstraint("jsonb_typeof(document) = 'object'", name="document_object"),
+        CheckConstraint(
+            "(document ->> 'schema_version') IS NOT DISTINCT FROM schema_version",
+            name="document_schema_version",
+        ),
+        CheckConstraint(
+            "(document ->> 'run_id') IS NOT DISTINCT FROM run_id", name="document_run_id"
+        ),
+        CheckConstraint(
+            "jsonb_typeof(document -> 'checkpoint_version') IS NOT DISTINCT FROM 'number' "
+            "AND (document ->> 'checkpoint_version') ~ '^[1-9][0-9]*$' "
+            "AND (document ->> 'checkpoint_version')::bigint "
+            "IS NOT DISTINCT FROM checkpoint_version",
+            name="document_checkpoint_version",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(document -> 'lease_attempt') IS NOT DISTINCT FROM 'number' "
+            "AND (document ->> 'lease_attempt') ~ '^[1-9][0-9]*$' "
+            "AND (document ->> 'lease_attempt')::bigint IS NOT DISTINCT FROM lease_attempt",
+            name="document_lease_attempt",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(document -> 'last_event_sequence') IS NOT DISTINCT FROM 'number' "
+            "AND (document ->> 'last_event_sequence') ~ '^[1-9][0-9]*$' "
+            "AND (document ->> 'last_event_sequence')::bigint "
+            "IS NOT DISTINCT FROM last_event_sequence",
+            name="document_last_event_sequence",
+        ),
+        ForeignKeyConstraint(
+            ["run_id"], ["public.runs.run_id"], name="fk_execution_checkpoints_run"
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    checkpoint_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_event_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    document_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+
+
 class RunEventModel(Base):
     """Append-only Run Event contract document and query/index columns."""
 

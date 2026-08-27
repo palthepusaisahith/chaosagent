@@ -21,6 +21,7 @@ build-constraint-dependencies = ["hatchling==1.32.0"]
 
 [tool.uv.workspace]
 members = [
+    "packages/agent-runtime",
     "packages/evidence",
     "packages/fixtures",
     "packages/persistence",
@@ -44,6 +45,7 @@ quote-style = "double"
 python_version = "3.12"
 strict = true
 files = [
+    "packages/agent-runtime/src",
     "packages/evidence/src",
     "packages/fixtures/src",
     "packages/persistence/src",

@@ -7,16 +7,18 @@ evaluation, observability, and security testing of autonomous AI agents.
 
 ChaosAgent is pre-1.0 and under active design.
 
-- **Implemented:** the Python/TypeScript monorepo bootstrap, reproducible
-  developer tooling, Linux CI smoke checks, repository governance documents, and
-  the versioned Scenario v0 contract with validation and stable digests, plus
-  versioned Run Event and Run Report v0 evidence contracts.
+- **Implemented:** versioned Scenario/Fixture/Policy/Evidence contracts,
+  PostgreSQL persistence and leases, isolated synthetic-company state, the four
+  bounded tool contracts with idempotent mutations and approval enforcement, and
+  the provider-neutral deterministic Issue #11 execution runtime.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
-No experiment execution behavior is implemented today.
+The execution runtime currently supports only deterministic in-process adapters;
+there is no hosted model adapter, fault engine, evaluator, campaign service, or
+user interface yet.
 
 ## Why ChaosAgent exists
 
@@ -105,6 +107,7 @@ make check
 apps/web/                  TypeScript web-package placeholder
 services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
+packages/agent-runtime/    Provider-neutral loop and checkpoint v0 contract
 packages/evidence/         Run Event/Report v0 schemas and validated loaders
 packages/fixtures/         Fixture v0 schema, deterministic loader, digest
 packages/persistence/      PostgreSQL models, Alembic migration, repositories
@@ -119,8 +122,9 @@ Persistence responsibilities and local PostgreSQL setup are documented in
 the Run state machine and lease/fencing protocol in
 [`docs/persistence/RUN_LIFECYCLE_LEASES.md`](docs/persistence/RUN_LIFECYCLE_LEASES.md).
 Fixture semantics and isolated synthetic state are documented in
-[`docs/fixtures/FIXTURE_V0.md`](docs/fixtures/FIXTURE_V0.md). No agent-facing
-tool or model execution behavior is implemented.
+[`docs/fixtures/FIXTURE_V0.md`](docs/fixtures/FIXTURE_V0.md). The deterministic
+execution loop, approval resume, and crash semantics are documented in
+[`docs/runtime/AGENT_RUNTIME_V0.md`](docs/runtime/AGENT_RUNTIME_V0.md).
 
 ## Developer commands
 

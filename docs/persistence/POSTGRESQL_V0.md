@@ -3,7 +3,7 @@
 ## Scope and ownership
 
 This package is the PostgreSQL adapter introduced by Issue #5 and extended by
-Issues #6–#7 and #9–#10. It persists validated Scenario, Fixture, and Policy
+Issues #6–#7 and #9–#11. It persists validated Scenario, Fixture, and Policy
 revisions, unresolved Agent Configuration revision references, Runs, isolated
 Run-local synthetic company state, Run Event evidence, and one final Run Report
 per Run. It does not implement workers, evaluation, agent-facing tools, fault
@@ -36,6 +36,14 @@ The tables have deliberately different responsibilities:
 - `run_reports` stores one validated, final Run Report document per Run. V0 does
   not support replacing or rebuilding a report. A future versioned-report policy
   requires an explicit migration and contract decision.
+- `execution_checkpoints` stores the mutable, versioned Issue #11 safe
+  trajectory needed for crash recovery and approval pause/resume. Writes are
+  lease-fenced and use an independent checkpoint CAS version; unlike immutable
+  evidence, this table intentionally has no UPDATE/DELETE rejection trigger. Its
+  raw-document writer is private to the runtime: PostgreSQL owns projection/FK
+  constraints, persistence owns JSONB representability, digest, lease and CAS
+  checks, and the runtime owns JSON Schema plus evidence-semantic
+  reconstruction.
 - `company_effects` stores the immutable Issue #9 idempotency/effect ledger for
   the two synthetic mutation tools. Its full identity, locking, evidence, and
   exactly-once scope are documented in the mutation-tool contract.
@@ -98,6 +106,13 @@ malicious database owner.
 Runs are deliberately mutable only through the Issue #6 lifecycle CAS methods.
 See [`RUN_LIFECYCLE_LEASES.md`](RUN_LIFECYCLE_LEASES.md) for their state,
 ownership, recovery, and evidence guarantees.
+
+Execution checkpoints are mutable application coordination state, not evidence.
+Their repository writes retain Issue #5 caller-owned transactions, lock the Run
+row, validate the current running lease, use a database CAS predicate, and bind
+the write to the latest event sequence. The runtime contract and additional
+semantic read validation are documented in
+[`../runtime/AGENT_RUNTIME_V0.md`](../runtime/AGENT_RUNTIME_V0.md).
 
 ## Transactions, conflicts, and event ordering
 
@@ -166,9 +181,9 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #10
+## Deferred beyond Issue #11
 
-- worker processes/daemons and automatic recovery scheduling;
+- worker processes/daemons, heartbeats, and automatic recovery scheduling;
 - external side-effect fencing or reconciliation beyond the committed local
   synthetic effect ledger;
 - Campaign persistence and campaign statistics;

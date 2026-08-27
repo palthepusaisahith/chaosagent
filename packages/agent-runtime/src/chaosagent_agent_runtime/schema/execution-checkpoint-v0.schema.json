@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/execution-checkpoint/v0/schema.json",
+  "title": "ChaosAgent Execution Checkpoint v0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "checkpoint_version",
+    "lease_attempt",
+    "last_event_sequence",
+    "adapter",
+    "next_step_number",
+    "tool_attempts",
+    "active_wall_time_ms",
+    "known_cost_microusd",
+    "cost_complete",
+    "status",
+    "trajectory",
+    "pending_tool_calls",
+    "final_answer"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.execution-checkpoint/v0" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "checkpoint_version": { "$ref": "#/$defs/positiveInteger" },
+    "lease_attempt": { "$ref": "#/$defs/positiveInteger" },
+    "last_event_sequence": { "$ref": "#/$defs/positiveInteger" },
+    "adapter": {
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "version": { "$ref": "#/$defs/revision" }
+      },
+      "additionalProperties": false
+    },
+    "next_step_number": { "$ref": "#/$defs/positiveInteger" },
+    "tool_attempts": { "$ref": "#/$defs/nonnegativeInteger" },
+    "active_wall_time_ms": { "$ref": "#/$defs/nonnegativeInteger" },
+    "known_cost_microusd": { "$ref": "#/$defs/nonnegativeInteger" },
+    "cost_complete": { "type": "boolean" },
+    "status": { "enum": ["active", "waiting_for_approval", "final"] },
+    "trajectory": {
+      "type": "array",
+      "maxItems": 4000,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/assistantTurn" },
+          { "$ref": "#/$defs/toolTurn" }
+        ]
+      }
+    },
+    "pending_tool_calls": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/pendingCall" }
+    },
+    "final_answer": { "type": ["string", "null"], "maxLength": 100000 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "waiting_for_approval" } } },
+      "then": { "properties": { "pending_tool_calls": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "final" } } },
+      "then": {
+        "properties": {
+          "pending_tool_calls": { "maxItems": 0 },
+          "final_answer": { "type": "string" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonnegativeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "call": {
+      "type": "object",
+      "required": [
+        "call_id",
+        "call_index",
+        "logical_call_id",
+        "tool_id",
+        "contract_version",
+        "arguments"
+      ],
+      "properties": {
+        "call_id": { "$ref": "#/$defs/id" },
+        "call_index": { "$ref": "#/$defs/positiveInteger" },
+        "logical_call_id": { "$ref": "#/$defs/id" },
+        "tool_id": { "$ref": "#/$defs/id" },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "arguments": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "pendingCall": {
+      "type": "object",
+      "required": [
+        "call_id",
+        "call_index",
+        "logical_call_id",
+        "tool_id",
+        "contract_version",
+        "arguments",
+        "step_id",
+        "attempt_number"
+      ],
+      "properties": {
+        "call_id": { "$ref": "#/$defs/id" },
+        "call_index": { "$ref": "#/$defs/positiveInteger" },
+        "logical_call_id": { "$ref": "#/$defs/id" },
+        "tool_id": { "$ref": "#/$defs/id" },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "arguments": { "type": "object" },
+        "step_id": { "$ref": "#/$defs/id" },
+        "attempt_number": { "$ref": "#/$defs/positiveInteger" },
+        "approval_id": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens", "cost_microusd"],
+      "properties": {
+        "input_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cost_microusd": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "assistantTurn": {
+      "type": "object",
+      "required": [
+        "kind",
+        "step_id",
+        "step_number",
+        "text",
+        "final",
+        "duration_ms",
+        "tool_calls",
+        "usage"
+      ],
+      "properties": {
+        "kind": { "const": "assistant" },
+        "step_id": { "$ref": "#/$defs/id" },
+        "step_number": { "$ref": "#/$defs/positiveInteger" },
+        "text": { "type": "string", "maxLength": 100000 },
+        "final": { "type": "boolean" },
+        "duration_ms": { "$ref": "#/$defs/nonnegativeInteger" },
+        "tool_calls": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/call" }
+        },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "additionalProperties": false
+    },
+    "toolTurn": {
+      "type": "object",
+      "required": [
+        "kind",
+        "call_index",
+        "step_id",
+        "logical_call_id",
+        "attempt_id",
+        "attempt_number",
+        "duration_ms",
+        "request_event_id",
+        "result_event_id",
+        "tool_id",
+        "contract_version",
+        "outcome",
+        "output",
+        "error"
+      ],
+      "properties": {
+        "kind": { "const": "tool" },
+        "call_index": { "$ref": "#/$defs/positiveInteger" },
+        "step_id": { "$ref": "#/$defs/id" },
+        "logical_call_id": { "$ref": "#/$defs/id" },
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "attempt_number": { "$ref": "#/$defs/positiveInteger" },
+        "duration_ms": { "$ref": "#/$defs/nonnegativeInteger" },
+        "request_event_id": { "$ref": "#/$defs/id" },
+        "result_event_id": { "$ref": "#/$defs/id" },
+        "tool_id": { "$ref": "#/$defs/id" },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "outcome": { "enum": ["succeeded", "failed", "denied"] },
+        "output": { "type": ["object", "null"] },
+        "error": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["code"],
+              "properties": {
+                "code": { "$ref": "#/$defs/id" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "approval_id": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

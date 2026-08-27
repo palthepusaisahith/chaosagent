@@ -15,6 +15,7 @@ from .repository import (
     ApprovalConflictError,
     ApprovalRequestRecord,
     BusinessRuleViolationError,
+    CheckpointConflictError,
     ClaimedRun,
     CompanyCustomer,
     CompanyEffect,
@@ -27,6 +28,7 @@ from .repository import (
     DuplicateEventIDError,
     EventIdentityAndSequenceConflictError,
     EventSequenceConflictError,
+    ExecutionCheckpointRecord,
     FinalReportConflictError,
     FixtureRevisionRecord,
     IdempotencyConflictError,
@@ -52,6 +54,7 @@ from .repository import (
     SyntheticCompanyState,
     approval_identity,
     create_postgres_engine,
+    validate_jsonb_persistence_profile,
 )
 
 __all__ = [
@@ -71,9 +74,11 @@ __all__ = [
     "CompanyShipment",
     "CompanyStateInitializationError",
     "CompanySupportTicket",
+    "CheckpointConflictError",
     "DuplicateEventIDError",
     "EventIdentityAndSequenceConflictError",
     "EventSequenceConflictError",
+    "ExecutionCheckpointRecord",
     "FinalReportConflictError",
     "FixtureRevisionRecord",
     "IdempotencyConflictError",
@@ -102,6 +107,7 @@ __all__ = [
     "SyntheticCompanyState",
     "TERMINAL_STATUSES",
     "create_postgres_engine",
+    "validate_jsonb_persistence_profile",
     "approval_identity",
     "legal_targets",
 ]
