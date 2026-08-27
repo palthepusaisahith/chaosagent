@@ -15,7 +15,12 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from chaosagent_evidence import RunEvent, digest_payload_v0, validate_run_event_v0
+from chaosagent_evidence import (
+    RunEvent,
+    digest_payload_v0,
+    loads_run_event,
+    validate_run_event_v0,
+)
 from chaosagent_fixtures import load_fixture
 from chaosagent_persistence import (
     ClaimedRun,
@@ -28,6 +33,7 @@ from chaosagent_persistence import (
     RunEventRecord,
     create_postgres_engine,
 )
+from chaosagent_policies import load_policy, loads_policy
 from chaosagent_scenarios import loads_scenario
 from chaosagent_tool_gateway import (
     ORDERS_GET_V0,
@@ -51,6 +57,7 @@ pytestmark = pytest.mark.postgres
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_PATH = ROOT / "benchmarks/shipment-refund/scenarios/refund-ambiguous-timeout.v0.json"
 FIXTURE_PATH = ROOT / "benchmarks/shipment-refund/fixtures/failed-shipment.v0.json"
+POLICY_PATH = ROOT / "benchmarks/shipment-refund/policies/refund-policy.v0.json"
 ALEMBIC_INI = ROOT / "packages/persistence/alembic.ini"
 AGENT = RevisionReference("gateway-test-agent", "placeholder", "sha256:" + "a" * 64)
 
@@ -104,9 +111,11 @@ def _create_running_run(
     with Session(engine) as session, session.begin():
         repository = PersistenceRepository(session)
         fixture = load_fixture(FIXTURE_PATH)
+        policy = load_policy(POLICY_PATH)
         scenario = loads_scenario(json.dumps(_scenario_document(allowed_tools=allowed_tools)))
         scenario_document = scenario.to_dict()
         repository.insert_fixture_revision(fixture, created_by="gateway-tests")
+        repository.insert_policy_revision(policy, created_by="gateway-tests")
         repository.insert_scenario_revision(scenario, created_by="gateway-tests")
         repository.insert_agent_configuration_reference(AGENT, created_by="gateway-tests")
         repository.create_run(
@@ -144,6 +153,7 @@ def _call(
     version: str = ORDERS_GET_V0,
     arguments: object | None = None,
     logical_call_id: str | None = None,
+    approval_id: str | None = None,
 ) -> ToolExecutionResult:
     return gateway.execute(
         lease,
@@ -152,6 +162,7 @@ def _call(
         arguments={"order_id": "ORD-1007"} if arguments is None else arguments,
         logical_call_id=logical_call_id or _unique("logical"),
         attempt_id=_unique("attempt"),
+        approval_id=approval_id,
     )
 
 
@@ -173,6 +184,7 @@ def _refund(
     *,
     arguments: object | None = None,
     logical_call_id: str | None = None,
+    approval_id: str | None = None,
 ) -> ToolExecutionResult:
     return _call(
         gateway,
@@ -181,7 +193,777 @@ def _refund(
         version=PAYMENTS_REFUND_V0,
         arguments=_refund_arguments() if arguments is None else arguments,
         logical_call_id=logical_call_id,
+        approval_id=approval_id,
     )
+
+
+def test_policy_denial_and_human_approval_gate(gateway_engine: Engine) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    medium = _refund_arguments(key=_unique("approval-key"), amount_minor=6000)
+    excessive = _refund_arguments(key=_unique("deny-key"), amount_minor=12001)
+
+    with Session(gateway_engine) as session, session.begin():
+        gateway = ToolGateway(session)
+        denied = _refund(gateway, claimed.lease, arguments=excessive)
+        requested = _refund(gateway, claimed.lease, arguments=medium)
+        assert denied.error is not None and denied.error.code == "policy_denied"
+        assert requested.error is not None and requested.error.code == "approval_required"
+        assert requested.approval_id is not None
+        repository = PersistenceRepository(session)
+        assert repository.get_approval_request(requested.approval_id).status == "pending"  # type: ignore[union-attr]
+        assert (
+            repository.get_company_effect(
+                run_id,
+                "payments.refund",
+                PAYMENTS_REFUND_V0,
+                digest_payload_v0(cast(str, medium["idempotency_key"])),
+            )
+            is None
+        )
+
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        resolved = repository.resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="human-reviewer",
+            resolution_event_id=_unique("evt-approval-resolved"),
+        )
+        assert resolved.status == "approved"
+
+    with Session(gateway_engine) as session, session.begin():
+        executed = _refund(
+            ToolGateway(session),
+            claimed.lease,
+            arguments=medium,
+        )
+        replay = _refund(ToolGateway(session), claimed.lease, arguments=medium)
+        assert executed.outcome == "succeeded"
+        assert replay.outcome == "succeeded"
+        assert executed.output is not None and executed.output["application"] == "newly_applied"
+        assert replay.output is not None and replay.output["application"] == "already_applied"
+
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        events = repository.fetch_events(run_id)
+        documents = {
+            record.event.to_dict()["event_id"]: record.event.to_dict() for record in events
+        }
+        types = [record.event.to_dict()["event_type"] for record in events]
+        assert types.count("approval.requested") == 1
+        assert types.count("approval.resolved") == 1
+        assert types.index("policy.decision") < types.index("approval.requested")
+        approval = repository.get_approval_request(requested.approval_id)
+        assert approval is not None and approval.resolution_event_id is not None
+        assert documents[cast(str, denied.result_event_id)]["causation_event_id"] == (
+            denied.policy_decision_event_id
+        )
+        assert documents[cast(str, requested.result_event_id)]["causation_event_id"] == (
+            approval.request_event_id
+        )
+        assert documents[cast(str, executed.result_event_id)]["causation_event_id"] == (
+            approval.resolution_event_id
+        )
+        assert documents[cast(str, replay.result_event_id)]["causation_event_id"] == (
+            approval.resolution_event_id
+        )
+        for result in (denied, requested, executed, replay):
+            payload = cast(
+                dict[str, object], documents[cast(str, result.result_event_id)]["payload"]
+            )
+            assert payload["request_event_id"] == result.request_event_id
+
+    immutable_writes = (
+        "UPDATE public.approval_requests SET requested_attempt_id = 'attacker' "
+        "WHERE approval_id = :approval_id",
+        "DELETE FROM public.approval_requests WHERE approval_id = :approval_id",
+        "UPDATE public.approval_resolutions SET actor_id = 'attacker' "
+        "WHERE approval_id = :approval_id",
+        "DELETE FROM public.approval_resolutions WHERE approval_id = :approval_id",
+    )
+    for statement in immutable_writes:
+        with gateway_engine.connect() as connection:
+            transaction = connection.begin()
+            with pytest.raises(DBAPIError, match="append-only"):
+                connection.execute(text(statement), {"approval_id": requested.approval_id})
+            transaction.rollback()
+
+
+def test_denied_approval_is_authoritative_and_cannot_be_resolved_twice(
+    gateway_engine: Engine,
+) -> None:
+    _, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("denied-approval"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.resolve_approval_request(
+            requested.approval_id,
+            result="denied",
+            actor_id="human-reviewer",
+            resolution_event_id=_unique("evt-denied"),
+        )
+        with pytest.raises(PersistenceError, match="already denied"):
+            repository.resolve_approval_request(
+                requested.approval_id,
+                result="approved",
+                actor_id="other-reviewer",
+                resolution_event_id=_unique("evt-duplicate"),
+            )
+    with Session(gateway_engine) as session, session.begin():
+        denied = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert denied.error is not None and denied.error.code == "approval_denied"
+        approval = PersistenceRepository(session).get_approval_request(requested.approval_id)
+        assert approval is not None and approval.resolution_event_id is not None
+        result = next(
+            record.event.to_dict()
+            for record in PersistenceRepository(session).fetch_events(claimed.lease.run_id)
+            if record.event.to_dict()["event_id"] == denied.result_event_id
+        )
+        assert result["causation_event_id"] == approval.resolution_event_id
+        assert cast(dict[str, object], result["payload"])["request_event_id"] == (
+            denied.request_event_id
+        )
+
+
+def test_approval_does_not_bypass_current_refund_business_invariants(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    approved_arguments = _refund_arguments(key=_unique("toctou-approved"), amount_minor=8000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=approved_arguments)
+        assert requested.approval_id is not None
+        small = _refund(
+            ToolGateway(session),
+            claimed.lease,
+            arguments=_refund_arguments(key=_unique("toctou-small"), amount_minor=5000),
+        )
+        assert small.outcome == "succeeded"
+    with Session(gateway_engine) as session, session.begin():
+        PersistenceRepository(session).resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="human-reviewer",
+            resolution_event_id=_unique("evt-toctou-approved"),
+        )
+    with Session(gateway_engine) as session, session.begin():
+        rejected = _refund(ToolGateway(session), claimed.lease, arguments=approved_arguments)
+        assert rejected.error is not None
+        assert rejected.error.code == "business_rule_violation"
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None
+        assert sum(refund.amount_minor for refund in state.refunds) == 5000
+
+
+def test_duplicate_approval_request_and_resolution_races_are_single_authority(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("approval-race"), amount_minor=6000)
+    request_barrier = Barrier(2)
+
+    def request() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            request_barrier.wait(timeout=10)
+            return _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        requested = [
+            future.result(timeout=20) for future in [pool.submit(request) for _ in range(2)]
+        ]
+    assert {result.error.code for result in requested if result.error is not None} == {
+        "approval_required",
+        "approval_pending",
+    }
+    approval_ids = {result.approval_id for result in requested}
+    assert len(approval_ids) == 1
+    approval_id = next(iter(approval_ids))
+    assert approval_id is not None
+
+    resolution_barrier = Barrier(2)
+
+    def resolve(result: Literal["approved", "denied"]) -> str:
+        try:
+            with Session(gateway_engine) as session, session.begin():
+                resolution_barrier.wait(timeout=10)
+                PersistenceRepository(session).resolve_approval_request(
+                    approval_id,
+                    result=result,
+                    actor_id=f"reviewer-{result}",
+                    resolution_event_id=_unique(f"evt-{result}"),
+                )
+            return result
+        except PersistenceError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        resolutions = sorted(
+            future.result(timeout=20)
+            for future in [pool.submit(resolve, "approved"), pool.submit(resolve, "denied")]
+        )
+    assert resolutions.count("conflict") == 1
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        approval = repository.get_approval_request(approval_id)
+        assert approval is not None and approval.status in {"approved", "denied"}
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        assert sum(event["event_type"] == "approval.requested" for event in events) == 1
+        assert sum(event["event_type"] == "approval.resolved" for event in events) == 1
+        sequences = [cast(int, event["sequence"]) for event in events]
+        assert sequences == list(range(1, len(sequences) + 1))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["arguments", "request_digest", "key_digest", "policy"],
+)
+def test_corrupted_approved_binding_fails_closed_before_mutation(
+    gateway_engine: Engine,
+    corruption: str,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("corrupt-approval"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="integrity-reviewer",
+            resolution_event_id=_unique("evt-integrity-approved"),
+        )
+        if corruption == "policy":
+            document = load_policy(POLICY_PATH).to_dict()
+            document["policy_id"] = _unique("other-policy")
+            other = loads_policy(json.dumps(document))
+            repository.insert_policy_revision(other, created_by="integrity-test")
+            replacement: object = (document["policy_id"], document["revision"], other.digest)
+        else:
+            replacement = None
+
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.approval_requests DISABLE TRIGGER approval_requests_immutable")
+        )
+        if corruption == "arguments":
+            connection.execute(
+                text(
+                    "UPDATE public.approval_requests SET arguments_document = "
+                    "jsonb_set(arguments_document, '{amount_minor}', '6001'::jsonb) "
+                    "WHERE approval_id = :approval_id"
+                ),
+                {"approval_id": requested.approval_id},
+            )
+        elif corruption == "request_digest":
+            connection.execute(
+                text(
+                    "UPDATE public.approval_requests SET request_digest = :digest "
+                    "WHERE approval_id = :approval_id"
+                ),
+                {"approval_id": requested.approval_id, "digest": "sha256:" + "3" * 64},
+            )
+        elif corruption == "key_digest":
+            connection.execute(
+                text(
+                    "UPDATE public.approval_requests SET idempotency_key_digest = :digest "
+                    "WHERE approval_id = :approval_id"
+                ),
+                {"approval_id": requested.approval_id, "digest": "sha256:" + "4" * 64},
+            )
+        else:
+            policy_id, revision, digest = cast(tuple[str, str, str], replacement)
+            connection.execute(
+                text(
+                    "UPDATE public.approval_requests SET policy_id = :policy_id, "
+                    "policy_revision = :revision, policy_digest = :digest "
+                    "WHERE approval_id = :approval_id"
+                ),
+                {
+                    "approval_id": requested.approval_id,
+                    "policy_id": policy_id,
+                    "revision": revision,
+                    "digest": digest,
+                },
+            )
+        connection.execute(
+            text("ALTER TABLE public.approval_requests ENABLE TRIGGER approval_requests_immutable")
+        )
+
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert result.error is not None and result.error.code == "infrastructure_error"
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+
+
+def test_corrupted_approved_run_binding_fails_closed_before_mutation(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    other_run_id, _ = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("wrong-run-approval"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.approval_requests DISABLE TRIGGER approval_requests_immutable")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.approval_requests SET run_id = :other_run_id "
+                "WHERE approval_id = :approval_id"
+            ),
+            {"other_run_id": other_run_id, "approval_id": requested.approval_id},
+        )
+        connection.execute(
+            text("ALTER TABLE public.approval_requests ENABLE TRIGGER approval_requests_immutable")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public.approval_resolutions "
+                "(approval_id, run_id, result, actor_id, responder_type, resolution_event_id) "
+                "VALUES (:approval_id, :run_id, 'approved', 'wrong-run-reviewer', 'human', "
+                ":resolution_event_id)"
+            ),
+            {
+                "approval_id": requested.approval_id,
+                "run_id": other_run_id,
+                "resolution_event_id": _unique("evt-fabricated-resolution"),
+            },
+        )
+    with Session(gateway_engine) as session, session.begin():
+        result = _refund(
+            ToolGateway(session),
+            claimed.lease,
+            arguments=arguments,
+            approval_id=requested.approval_id,
+        )
+        assert result.error is not None and result.error.code == "infrastructure_error"
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+
+
+def test_raw_approval_identity_and_constrained_binding_corruption_fail_closed(
+    gateway_engine: Engine,
+) -> None:
+    _, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("identity-corruption"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    corrupted_id = _unique("approval-corrupt")
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.approval_requests DISABLE TRIGGER approval_requests_immutable")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.approval_requests SET approval_id = :corrupted "
+                "WHERE approval_id = :original"
+            ),
+            {"corrupted": corrupted_id, "original": requested.approval_id},
+        )
+        connection.execute(
+            text("ALTER TABLE public.approval_requests ENABLE TRIGGER approval_requests_immutable")
+        )
+    with Session(gateway_engine) as session:
+        with pytest.raises(PersistenceError, match="identity"):
+            PersistenceRepository(session).get_approval_request(corrupted_id)
+    for assignment in (
+        "scenario_id = 'other.valid-scenario'",
+        "scenario_revision = '2'",
+        "scenario_digest = 'sha256:" + "5" * 64 + "'",
+        "policy_id = 'other.valid-policy'",
+        "policy_revision = '2'",
+        "policy_digest = 'sha256:" + "6" * 64 + "'",
+        "tool_id = 'orders.get'",
+        "contract_version = 'chaosagent.tool/orders.get/v0'",
+    ):
+        with gateway_engine.connect() as connection:
+            transaction = connection.begin()
+            connection.execute(
+                text(
+                    "ALTER TABLE public.approval_requests "
+                    "DISABLE TRIGGER approval_requests_immutable"
+                )
+            )
+            with pytest.raises(IntegrityError):
+                connection.execute(
+                    text(
+                        "UPDATE public.approval_requests SET "
+                        + assignment
+                        + " WHERE approval_id = :approval_id"
+                    ),
+                    {"approval_id": corrupted_id},
+                )
+            transaction.rollback()
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        "missing",
+        "wrong_type",
+        "wrong_run",
+        "wrong_decision",
+        "wrong_decision_id",
+        "wrong_policy",
+        "wrong_logical_call",
+    ],
+)
+def test_approval_creation_rejects_invalid_policy_decision_provenance(
+    gateway_engine: Engine,
+    provenance: str,
+) -> None:
+    _, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("provenance"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+        repository = PersistenceRepository(session)
+        original = repository.get_approval_request(requested.approval_id)
+        assert original is not None
+
+    replacement_event_id: str | None = None
+    replacement_decision_id: str | None = None
+    replacement_logical_call_id: str | None = None
+    if provenance == "wrong_run":
+        _, other_claim = _create_running_run(gateway_engine)
+        other_logical_call_id = _unique("logical-other-run")
+        with Session(gateway_engine) as session, session.begin():
+            other_requested = _refund(
+                ToolGateway(session),
+                other_claim.lease,
+                arguments=arguments,
+                logical_call_id=other_logical_call_id,
+            )
+            other = PersistenceRepository(session).get_approval_request(
+                cast(str, other_requested.approval_id)
+            )
+            assert other is not None
+            replacement_event_id = other.decision_event_id
+            replacement_decision_id = other.decision_id
+            replacement_logical_call_id = other.logical_call_id
+    elif provenance in {"wrong_decision", "wrong_policy"}:
+        with Session(gateway_engine) as session, session.begin():
+            repository = PersistenceRepository(session)
+            source = next(
+                record.event.to_dict()
+                for record in repository.fetch_events(claimed.lease.run_id)
+                if record.event.to_dict()["event_id"] == original.decision_event_id
+            )
+            payload = cast(dict[str, object], source["payload"])
+            if provenance == "wrong_decision":
+                payload["decision"] = "deny"
+            else:
+                document = load_policy(POLICY_PATH).to_dict()
+                document["policy_id"] = _unique("provenance-policy")
+                alternate = loads_policy(json.dumps(document))
+                repository.insert_policy_revision(alternate, created_by="provenance-test")
+                payload["policy"] = {
+                    "id": document["policy_id"],
+                    "revision": document["revision"],
+                    "digest": alternate.digest,
+                }
+            payload_digest = digest_payload_v0(payload)
+            replacement_event_id = _unique("evt-policy-provenance")
+
+            def event_factory(sequence: int) -> RunEvent:
+                source["event_id"] = replacement_event_id
+                source["sequence"] = sequence
+                source["payload_digest"] = payload_digest
+                return loads_run_event(json.dumps(source))
+
+            repository.append_event_allocated(claimed.lease.run_id, event_factory)
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.approval_requests DISABLE TRIGGER approval_requests_immutable")
+        )
+        connection.execute(
+            text("DELETE FROM public.approval_requests WHERE approval_id = :approval_id"),
+            {"approval_id": requested.approval_id},
+        )
+        connection.execute(
+            text("ALTER TABLE public.approval_requests ENABLE TRIGGER approval_requests_immutable")
+        )
+
+    decision_event_id = original.decision_event_id
+    decision_id = original.decision_id
+    logical_call_id = original.logical_call_id
+    if provenance == "missing":
+        decision_event_id = _unique("evt-missing")
+    elif provenance == "wrong_type":
+        decision_event_id = original.request_event_id
+    elif provenance in {"wrong_run", "wrong_decision", "wrong_policy"}:
+        assert replacement_event_id is not None
+        decision_event_id = replacement_event_id
+        if replacement_decision_id is not None:
+            decision_id = replacement_decision_id
+        if replacement_logical_call_id is not None:
+            logical_call_id = replacement_logical_call_id
+    elif provenance == "wrong_decision_id":
+        decision_id = _unique("decision-wrong")
+    else:
+        logical_call_id = _unique("logical-wrong")
+    with Session(gateway_engine) as session, session.begin():
+        with pytest.raises(PersistenceError, match="policy-decision|provenance"):
+            PersistenceRepository(session).create_approval_request(
+                run=claimed.run,
+                policy=original.policy,
+                tool_id=original.tool_id,
+                contract_version=original.contract_version,
+                request_digest=original.request_digest,
+                idempotency_key_digest=original.idempotency_key_digest,
+                arguments=original.arguments,
+                logical_call_id=logical_call_id,
+                requested_attempt_id=_unique("attempt-recreated"),
+                lease_attempt=claimed.lease.attempt,
+                decision_id=decision_id,
+                decision_event_id=decision_event_id,
+                request_event_id=_unique("evt-recreated-request"),
+                producer_component="provenance-test",
+            )
+
+
+def test_approval_evidence_failures_roll_back_request_and_resolution(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("approval-rollback"), amount_minor=6000)
+    original_append = PersistenceRepository.append_event
+
+    def fail_requested(repository: PersistenceRepository, event: RunEvent) -> RunEventRecord:
+        if event.to_dict()["event_type"] == "approval.requested":
+            raise PersistenceError("forced approval request evidence failure")
+        return original_append(repository, event)
+
+    monkeypatch.setattr(PersistenceRepository, "append_event", fail_requested)
+    with Session(gateway_engine) as session, session.begin():
+        failed = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert failed.error is not None and failed.error.code == "infrastructure_error"
+    monkeypatch.undo()
+    with gateway_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.approval_requests WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 0
+        )
+
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+
+    def fail_resolved(repository: PersistenceRepository, event: RunEvent) -> RunEventRecord:
+        if event.to_dict()["event_type"] == "approval.resolved":
+            raise PersistenceError("forced approval resolution evidence failure")
+        return original_append(repository, event)
+
+    monkeypatch.setattr(PersistenceRepository, "append_event", fail_resolved)
+    with Session(gateway_engine) as session, session.begin():
+        with pytest.raises(PersistenceError, match="resolution evidence"):
+            PersistenceRepository(session).resolve_approval_request(
+                requested.approval_id,
+                result="approved",
+                actor_id="rollback-reviewer",
+                resolution_event_id=_unique("evt-resolution-rollback"),
+            )
+    monkeypatch.undo()
+    with Session(gateway_engine) as session:
+        approval = PersistenceRepository(session).get_approval_request(requested.approval_id)
+        assert approval is not None and approval.status == "pending"
+
+
+def test_approved_request_cannot_be_used_by_stale_worker_after_reclaim(
+    gateway_engine: Engine,
+) -> None:
+    run_id, stale_claim = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("approved-stale"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), stale_claim.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    with Session(gateway_engine) as session, session.begin():
+        PersistenceRepository(session).resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="stale-test-reviewer",
+            resolution_event_id=_unique("evt-stale-approved"),
+        )
+        session.execute(
+            text(
+                "UPDATE public.runs SET heartbeat_at = clock_timestamp() - interval '2 hours', "
+                "lease_expires_at = clock_timestamp() - interval '1 hour' WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.requeue_expired_run(
+            run_id,
+            expected_version=stale_claim.run.lifecycle_version,
+            evidence=_evidence("approval-stale-requeue"),
+        )
+        replacement = repository.claim_next_run(
+            "replacement-approval-worker",
+            lease_duration_seconds=600,
+            evidence=_evidence("approval-stale-reclaim"),
+            run_id=run_id,
+        )
+        assert replacement is not None
+        running = repository.transition_owned_run(
+            replacement.lease,
+            "running",
+            expected_version=replacement.run.lifecycle_version,
+            evidence=_evidence("approval-stale-running"),
+        )
+        replacement = ClaimedRun(running, replacement.lease)
+    with Session(gateway_engine) as session, session.begin():
+        stale = _refund(
+            ToolGateway(session),
+            stale_claim.lease,
+            arguments=arguments,
+            approval_id=requested.approval_id,
+        )
+        assert stale.error is not None and stale.error.code == "stale_lease"
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+    with Session(gateway_engine) as session, session.begin():
+        current = _refund(
+            ToolGateway(session),
+            replacement.lease,
+            arguments=arguments,
+            approval_id=requested.approval_id,
+        )
+        assert current.outcome == "succeeded"
+
+
+def test_approval_resolution_race_with_execution_is_atomic(gateway_engine: Engine) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("approval-execution-race"), amount_minor=6000)
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    resolution_event_id = _unique("evt-resolution-execution-race")
+    barrier = Barrier(2)
+
+    def resolve() -> None:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            PersistenceRepository(session).resolve_approval_request(
+                cast(str, requested.approval_id),
+                result="approved",
+                actor_id="race-reviewer",
+                resolution_event_id=resolution_event_id,
+            )
+
+    def execute() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _refund(
+                ToolGateway(session),
+                claimed.lease,
+                arguments=arguments,
+                approval_id=requested.approval_id,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        resolution_future = pool.submit(resolve)
+        execution_future = pool.submit(execute)
+        resolution_future.result(timeout=20)
+        execution = execution_future.result(timeout=20)
+
+    assert execution.outcome == "succeeded" or (
+        execution.error is not None and execution.error.code == "approval_pending"
+    )
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        approval = repository.get_approval_request(requested.approval_id)
+        state = repository.get_run_company_state(run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        assert approval is not None and approval.status == "approved"
+        assert state is not None and len(state.refunds) == (
+            1 if execution.outcome == "succeeded" else 0
+        )
+        sequences = [cast(int, event["sequence"]) for event in events]
+        assert sequences == list(range(1, len(sequences) + 1))
+        result = next(event for event in events if event["event_id"] == execution.result_event_id)
+        expected_cause = (
+            resolution_event_id if execution.outcome == "succeeded" else approval.request_event_id
+        )
+        assert result["causation_event_id"] == expected_cause
+
+
+def test_approved_execution_race_with_terminal_transition_is_atomic(
+    gateway_engine: Engine,
+) -> None:
+    run_id, claimed = _create_running_run(gateway_engine)
+    arguments = _refund_arguments(key=_unique("approval-terminal-race"), amount_minor=6000)
+    resolution_event_id = _unique("evt-approval-terminal-race")
+    with Session(gateway_engine) as session, session.begin():
+        requested = _refund(ToolGateway(session), claimed.lease, arguments=arguments)
+        assert requested.approval_id is not None
+    with Session(gateway_engine) as session, session.begin():
+        PersistenceRepository(session).resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="terminal-race-reviewer",
+            resolution_event_id=resolution_event_id,
+        )
+    barrier = Barrier(2)
+
+    def execute() -> ToolExecutionResult:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            return _refund(
+                ToolGateway(session),
+                claimed.lease,
+                arguments=arguments,
+                approval_id=requested.approval_id,
+            )
+
+    def terminate() -> None:
+        with Session(gateway_engine) as session, session.begin():
+            barrier.wait(timeout=10)
+            PersistenceRepository(session).transition_owned_run(
+                claimed.lease,
+                "failed",
+                expected_version=claimed.run.lifecycle_version,
+                evidence=_evidence("approval-terminal-race"),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        execution_future = pool.submit(execute)
+        terminal_future = pool.submit(terminate)
+        terminal_future.result(timeout=20)
+        execution = execution_future.result(timeout=20)
+
+    assert execution.outcome == "succeeded" or (
+        execution.error is not None and execution.error.code in {"run_not_ready", "stale_lease"}
+    )
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(run_id)
+        state = repository.get_run_company_state(run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        assert run is not None and run.status == "failed"
+        assert state is not None and len(state.refunds) == (
+            1 if execution.outcome == "succeeded" else 0
+        )
+        sequences = [cast(int, event["sequence"]) for event in events]
+        assert sequences == list(range(1, len(sequences) + 1))
+        if execution.outcome == "succeeded":
+            result = next(
+                event for event in events if event["event_id"] == execution.result_event_id
+            )
+            assert result["causation_event_id"] == resolution_event_id
 
 
 def _update_ticket(
@@ -238,8 +1020,9 @@ def test_read_handlers_outputs_evidence_checksums_and_no_mutation(gateway_engine
         assert [record.event.to_dict()["sequence"] for record in events] == list(
             range(1, len(events) + 1)
         )
-        request, result = (record.event.to_dict() for record in events[-2:])
+        request, policy, result = (record.event.to_dict() for record in events[-3:])
         assert request["event_type"] == "tool.requested"
+        assert policy["event_type"] == "policy.decision"
         assert result["event_type"] == "tool.result"
         request_payload = cast(dict[str, object], request["payload"])
         result_payload = cast(dict[str, object], result["payload"])
@@ -250,7 +1033,7 @@ def test_read_handlers_outputs_evidence_checksums_and_no_mutation(gateway_engine
         assert result_payload["request_event_id"] == request["event_id"]
         for field in ("logical_call_id", "attempt_id", "attempt_number", "tool_id"):
             assert result_payload[field] == request_payload[field]
-        assert result["causation_event_id"] == request["event_id"]
+        assert result["causation_event_id"] == policy["event_id"]
 
 
 def test_entity_not_found_is_evidenced_tool_error(gateway_engine: Engine) -> None:
@@ -477,7 +1260,7 @@ def test_invalid_handler_output_becomes_safe_evidenced_error(gateway_engine: Eng
         assert result.error is not None and result.error.code == "infrastructure_error"
         assert result.output is None
         events = PersistenceRepository(session).fetch_events(run_id)
-        assert len(events) == 4
+        assert len(events) == 5
         result_document = events[-1].event.to_dict()
         payload = cast(dict[str, object], result_document["payload"])
         assert payload["outcome"] == "failed"
@@ -541,8 +1324,8 @@ def test_concurrent_tool_calls_share_one_sequence_domain(gateway_engine: Engine)
             record.event.to_dict() for record in PersistenceRepository(session).fetch_events(run_id)
         ]
         sequences = [cast(int, document["sequence"]) for document in documents]
-        assert sequences == list(range(1, 7))
-        assert len({document["event_id"] for document in documents}) == 6
+        assert sequences == list(range(1, 9))
+        assert len({document["event_id"] for document in documents}) == 8
 
 
 def test_lifecycle_and_tool_events_cannot_collide(gateway_engine: Engine) -> None:
@@ -664,14 +1447,17 @@ def test_refund_success_replay_conflict_and_authoritative_evidence(
         mutation_events = [record.event.to_dict() for record in repository.fetch_events(run_id)[2:]]
         assert [event["event_type"] for event in mutation_events] == [
             "tool.requested",
+            "policy.decision",
             "tool.result",
             "state.evidence_recorded",
             "tool.requested",
+            "policy.decision",
             "tool.result",
             "tool.requested",
+            "policy.decision",
             "tool.result",
         ]
-        evidence = cast(dict[str, object], mutation_events[2]["payload"])
+        evidence = cast(dict[str, object], mutation_events[3]["payload"])
         assert evidence["evidence_id"] == effect.effect_id
         assert evidence["fact_type"] == "refund.created"
         assert cast(dict[str, object], evidence["subject"])["id"] == effect.subject_id
@@ -739,7 +1525,7 @@ def test_refund_business_rules_missing_entities_and_integer_contract(
             arguments={**_refund_arguments(key="float"), "amount_minor": 12.99},
         )
         assert missing.error is not None and missing.error.code == "entity_not_found"
-        assert too_much.error is not None and too_much.error.code == "business_rule_violation"
+        assert too_much.error is not None and too_much.error.code == "policy_denied"
         assert floating.error is not None and floating.error.code == "invalid_request"
         state = PersistenceRepository(session).get_run_company_state(run_id)
         assert state is not None and state.refunds == ()
@@ -819,6 +1605,7 @@ def test_fabricated_mutation_handler_cannot_apply_or_emit_authoritative_evidence
             "run.lifecycle",
             "run.lifecycle",
             "tool.requested",
+            "policy.decision",
             "tool.result",
         ]
 
@@ -969,7 +1756,7 @@ def test_historical_refund_replay_does_not_reapply_or_revert_payment_state(
         second = _refund(
             gateway,
             claimed.lease,
-            arguments=_refund_arguments(key="refund-history-b", amount_minor=8000),
+            arguments=_refund_arguments(key="refund-history-b", amount_minor=5000),
         )
         replay = _refund(
             gateway,
@@ -983,7 +1770,7 @@ def test_historical_refund_replay_does_not_reapply_or_revert_payment_state(
         repository = PersistenceRepository(session)
         state = repository.get_run_company_state(run_id)
         assert state is not None and len(state.refunds) == 2
-        assert sum(refund.amount_minor for refund in state.refunds) == 12000
+        assert sum(refund.amount_minor for refund in state.refunds) == 9000
         payment = repository.get_company_payment(run_id, "PAY-1007")
         assert payment is not None and payment.status == "partially_refunded"
 
@@ -1073,14 +1860,22 @@ def test_concurrent_refunds_enforce_idempotency_conflicts_and_capture_limit(
         state = PersistenceRepository(session).get_run_company_state(conflict_run)
         assert state is not None and len(state.refunds) == 1
 
-    limited_run, limited_claimed = _create_running_run(gateway_engine)
-    limited_barrier = Barrier(2)
+        limited_run, limited_claimed = _create_running_run(gateway_engine)
+        with Session(gateway_engine) as session, session.begin():
+            session.execute(
+                text(
+                    "UPDATE public.company_payments SET amount_minor = 9000 "
+                    "WHERE run_id = :run_id AND payment_id = 'PAY-1007'"
+                ),
+                {"run_id": limited_run},
+            )
+        limited_barrier = Barrier(2)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
             pool.submit(
                 race,
                 limited_claimed.lease,
-                _refund_arguments(key=f"distinct-{index}", amount_minor=8000),
+                _refund_arguments(key=f"distinct-{index}", amount_minor=5000),
                 limited_barrier,
             )
             for index in range(2)
@@ -1094,7 +1889,7 @@ def test_concurrent_refunds_enforce_idempotency_conflicts_and_capture_limit(
     with Session(gateway_engine) as session:
         state = PersistenceRepository(session).get_run_company_state(limited_run)
         assert state is not None
-        assert sum(refund.amount_minor for refund in state.refunds) == 8000
+        assert sum(refund.amount_minor for refund in state.refunds) == 5000
 
 
 def test_direct_repository_same_key_waits_for_run_lock_and_survives_first_rollback(
@@ -1256,7 +2051,12 @@ def test_effect_evidence_failure_rolls_back_mutation_and_outer_transaction_remai
             self,
             run_id: str,
             event_id: str,
-            event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
+            event_type: Literal[
+                "tool.requested",
+                "tool.result",
+                "state.evidence_recorded",
+                "policy.decision",
+            ],
             payload: dict[str, object],
             *,
             correlation_id: str,
@@ -1290,6 +2090,7 @@ def test_effect_evidence_failure_rolls_back_mutation_and_outer_transaction_remai
             "run.lifecycle",
             "run.lifecycle",
             "tool.requested",
+            "policy.decision",
             "tool.result",
         ]
 
@@ -1357,7 +2158,12 @@ def test_mutation_result_evidence_failure_rolls_back_request_and_effect(
             self,
             run_id: str,
             event_id: str,
-            event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
+            event_type: Literal[
+                "tool.requested",
+                "tool.result",
+                "state.evidence_recorded",
+                "policy.decision",
+            ],
             payload: dict[str, object],
             *,
             correlation_id: str,
@@ -1524,8 +2330,9 @@ def test_corrupt_stored_effect_fails_replay_closed_without_success_evidence(
         assert replay.error is not None and replay.error.code == "infrastructure_error"
         assert replay.output is None and replay.state_evidence_event_id is None
         events = PersistenceRepository(session).fetch_events(run_id)
-        assert [event.event.to_dict()["event_type"] for event in events[-2:]] == [
+        assert [event.event.to_dict()["event_type"] for event in events[-3:]] == [
             "tool.requested",
+            "policy.decision",
             "tool.result",
         ]
         assert (

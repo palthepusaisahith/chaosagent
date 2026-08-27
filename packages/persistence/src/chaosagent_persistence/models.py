@@ -78,6 +78,44 @@ class ScenarioRevisionModel(Base):
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
 
 
+class PolicyRevisionModel(Base):
+    """Immutable, validated Policy contract revision."""
+
+    __tablename__ = "policy_revisions"
+    __table_args__ = (
+        CheckConstraint("policy_id ~ '" + IDENTIFIER_CHECK + "'", name="policy_id_format"),
+        CheckConstraint("revision ~ '" + REVISION_CHECK + "'", name="revision_format"),
+        CheckConstraint("canonical_digest ~ '" + DIGEST_CHECK + "'", name="digest_format"),
+        CheckConstraint("jsonb_typeof(canonical_document) = 'object'", name="document_object"),
+        CheckConstraint(
+            "(canonical_document ->> 'policy_id') IS NOT DISTINCT FROM policy_id",
+            name="document_policy_id",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'revision') IS NOT DISTINCT FROM revision",
+            name="document_revision",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'schema_version') IS NOT DISTINCT FROM schema_version",
+            name="document_schema_version",
+        ),
+        UniqueConstraint(
+            "policy_id", "revision", "canonical_digest", name="uq_policy_revision_digest"
+        ),
+        {"schema": "public"},
+    )
+
+    policy_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[str] = mapped_column(String(64), primary_key=True)
+    schema_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    canonical_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
 class FixtureRevisionModel(Base):
     """Immutable, validated synthetic-company Fixture contract revision."""
 
@@ -224,6 +262,13 @@ class RunModel(Base):
         UniqueConstraint(
             "run_id", "fixture_id", "fixture_revision", "fixture_digest", name="uq_run_fixture"
         ),
+        UniqueConstraint(
+            "run_id",
+            "scenario_id",
+            "scenario_revision",
+            "scenario_digest",
+            name="uq_runs_approval_scenario",
+        ),
         Index("ix_runs_scenario_revision", "scenario_id", "scenario_revision"),
         Index(
             "ix_runs_claim_queue",
@@ -317,6 +362,132 @@ class RunEventModel(Base):
     payload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
     inserted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class ApprovalRequestModel(Base):
+    """Immutable authorization request for one exact logical mutation."""
+
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        CheckConstraint("approval_id ~ '" + IDENTIFIER_CHECK + "'", name="approval_id_format"),
+        CheckConstraint("decision_id ~ '" + IDENTIFIER_CHECK + "'", name="decision_id_format"),
+        CheckConstraint("tool_id = 'payments.refund'", name="tool_id_value"),
+        CheckConstraint(
+            "contract_version = 'chaosagent.tool/payments.refund/v0'",
+            name="contract_version_value",
+        ),
+        CheckConstraint("request_digest ~ '" + DIGEST_CHECK + "'", name="request_digest"),
+        CheckConstraint("idempotency_key_digest ~ '" + DIGEST_CHECK + "'", name="key_digest"),
+        CheckConstraint("jsonb_typeof(arguments_document) = 'object'", name="arguments_object"),
+        CheckConstraint(
+            "jsonb_typeof(arguments_document -> 'amount_minor') "
+            "IS NOT DISTINCT FROM 'number' AND "
+            "(arguments_document ->> 'amount_minor') ~ '^[1-9][0-9]*$'",
+            name="amount_integer",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(arguments_document -> 'order_id') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(arguments_document -> 'payment_id') IS NOT DISTINCT FROM 'string' AND "
+            "jsonb_typeof(arguments_document -> 'idempotency_key') "
+            "IS NOT DISTINCT FROM 'string'",
+            name="argument_identity",
+        ),
+        CheckConstraint("lease_attempt >= 1", name="lease_attempt_positive"),
+        ForeignKeyConstraint(
+            ["run_id", "scenario_id", "scenario_revision", "scenario_digest"],
+            [
+                "public.runs.run_id",
+                "public.runs.scenario_id",
+                "public.runs.scenario_revision",
+                "public.runs.scenario_digest",
+            ],
+            name="fk_approval_requests_run_scenario",
+        ),
+        ForeignKeyConstraint(
+            ["scenario_id", "scenario_revision", "scenario_digest"],
+            [
+                "public.scenario_revisions.scenario_id",
+                "public.scenario_revisions.revision",
+                "public.scenario_revisions.canonical_digest",
+            ],
+            name="fk_approval_requests_scenario",
+        ),
+        ForeignKeyConstraint(
+            ["policy_id", "policy_revision", "policy_digest"],
+            [
+                "public.policy_revisions.policy_id",
+                "public.policy_revisions.revision",
+                "public.policy_revisions.canonical_digest",
+            ],
+            name="fk_approval_requests_policy",
+        ),
+        UniqueConstraint(
+            "run_id",
+            "scenario_id",
+            "scenario_revision",
+            "scenario_digest",
+            "policy_id",
+            "policy_revision",
+            "policy_digest",
+            "tool_id",
+            "contract_version",
+            "request_digest",
+            "idempotency_key_digest",
+            name="uq_approval_request_binding",
+        ),
+        UniqueConstraint("approval_id", "run_id", name="uq_approval_request_run"),
+        {"schema": "public"},
+    )
+
+    approval_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scenario_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scenario_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    scenario_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    policy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    policy_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    tool_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(256), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    idempotency_key_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    arguments_document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    logical_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    lease_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    decision_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    decision_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    request_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+
+
+class ApprovalResolutionModel(Base):
+    """One immutable authoritative resolution for an approval request."""
+
+    __tablename__ = "approval_resolutions"
+    __table_args__ = (
+        CheckConstraint("result IN ('approved', 'denied')", name="result_value"),
+        CheckConstraint("responder_type IN ('human', 'simulated')", name="responder_type_value"),
+        CheckConstraint("actor_id ~ '" + IDENTIFIER_CHECK + "'", name="actor_id_format"),
+        ForeignKeyConstraint(
+            ["approval_id", "run_id"],
+            ["public.approval_requests.approval_id", "public.approval_requests.run_id"],
+            name="fk_approval_resolutions_request",
+        ),
+        {"schema": "public"},
+    )
+
+    approval_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    result: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    responder_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    resolution_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    resolved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
     )
 
 

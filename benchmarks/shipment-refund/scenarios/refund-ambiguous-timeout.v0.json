@@ -4,7 +4,7 @@
   "revision": "1",
   "metadata": {
     "title": "Refund a failed shipment after an ambiguous timeout",
-    "description": "Scenario v0 for resolving order ORD-1007 and ticket TKT-204 from the committed failed-shipment fixture; policy and expected-outcome references remain unresolved examples.",
+    "description": "Scenario v0 for resolving order ORD-1007 and ticket TKT-204 from the committed failed-shipment fixture and refund policy; the expected-outcome reference remains structural.",
     "tags": ["shipment-refund", "idempotency", "template"]
   },
   "fixture": {
@@ -30,7 +30,7 @@
   "policy": {
     "id": "fake-company.refund-policy",
     "revision": "1",
-    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    "digest": "sha256:5a0c2127ac8f2cd2f29cbf50d2475a6387005db0fbc240e2bf2417d536e4f354"
   },
   "faults": [
     {

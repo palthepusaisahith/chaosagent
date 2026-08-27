@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Run-scoped synthetic-company tool contracts and gateway for ChaosAgent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "chaosagent-policies",
     "chaosagent-evidence",
     "chaosagent-persistence",
     "jsonschema==4.26.0",
@@ -12,6 +13,7 @@ dependencies = [
 
 [tool.uv.sources]
 chaosagent-evidence = { workspace = true }
+chaosagent-policies = { workspace = true }
 chaosagent-persistence = { workspace = true }
 
 [build-system]

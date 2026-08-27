@@ -3,11 +3,11 @@
 ## Scope and ownership
 
 This package is the PostgreSQL adapter introduced by Issue #5 and extended by
-Issues #6–#7 and #9. It persists validated Scenario and Fixture revisions,
-unresolved Agent Configuration revision references, Runs, isolated Run-local
-synthetic company state, Run Event evidence, and one final Run Report per Run.
-It does not implement workers, evaluation, agent-facing tools, fault behavior,
-or streaming.
+Issues #6–#7 and #9–#10. It persists validated Scenario, Fixture, and Policy
+revisions, unresolved Agent Configuration revision references, Runs, isolated
+Run-local synthetic company state, Run Event evidence, and one final Run Report
+per Run. It does not implement workers, evaluation, agent-facing tools, fault
+behavior, or streaming.
 
 The tables have deliberately different responsibilities:
 
@@ -16,6 +16,12 @@ The tables have deliberately different responsibilities:
 - `fixture_revisions` stores immutable validated Fixture v0 documents and their
   canonical digests. Mutable Run-local company rows are described in the Fixture
   documentation.
+- `policy_revisions` stores immutable validated Policy v0 documents and their
+  JCS digests. `approval_requests` freezes one exact mutation authorization
+  request; `approval_resolutions` provides its immutable zero-or-one human
+  resolution. A composite foreign key binds the approval's full Scenario tuple
+  to its Run; repository validation additionally proves its Policy is the Policy
+  frozen by that Scenario and revalidates the complete evidence chain.
 - `agent_configuration_revisions` is only an immutable `{id, revision, digest}`
   reference registry. There is no Agent Configuration contract yet, so this
   table does not claim that the referenced content was loaded or that its digest
@@ -82,6 +88,12 @@ provisioning is deployment-specific and deferred; the application role must not
 own these tables and should receive only `SELECT`/`INSERT` on immutable tables.
 `TRUNCATE` and DDL must not be granted. The migration intentionally does not
 create cluster-global roles.
+
+For approvals, database constraints enforce relational references and the v0
+tool/version shape. The centralized repository loader separately recomputes the
+approval identity and request fingerprints and validates Run, Scenario, Policy,
+and evidence coherence. Neither layer is presented as protection from a
+malicious database owner.
 
 Runs are deliberately mutable only through the Issue #6 lifecycle CAS methods.
 See [`RUN_LIFECYCLE_LEASES.md`](RUN_LIFECYCLE_LEASES.md) for their state,
@@ -154,13 +166,14 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #9
+## Deferred beyond Issue #10
 
 - worker processes/daemons and automatic recovery scheduling;
 - external side-effect fencing or reconciliation beyond the committed local
   synthetic effect ledger;
 - Campaign persistence and campaign statistics;
-- fault activations, approvals, evaluators, SSE, telemetry, exports, and
-  deployment role creation;
+- authentication/RBAC, approval UI/notifications, expiry workflows, fault
+  activations, evaluators, SSE, telemetry, exports, and deployment role
+  creation;
 - an actual versioned Agent Configuration document contract;
 - any report rebuild/version history policy.

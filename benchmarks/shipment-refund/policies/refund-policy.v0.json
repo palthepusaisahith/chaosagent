@@ -1,0 +1,19 @@
+{
+  "schema_version": "chaosagent.policy/v0",
+  "policy_id": "fake-company.refund-policy",
+  "revision": "1",
+  "metadata": {
+    "title": "Shipment refund benchmark policy",
+    "description": "Allows benchmark reads and ticket updates, automatically allows refunds through USD 50.00, requires one-request human approval through USD 120.00, and denies larger refunds."
+  },
+  "tools": {
+    "orders.get": { "decision": "allow" },
+    "shipping.get_status": { "decision": "allow" },
+    "payments.refund": {
+      "currency": "USD",
+      "automatic_max_minor": 5000,
+      "approval_max_minor": 12000
+    },
+    "support.update_ticket": { "decision": "allow" }
+  }
+}

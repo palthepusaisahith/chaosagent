@@ -6,7 +6,7 @@
   "scenario": {
     "id": "shipment-refund.ambiguous-timeout",
     "revision": "1",
-    "digest": "sha256:64f946edcb0f5f70e58cba4eb37755d6a105db789e7609ca62e703c53f79b2dc"
+    "digest": "sha256:969b3a01599ee5bccf753b9e49c763a7c70bd1395e12fa47b7e6370b3aa4231f"
   },
   "agent_configuration": {
     "id": "example-agent-configuration",

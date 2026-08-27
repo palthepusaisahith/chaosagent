@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -33,8 +34,11 @@ from chaosagent_persistence import (
     PersistenceIntegrityError,
     PersistenceRepository,
     ReferenceNotFoundError,
+    RevisionReference,
     StaleLeaseError,
+    approval_identity,
 )
+from chaosagent_policies import PolicyValidationError, evaluate_policy_v0
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -49,6 +53,13 @@ type ToolErrorCode = Literal[
     "entity_not_found",
     "business_rule_violation",
     "idempotency_conflict",
+    "policy_denied",
+    "approval_required",
+    "approval_not_found",
+    "approval_pending",
+    "approval_denied",
+    "approval_mismatch",
+    "policy_integrity_error",
     "infrastructure_error",
 ]
 
@@ -75,6 +86,17 @@ class _LeaseLostDuringExecution(RuntimeError):
     pass
 
 
+class _PolicyGateBlocked(RuntimeError):
+    pass
+
+
+@contextmanager
+def _execute_when_authorized(error: ToolError | None) -> Iterator[None]:
+    if error is not None:
+        raise _PolicyGateBlocked
+    yield
+
+
 @dataclass(frozen=True, slots=True)
 class ToolError:
     code: ToolErrorCode
@@ -93,6 +115,8 @@ class ToolExecutionResult:
     request_event_id: str | None
     result_event_id: str | None
     state_evidence_event_id: str | None
+    policy_decision_event_id: str | None = None
+    approval_id: str | None = None
 
 
 class ReadOnlyCompanyState(Protocol):
@@ -360,6 +384,7 @@ class ToolGateway:
         attempt_number: object = 1,
         step_id: object | None = None,
         causation_event_id: object | None = None,
+        approval_id: object | None = None,
     ) -> ToolExecutionResult:
         field_error = _validate_call_fields(
             lease,
@@ -371,6 +396,7 @@ class ToolGateway:
             attempt_number,
             step_id,
             causation_event_id,
+            approval_id,
         )
         result_tool_id = tool_id if isinstance(tool_id, str) else "<invalid>"
         result_version = contract_version if isinstance(contract_version, str) else "<invalid>"
@@ -389,6 +415,7 @@ class ToolGateway:
         assert isinstance(attempt_number, int) and not isinstance(attempt_number, bool)
         assert step_id is None or isinstance(step_id, str)
         assert causation_event_id is None or isinstance(causation_event_id, str)
+        assert approval_id is None or isinstance(approval_id, str)
         definition = self._registry.resolve(tool_id, contract_version)
         if definition is None:
             message = (
@@ -472,6 +499,26 @@ class ToolGateway:
                         "run_not_ready",
                         "Run-local synthetic company state is not initialized",
                     )
+                policy_reference = cast(dict[str, object], scenario["policy"])
+                policy_record = self._repository.get_policy_revision(
+                    cast(str, policy_reference["id"]),
+                    cast(str, policy_reference["revision"]),
+                )
+                if (
+                    policy_record is None
+                    or policy_record.policy.digest != policy_reference["digest"]
+                ):
+                    return self._rejected(
+                        tool_id,
+                        contract_version,
+                        "policy_integrity_error",
+                        "the frozen Scenario policy reference does not resolve",
+                    )
+                frozen_policy = RevisionReference(
+                    cast(str, policy_reference["id"]),
+                    cast(str, policy_reference["revision"]),
+                    cast(str, policy_reference["digest"]),
+                )
 
                 request_event_id = _event_id()
                 request_digest = digest_payload_v0(
@@ -506,12 +553,122 @@ class ToolGateway:
                     causation_event_id=causation_event_id,
                 )
 
+                payment_currency: str | None = None
+                if tool_id == "payments.refund":
+                    payment = self._repository.get_company_payment(
+                        run.run_id, cast(str, arguments_snapshot["payment_id"])
+                    )
+                    payment_currency = None if payment is None else payment.currency
+                decision = evaluate_policy_v0(
+                    policy_record.policy,
+                    tool_id=tool_id,
+                    contract_version=contract_version,
+                    arguments=arguments_snapshot,
+                    payment_currency=payment_currency,
+                )
+                decision_id = f"decision-{uuid4().hex}"
+                policy_decision_event_id = _event_id()
+                self._append_event(
+                    run.run_id,
+                    policy_decision_event_id,
+                    "policy.decision",
+                    {
+                        "decision_id": decision_id,
+                        "policy": {
+                            "id": frozen_policy.id,
+                            "revision": frozen_policy.revision,
+                            "digest": frozen_policy.digest,
+                        },
+                        "decision": decision.decision,
+                        "reason_code": decision.reason_code,
+                        "logical_call_id": logical_call_id,
+                    },
+                    correlation_id=logical_call_id,
+                    causation_event_id=request_event_id,
+                )
+
                 started = monotonic_ns()
                 output: dict[str, object] | None = None
                 tool_error: ToolError | None = None
                 effect: CompanyEffect | None = None
+                effective_approval_id: str | None = None
+                result_causation_event_id = policy_decision_event_id
+                if decision.decision == "deny":
+                    tool_error = ToolError(
+                        "policy_denied", "the frozen Policy denied this tool request"
+                    )
+                elif decision.decision == "require_approval":
+                    assert idempotency_key_digest is not None
+                    effective_approval_id = approval_identity(
+                        run_id=run.run_id,
+                        scenario_id=run.scenario.id,
+                        scenario_revision=run.scenario.revision,
+                        scenario_digest=run.scenario.digest,
+                        policy_id=frozen_policy.id,
+                        policy_revision=frozen_policy.revision,
+                        policy_digest=frozen_policy.digest,
+                        tool_id=tool_id,
+                        contract_version=contract_version,
+                        request_digest=request_digest,
+                        idempotency_key_digest=idempotency_key_digest,
+                    )
+                    if approval_id is not None and approval_id != effective_approval_id:
+                        tool_error = ToolError(
+                            "approval_mismatch",
+                            "approval does not authorize this exact frozen request",
+                        )
+                    else:
+                        approval = self._repository.get_approval_request_for_authorization(
+                            effective_approval_id,
+                            run=run,
+                            policy=frozen_policy,
+                            tool_id=tool_id,
+                            contract_version=contract_version,
+                            request_digest=request_digest,
+                            idempotency_key_digest=idempotency_key_digest,
+                            arguments=arguments_snapshot,
+                        )
+                        if approval is None and approval_id is not None:
+                            tool_error = ToolError(
+                                "approval_not_found", "approval request was not found"
+                            )
+                        elif approval is None:
+                            approval = self._repository.create_approval_request(
+                                run=run,
+                                policy=frozen_policy,
+                                tool_id=tool_id,
+                                contract_version=contract_version,
+                                request_digest=request_digest,
+                                idempotency_key_digest=idempotency_key_digest,
+                                arguments=arguments_snapshot,
+                                logical_call_id=logical_call_id,
+                                requested_attempt_id=attempt_id,
+                                lease_attempt=lease.attempt,
+                                decision_id=decision_id,
+                                decision_event_id=policy_decision_event_id,
+                                request_event_id=_event_id(),
+                                producer_component=self._producer_component,
+                                producer_instance_id=self._producer_instance_id,
+                            )
+                            result_causation_event_id = approval.request_event_id
+                            tool_error = ToolError(
+                                "approval_required",
+                                "human approval is required before execution",
+                            )
+                        elif approval.status == "pending":
+                            result_causation_event_id = approval.request_event_id
+                            tool_error = ToolError(
+                                "approval_pending", "approval request is still pending"
+                            )
+                        elif approval.status == "denied":
+                            assert approval.resolution_event_id is not None
+                            result_causation_event_id = approval.resolution_event_id
+                            tool_error = ToolError("approval_denied", "approval request was denied")
+                        else:
+                            assert approval.resolution_event_id is not None
+                            result_causation_event_id = approval.resolution_event_id
                 try:
-                    with self._session.begin_nested():
+                    with self._session.begin_nested(), _execute_when_authorized(tool_error):
                         if definition.capability == "read":
                             read_handler = cast(ReadToolHandler, definition.handler)
                             read_output = read_handler(
@@ -550,6 +707,8 @@ class ToolGateway:
                                 raise ValueError(
                                     f"handler output violated its contract: {output_error}"
                                 )
+                except _PolicyGateBlocked:
+                    pass
                 except IdempotencyConflictError:
                     output = None
                     effect = None
@@ -604,7 +763,7 @@ class ToolGateway:
                     "tool.result",
                     result_payload,
                     correlation_id=logical_call_id,
-                    causation_event_id=request_event_id,
+                    causation_event_id=result_causation_event_id,
                 )
                 state_evidence_event_id: str | None = None
                 if effect is not None and effect.newly_applied:
@@ -629,12 +788,14 @@ class ToolGateway:
                 return ToolExecutionResult(
                     tool_id=tool_id,
                     contract_version=contract_version,
-                    outcome="succeeded" if tool_error is None else "failed",
+                    outcome=self._result_outcome(tool_error),
                     output=None if output is None else MappingProxyType(deepcopy(output)),
                     error=tool_error,
                     request_event_id=request_event_id,
                     result_event_id=result_event_id,
                     state_evidence_event_id=state_evidence_event_id,
+                    policy_decision_event_id=policy_decision_event_id,
+                    approval_id=effective_approval_id,
                 )
         except _LeaseLostDuringExecution:
             return self._rejected(
@@ -642,6 +803,13 @@ class ToolGateway:
                 contract_version,
                 "stale_lease",
                 "caller lost the Run lease before the mutation could commit",
+            )
+        except PolicyValidationError:
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "policy_integrity_error",
+                "the frozen Policy could not be evaluated",
             )
         except (EvidenceValidationError, PersistenceError, SQLAlchemyError):
             return self._rejected(
@@ -721,7 +889,12 @@ class ToolGateway:
         self,
         run_id: str,
         event_id: str,
-        event_type: Literal["tool.requested", "tool.result", "state.evidence_recorded"],
+        event_type: Literal[
+            "tool.requested",
+            "tool.result",
+            "state.evidence_recorded",
+            "policy.decision",
+        ],
         payload: dict[str, object],
         *,
         correlation_id: str,
@@ -753,6 +926,21 @@ class ToolGateway:
         self._repository.append_event_allocated(run_id, event_factory)
 
     @staticmethod
+    def _result_outcome(error: ToolError | None) -> Literal["succeeded", "failed", "denied"]:
+        if error is None:
+            return "succeeded"
+        if error.code in {
+            "policy_denied",
+            "approval_required",
+            "approval_not_found",
+            "approval_pending",
+            "approval_denied",
+            "approval_mismatch",
+        }:
+            return "denied"
+        return "failed"
+
+    @staticmethod
     def _rejected(
         tool_id: str,
         contract_version: str,
@@ -762,7 +950,21 @@ class ToolGateway:
         return ToolExecutionResult(
             tool_id=tool_id,
             contract_version=contract_version,
-            outcome="denied" if code in {"tool_not_allowed", "stale_lease"} else "failed",
+            outcome=(
+                "denied"
+                if code
+                in {
+                    "tool_not_allowed",
+                    "stale_lease",
+                    "policy_denied",
+                    "approval_required",
+                    "approval_not_found",
+                    "approval_pending",
+                    "approval_denied",
+                    "approval_mismatch",
+                }
+                else "failed"
+            ),
             output=None,
             error=ToolError(code, message),
             request_event_id=None,
@@ -781,6 +983,7 @@ def _validate_call_fields(
     attempt_number: object,
     step_id: object | None,
     causation_event_id: object | None,
+    approval_id: object | None,
 ) -> str | None:
     if not isinstance(lease, LeaseIdentity):
         return "lease credentials are malformed"
@@ -804,7 +1007,11 @@ def _validate_call_fields(
     for name, value in (("logical_call_id", logical_call_id), ("attempt_id", attempt_id)):
         if not isinstance(value, str) or _ID_RE.fullmatch(value) is None:
             return f"{name} is malformed"
-    for name, value in (("step_id", step_id), ("causation_event_id", causation_event_id)):
+    for name, value in (
+        ("step_id", step_id),
+        ("causation_event_id", causation_event_id),
+        ("approval_id", approval_id),
+    ):
         if value is not None and (not isinstance(value, str) or _ID_RE.fullmatch(value) is None):
             return f"{name} is malformed"
     if (

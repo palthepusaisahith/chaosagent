@@ -11,6 +11,9 @@ from .lifecycle import (
 from .models import Base
 from .repository import (
     AgentConfigurationRevisionRecord,
+    ApprovalAlreadyResolvedError,
+    ApprovalConflictError,
+    ApprovalRequestRecord,
     BusinessRuleViolationError,
     ClaimedRun,
     CompanyCustomer,
@@ -37,6 +40,7 @@ from .repository import (
     PersistenceIntegrityError,
     PersistenceProfileError,
     PersistenceRepository,
+    PolicyRevisionRecord,
     ReferenceNotFoundError,
     RevisionConflictError,
     RevisionReference,
@@ -46,11 +50,15 @@ from .repository import (
     ScenarioRevisionRecord,
     StaleLeaseError,
     SyntheticCompanyState,
+    approval_identity,
     create_postgres_engine,
 )
 
 __all__ = [
     "AgentConfigurationRevisionRecord",
+    "ApprovalAlreadyResolvedError",
+    "ApprovalConflictError",
+    "ApprovalRequestRecord",
     "ACTIVE_STATUSES",
     "Base",
     "BusinessRuleViolationError",
@@ -80,6 +88,7 @@ __all__ = [
     "PersistenceIntegrityError",
     "PersistenceProfileError",
     "PersistenceRepository",
+    "PolicyRevisionRecord",
     "ReferenceNotFoundError",
     "RUN_STATUSES",
     "RevisionConflictError",
@@ -93,5 +102,6 @@ __all__ = [
     "SyntheticCompanyState",
     "TERMINAL_STATUSES",
     "create_postgres_engine",
+    "approval_identity",
     "legal_targets",
 ]

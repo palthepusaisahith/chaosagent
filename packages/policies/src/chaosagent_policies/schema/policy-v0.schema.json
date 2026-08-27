@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/policy/v0/schema.json",
+  "title": "ChaosAgent Policy v0",
+  "type": "object",
+  "required": ["schema_version", "policy_id", "revision", "metadata", "tools"],
+  "properties": {
+    "schema_version": { "const": "chaosagent.policy/v0" },
+    "policy_id": { "$ref": "#/$defs/id" },
+    "revision": { "$ref": "#/$defs/revision" },
+    "metadata": {
+      "type": "object",
+      "required": ["title", "description"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "tools": {
+      "type": "object",
+      "required": [
+        "orders.get",
+        "shipping.get_status",
+        "payments.refund",
+        "support.update_ticket"
+      ],
+      "properties": {
+        "orders.get": { "$ref": "#/$defs/simpleRule" },
+        "shipping.get_status": { "$ref": "#/$defs/simpleRule" },
+        "support.update_ticket": { "$ref": "#/$defs/simpleRule" },
+        "payments.refund": {
+          "type": "object",
+          "required": ["currency", "automatic_max_minor", "approval_max_minor"],
+          "properties": {
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "automatic_max_minor": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "approval_max_minor": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "simpleRule": {
+      "type": "object",
+      "required": ["decision"],
+      "properties": { "decision": { "enum": ["allow", "deny"] } },
+      "additionalProperties": false
+    }
+  }
+}

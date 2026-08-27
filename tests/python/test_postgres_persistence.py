@@ -42,6 +42,7 @@ from chaosagent_persistence import (
     StaleLeaseError,
     create_postgres_engine,
 )
+from chaosagent_policies import Policy, load_policy, loads_policy
 from chaosagent_scenarios import (
     Scenario,
     load_scenario,
@@ -57,6 +58,7 @@ pytestmark = pytest.mark.postgres
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_PATH = ROOT / "benchmarks/shipment-refund/scenarios/refund-ambiguous-timeout.v0.json"
 FIXTURE_PATH = ROOT / "benchmarks/shipment-refund/fixtures/failed-shipment.v0.json"
+POLICY_PATH = ROOT / "benchmarks/shipment-refund/policies/refund-policy.v0.json"
 EVENT_PATH = ROOT / "benchmarks/shipment-refund/evidence/v0/001-run-started.json"
 REPORT_PATH = ROOT / "benchmarks/shipment-refund/evidence/v0/run-report.json"
 ALEMBIC_INI = ROOT / "packages/persistence/alembic.ini"
@@ -110,6 +112,10 @@ def _fixture() -> Fixture:
     return load_fixture(FIXTURE_PATH)
 
 
+def _policy() -> Policy:
+    return load_policy(POLICY_PATH)
+
+
 def _event(run_id: str, sequence: int, *, event_id: str | None = None) -> RunEvent:
     document = cast(dict[str, object], json.loads(EVENT_PATH.read_text(encoding="utf-8")))
     document["event_id"] = event_id or _unique("event")
@@ -131,6 +137,7 @@ def _seed_run(session: Session, run_id: str) -> None:
     fixture = _fixture()
     scenario_document = scenario.to_dict()
     repository.insert_fixture_revision(fixture, created_by="test-suite")
+    repository.insert_policy_revision(_policy(), created_by="test-suite")
     repository.insert_scenario_revision(scenario, created_by="test-suite")
     repository.insert_agent_configuration_reference(AGENT_REFERENCE, created_by="test-suite")
     repository.create_run(
@@ -295,6 +302,8 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
     command.upgrade(configuration, "head")
     assert {
         "agent_configuration_revisions",
+        "approval_requests",
+        "approval_resolutions",
         "company_customers",
         "company_effects",
         "company_orders",
@@ -303,6 +312,7 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
         "company_shipments",
         "company_support_tickets",
         "fixture_revisions",
+        "policy_revisions",
         "run_company_state",
         "run_events",
         "run_reports",
@@ -502,6 +512,17 @@ def test_mutation_ledger_migration_round_trips_to_issue_8(migrated_engine: Engin
     command.check(configuration)
 
 
+def test_policy_approval_migration_round_trips_to_issue_9(migrated_engine: Engine) -> None:
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0004_mutation_effect_ledger")
+    tables = set(inspect(migrated_engine).get_table_names(schema="public"))
+    assert {"policy_revisions", "approval_requests", "approval_resolutions"}.isdisjoint(tables)
+    command.upgrade(configuration, "head")
+    tables = set(inspect(migrated_engine).get_table_names(schema="public"))
+    assert {"policy_revisions", "approval_requests", "approval_resolutions"}.issubset(tables)
+    command.check(configuration)
+
+
 def test_insert_fetch_fixture_revision_conflict_and_database_immutability(
     migrated_engine: Engine,
 ) -> None:
@@ -558,6 +579,7 @@ def test_run_requires_and_freezes_exact_scenario_fixture_reference(
     with Session(migrated_engine) as session, session.begin():
         repository = PersistenceRepository(session)
         repository.insert_scenario_revision(scenario, created_by="test-suite")
+        repository.insert_policy_revision(_policy(), created_by="test-suite")
         repository.insert_agent_configuration_reference(AGENT_REFERENCE, created_by="test-suite")
         with pytest.raises(ReferenceNotFoundError, match="fixture reference"):
             repository.create_run(
@@ -579,6 +601,88 @@ def test_run_requires_and_freezes_exact_scenario_fixture_reference(
         )
         assert run.fixture is not None
         assert run.fixture.digest == inserted_fixture.fixture.digest
+
+
+def test_run_creation_requires_exact_valid_policy_revision(migrated_engine: Engine) -> None:
+    fixture = _fixture()
+    base_policy = _policy()
+
+    def scenario_for(policy_reference: dict[str, object]) -> Scenario:
+        document = _scenario().to_dict()
+        document["scenario_id"] = _unique("policy-bound-scenario")
+        document["policy"] = policy_reference
+        return loads_scenario(json.dumps(document))
+
+    missing_policy_id = _unique("missing-policy")
+    missing = scenario_for(
+        {"id": missing_policy_id, "revision": "1", "digest": "sha256:" + "8" * 64}
+    )
+    mismatch = scenario_for(
+        {
+            "id": base_policy.to_dict()["policy_id"],
+            "revision": base_policy.to_dict()["revision"],
+            "digest": "sha256:" + "9" * 64,
+        }
+    )
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.insert_fixture_revision(fixture, created_by="policy-run-test")
+        repository.insert_policy_revision(base_policy, created_by="policy-run-test")
+        repository.insert_agent_configuration_reference(
+            AGENT_REFERENCE, created_by="policy-run-test"
+        )
+        for scenario in (missing, mismatch):
+            repository.insert_scenario_revision(scenario, created_by="policy-run-test")
+            document = scenario.to_dict()
+            with pytest.raises(ReferenceNotFoundError, match="policy reference"):
+                repository.create_run(
+                    _unique("invalid-policy-run"),
+                    scenario_id=cast(str, document["scenario_id"]),
+                    scenario_revision=cast(str, document["revision"]),
+                    agent_configuration_id=AGENT_REFERENCE.id,
+                    agent_configuration_revision=AGENT_REFERENCE.revision,
+                    created_by="policy-run-test",
+                )
+
+    corrupt_document = base_policy.to_dict()
+    corrupt_document["policy_id"] = _unique("corrupt-policy")
+    corrupt_policy = loads_policy(json.dumps(corrupt_document))
+    corrupt_scenario = scenario_for(
+        {
+            "id": corrupt_document["policy_id"],
+            "revision": corrupt_document["revision"],
+            "digest": corrupt_policy.digest,
+        }
+    )
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.insert_policy_revision(corrupt_policy, created_by="policy-run-test")
+        repository.insert_scenario_revision(corrupt_scenario, created_by="policy-run-test")
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.policy_revisions DISABLE TRIGGER policy_revisions_immutable")
+        )
+        connection.execute(
+            text(
+                "UPDATE public.policy_revisions SET canonical_document = "
+                "canonical_document - 'tools' WHERE policy_id = :policy_id AND revision = '1'"
+            ),
+            {"policy_id": corrupt_document["policy_id"]},
+        )
+        connection.execute(
+            text("ALTER TABLE public.policy_revisions ENABLE TRIGGER policy_revisions_immutable")
+        )
+    with Session(migrated_engine) as session, session.begin():
+        document = corrupt_scenario.to_dict()
+        with pytest.raises(PersistenceIntegrityError, match="stored policy document"):
+            PersistenceRepository(session).create_run(
+                _unique("corrupt-policy-run"),
+                scenario_id=cast(str, document["scenario_id"]),
+                scenario_revision=cast(str, document["revision"]),
+                agent_configuration_id=AGENT_REFERENCE.id,
+                agent_configuration_revision=AGENT_REFERENCE.revision,
+                created_by="policy-run-test",
+            )
 
 
 def test_run_company_initialization_is_deterministic_idempotent_and_isolated(
@@ -706,6 +810,124 @@ def test_scenario_revision_rejects_content_and_digest_conflict(
         repository.insert_scenario_revision(original, created_by="author-1")
         with pytest.raises(RevisionConflictError):
             repository.insert_scenario_revision(changed, created_by="author-2")
+
+
+def test_policy_revision_insert_fetch_conflict_and_database_immutability(
+    migrated_engine: Engine,
+) -> None:
+    original_document = _policy().to_dict()
+    original_document["policy_id"] = _unique("policy")
+    original = loads_policy(json.dumps(original_document))
+    changed_document = original.to_dict()
+    cast(dict[str, object], changed_document["metadata"])["title"] = "Changed policy"
+    changed = loads_policy(json.dumps(changed_document))
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        inserted = repository.insert_policy_revision(original, created_by="policy-author")
+        repeated = repository.insert_policy_revision(original, created_by="ignored")
+        fetched = repository.get_policy_revision(
+            cast(str, original.to_dict()["policy_id"]),
+            cast(str, original.to_dict()["revision"]),
+        )
+        assert inserted.policy.digest == original.digest
+        assert repeated.created_by == "policy-author"
+        assert fetched is not None and fetched.policy.canonical_bytes == original.canonical_bytes
+        with pytest.raises(RevisionConflictError):
+            repository.insert_policy_revision(changed, created_by="other")
+    with migrated_engine.connect() as connection:
+        transaction = connection.begin()
+        with pytest.raises(DBAPIError, match="immutable"):
+            connection.execute(
+                text(
+                    "UPDATE public.policy_revisions SET created_by = 'attacker' "
+                    "WHERE policy_id = :policy_id AND revision = :revision"
+                ),
+                {
+                    "policy_id": original.to_dict()["policy_id"],
+                    "revision": original.to_dict()["revision"],
+                },
+            )
+        transaction.rollback()
+
+
+def test_policy_projection_constraints_fail_closed(migrated_engine: Engine) -> None:
+    statement = """
+        INSERT INTO public.policy_revisions (
+            policy_id, revision, schema_version, canonical_document,
+            canonical_digest, created_by
+        ) VALUES (
+            :policy_id, '1', 'chaosagent.policy/v0', CAST(:document AS jsonb),
+            :digest, 'raw-test'
+        )
+    """
+    policy_id = _unique("raw-policy")
+    for document in (
+        {},
+        {"policy_id": None, "revision": "1", "schema_version": "chaosagent.policy/v0"},
+        {"policy_id": policy_id, "revision": "1", "schema_version": "chaosagent.policy/v1"},
+    ):
+        _assert_raw_insert_rejected(
+            migrated_engine,
+            statement,
+            {
+                "policy_id": policy_id,
+                "document": json.dumps(document),
+                "digest": "sha256:" + "7" * 64,
+            },
+        )
+
+
+def test_raw_approval_cannot_bind_another_valid_scenario_to_run(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("approval-run")
+    alternate_document = _scenario().to_dict()
+    alternate_document["scenario_id"] = _unique("alternate-scenario")
+    alternate = loads_scenario(json.dumps(alternate_document))
+    with Session(migrated_engine) as session, session.begin():
+        _seed_run(session, run_id)
+        PersistenceRepository(session).insert_scenario_revision(
+            alternate, created_by="raw-approval-test"
+        )
+    policy = _policy()
+    policy_document = policy.to_dict()
+    with migrated_engine.begin() as connection, pytest.raises(IntegrityError):
+        connection.execute(
+            text(
+                "INSERT INTO public.approval_requests ("
+                "approval_id, run_id, scenario_id, scenario_revision, scenario_digest, "
+                "policy_id, policy_revision, policy_digest, tool_id, contract_version, "
+                "request_digest, idempotency_key_digest, arguments_document, logical_call_id, "
+                "requested_attempt_id, lease_attempt, decision_id, decision_event_id, "
+                "request_event_id) VALUES ("
+                ":approval_id, :run_id, :scenario_id, :scenario_revision, :scenario_digest, "
+                ":policy_id, :policy_revision, :policy_digest, 'payments.refund', "
+                "'chaosagent.tool/payments.refund/v0', :request_digest, :key_digest, "
+                "CAST(:arguments AS jsonb), 'logical-raw', 'attempt-raw', 1, "
+                "'decision-raw', 'evt-decision-raw', 'evt-request-raw')"
+            ),
+            {
+                "approval_id": _unique("approval"),
+                "run_id": run_id,
+                "scenario_id": alternate_document["scenario_id"],
+                "scenario_revision": alternate_document["revision"],
+                "scenario_digest": alternate.digest,
+                "policy_id": policy_document["policy_id"],
+                "policy_revision": policy_document["revision"],
+                "policy_digest": policy.digest,
+                "request_digest": "sha256:" + "1" * 64,
+                "key_digest": "sha256:" + "2" * 64,
+                "arguments": json.dumps(
+                    {
+                        "order_id": "ORD-1007",
+                        "payment_id": "PAY-1007",
+                        "amount_minor": 6000,
+                        "reason": "raw",
+                        "idempotency_key": "raw-key",
+                    }
+                ),
+            },
+        )
 
 
 def test_scenario_jsonb_persistence_profile_rejects_u0000(migrated_engine: Engine) -> None:

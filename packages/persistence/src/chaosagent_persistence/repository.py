@@ -8,10 +8,10 @@ import re
 import secrets
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import NoReturn, cast
+from typing import Literal, NoReturn, cast
 
 from chaosagent_evidence import (
     EvidenceValidationError,
@@ -22,6 +22,7 @@ from chaosagent_evidence import (
     loads_run_report,
 )
 from chaosagent_fixtures import Fixture, FixtureValidationError, loads_fixture
+from chaosagent_policies import Policy, PolicyValidationError, loads_policy
 from chaosagent_scenarios import Scenario, ScenarioValidationError, loads_scenario
 from sqlalchemy import Engine, Select, create_engine, func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +42,8 @@ from .models import (
     IDENTIFIER_CHECK,
     REVISION_CHECK,
     AgentConfigurationRevisionModel,
+    ApprovalRequestModel,
+    ApprovalResolutionModel,
     CompanyCustomerModel,
     CompanyEffectModel,
     CompanyOrderModel,
@@ -49,6 +52,7 @@ from .models import (
     CompanyShipmentModel,
     CompanySupportTicketModel,
     FixtureRevisionModel,
+    PolicyRevisionModel,
     RunCompanyStateModel,
     RunEventModel,
     RunModel,
@@ -129,6 +133,14 @@ class BusinessRuleViolationError(PersistenceError):
     """Raised when a valid mutation request violates synthetic business state."""
 
 
+class ApprovalConflictError(PersistenceConflictError):
+    """Raised when an approval identity is reused for another frozen request."""
+
+
+class ApprovalAlreadyResolvedError(PersistenceConflictError):
+    """Raised when an immutable approval resolution already exists."""
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionReference:
     id: str
@@ -139,6 +151,13 @@ class RevisionReference:
 @dataclass(frozen=True, slots=True)
 class ScenarioRevisionRecord:
     scenario: Scenario
+    created_at: datetime
+    created_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyRevisionRecord:
+    policy: Policy
     created_at: datetime
     created_by: str
 
@@ -308,6 +327,31 @@ class CompanyEffect:
     newly_applied: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalRequestRecord:
+    approval_id: str
+    run_id: str
+    scenario: RevisionReference
+    policy: RevisionReference
+    tool_id: str
+    contract_version: str
+    request_digest: str
+    idempotency_key_digest: str
+    arguments: Mapping[str, object]
+    logical_call_id: str
+    requested_attempt_id: str
+    lease_attempt: int
+    decision_id: str
+    decision_event_id: str
+    request_event_id: str
+    status: Literal["pending", "approved", "denied"]
+    created_at: datetime
+    resolved_at: datetime | None
+    actor_id: str | None
+    resolution_event_id: str | None
+    newly_created: bool = False
+
+
 def create_postgres_engine(database_url: str, *, echo: bool = False) -> Engine:
     """Create a SQLAlchemy engine and fail closed for non-PostgreSQL URLs."""
     engine = create_engine(database_url, echo=echo, pool_pre_ping=True)
@@ -340,6 +384,38 @@ def _validate_reference(reference: RevisionReference, field: str) -> None:
     _require_identifier(reference.id, f"{field}.id")
     _require_revision(reference.revision)
     _require_digest(reference.digest)
+
+
+def approval_identity(
+    *,
+    run_id: str,
+    scenario_id: str,
+    scenario_revision: str,
+    scenario_digest: str,
+    policy_id: str,
+    policy_revision: str,
+    policy_digest: str,
+    tool_id: str,
+    contract_version: str,
+    request_digest: str,
+    idempotency_key_digest: str,
+) -> str:
+    """Return the stable identity for one fully frozen approval request."""
+    binding = {
+        "run_id": run_id,
+        "scenario_id": scenario_id,
+        "scenario_revision": scenario_revision,
+        "scenario_digest": scenario_digest,
+        "policy_id": policy_id,
+        "policy_revision": policy_revision,
+        "policy_digest": policy_digest,
+        "tool_id": tool_id,
+        "contract_version": contract_version,
+        "request_digest": request_digest,
+        "idempotency_key_digest": idempotency_key_digest,
+    }
+    encoded = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    return f"approval-{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _validate_jsonb_persistence_profile(value: object, contract: str, path: str = "$") -> None:
@@ -421,6 +497,38 @@ class PersistenceRepository:
     ) -> ScenarioRevisionRecord | None:
         model = self._session.get(ScenarioRevisionModel, (scenario_id, revision))
         return None if model is None else self._scenario_record(model)
+
+    def insert_policy_revision(self, policy: Policy, *, created_by: str) -> PolicyRevisionRecord:
+        document = policy.to_dict()
+        _validate_jsonb_persistence_profile(document, "policy")
+        policy_id = cast(str, document["policy_id"])
+        revision = cast(str, document["revision"])
+        existing = self._session.get(PolicyRevisionModel, (policy_id, revision))
+        if existing is not None:
+            return self._same_policy_or_conflict(existing, policy)
+        model = PolicyRevisionModel(
+            policy_id=policy_id,
+            revision=revision,
+            schema_version=cast(str, document["schema_version"]),
+            canonical_document=document,
+            canonical_digest=policy.digest,
+            created_by=created_by,
+        )
+        try:
+            with self._session.begin_nested():
+                self._session.add(model)
+                self._session.flush()
+        except IntegrityError as error:
+            if _constraint_name(error) == "pk_policy_revisions":
+                concurrent = self._session.get(PolicyRevisionModel, (policy_id, revision))
+                if concurrent is not None:
+                    return self._same_policy_or_conflict(concurrent, policy)
+            _raise_integrity(error, "policy revision insert")
+        return self._policy_record(model)
+
+    def get_policy_revision(self, policy_id: str, revision: str) -> PolicyRevisionRecord | None:
+        model = self._session.get(PolicyRevisionModel, (policy_id, revision))
+        return None if model is None else self._policy_record(model)
 
     def insert_fixture_revision(
         self, fixture: Fixture, *, created_by: str
@@ -509,9 +617,10 @@ class PersistenceRepository:
             raise ReferenceNotFoundError(
                 f"scenario revision {(scenario_id, scenario_revision)!r} does not exist"
             )
+        scenario_document = self._scenario_record(scenario).scenario.to_dict()
         scenario_fixture = cast(
             dict[str, object],
-            scenario.canonical_document["fixture"],
+            scenario_document["fixture"],
         )
         fixture_key = (
             cast(str, scenario_fixture["id"]),
@@ -524,6 +633,19 @@ class PersistenceRepository:
                 f"{(fixture_key[0], fixture_key[1], scenario_fixture['digest'])!r} "
                 "does not resolve to an immutable Fixture revision"
             )
+        scenario_policy = cast(dict[str, object], scenario_document["policy"])
+        policy_key = (
+            cast(str, scenario_policy["id"]),
+            cast(str, scenario_policy["revision"]),
+        )
+        policy = self._session.get(PolicyRevisionModel, policy_key)
+        if policy is None or policy.canonical_digest != scenario_policy["digest"]:
+            raise ReferenceNotFoundError(
+                "scenario policy reference "
+                f"{(policy_key[0], policy_key[1], scenario_policy['digest'])!r} "
+                "does not resolve to an immutable Policy revision"
+            )
+        self._policy_record(policy)
         agent = self._session.get(
             AgentConfigurationRevisionModel,
             (agent_configuration_id, agent_configuration_revision),
@@ -1471,6 +1593,310 @@ class PersistenceRepository:
             raise PersistenceIntegrityError("PostgreSQL did not return its current timestamp")
         return cast(datetime, value)
 
+    def get_approval_request(self, approval_id: str) -> ApprovalRequestRecord | None:
+        model = self._session.get(ApprovalRequestModel, approval_id)
+        return None if model is None else self._approval_record(model)
+
+    def get_approval_request_for_authorization(
+        self,
+        approval_id: str,
+        *,
+        run: RunRecord,
+        policy: RevisionReference,
+        tool_id: str,
+        contract_version: str,
+        request_digest: str,
+        idempotency_key_digest: str,
+        arguments: Mapping[str, object],
+    ) -> ApprovalRequestRecord | None:
+        """Load one approval and prove it authorizes this exact frozen request."""
+        record = self.get_approval_request(approval_id)
+        if record is None:
+            return None
+        if not self._approval_matches(
+            record,
+            run=run,
+            policy=policy,
+            tool_id=tool_id,
+            contract_version=contract_version,
+            request_digest=request_digest,
+            idempotency_key_digest=idempotency_key_digest,
+            arguments=arguments,
+        ):
+            raise PersistenceIntegrityError(
+                "persisted approval does not match the current frozen request"
+            )
+        return record
+
+    def create_approval_request(
+        self,
+        *,
+        run: RunRecord,
+        policy: RevisionReference,
+        tool_id: str,
+        contract_version: str,
+        request_digest: str,
+        idempotency_key_digest: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        requested_attempt_id: str,
+        lease_attempt: int,
+        decision_id: str,
+        decision_event_id: str,
+        request_event_id: str,
+        producer_component: str,
+        producer_instance_id: str | None = None,
+    ) -> ApprovalRequestRecord:
+        """Atomically persist one exact request and its approval.requested evidence."""
+        if tool_id != "payments.refund":
+            raise ValueError("Policy v0 approvals are only defined for payments.refund")
+        for value, field in (
+            (logical_call_id, "logical_call_id"),
+            (requested_attempt_id, "requested_attempt_id"),
+            (decision_id, "decision_id"),
+            (decision_event_id, "decision_event_id"),
+            (request_event_id, "request_event_id"),
+        ):
+            _require_identifier(value, field)
+        _validate_reference(policy, "policy")
+        _require_digest(request_digest)
+        _require_digest(idempotency_key_digest)
+        arguments_document = deepcopy(dict(arguments))
+        _validate_jsonb_persistence_profile(arguments_document, "approval request")
+        with self._session.begin_nested():
+            authoritative_model = self._session.scalar(
+                select(RunModel)
+                .where(RunModel.run_id == run.run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if authoritative_model is None:
+                raise ReferenceNotFoundError(f"run {run.run_id!r} does not exist")
+            authoritative_run = self._run_record(authoritative_model)
+            if authoritative_run.scenario != run.scenario:
+                raise PersistenceIntegrityError(
+                    "caller Run snapshot does not match the authoritative Run Scenario"
+                )
+            if authoritative_run.status != "running" or lease_attempt != authoritative_run.attempt:
+                raise PersistenceIntegrityError(
+                    "approval request does not match the authoritative active Run attempt"
+                )
+            scenario_model = self._session.get(
+                ScenarioRevisionModel,
+                (authoritative_run.scenario.id, authoritative_run.scenario.revision),
+            )
+            if (
+                scenario_model is None
+                or scenario_model.canonical_digest != authoritative_run.scenario.digest
+            ):
+                raise PersistenceIntegrityError("authoritative Run Scenario does not resolve")
+            scenario_document = self._scenario_record(scenario_model).scenario.to_dict()
+            policy_document = cast(dict[str, object], scenario_document["policy"])
+            authoritative_policy = RevisionReference(
+                cast(str, policy_document["id"]),
+                cast(str, policy_document["revision"]),
+                cast(str, policy_document["digest"]),
+            )
+            if policy != authoritative_policy:
+                raise PersistenceIntegrityError(
+                    "caller Policy does not match the authoritative Scenario Policy"
+                )
+            policy_model = self._session.get(
+                PolicyRevisionModel, (authoritative_policy.id, authoritative_policy.revision)
+            )
+            if policy_model is None or policy_model.canonical_digest != authoritative_policy.digest:
+                raise PersistenceIntegrityError("authoritative Scenario Policy does not resolve")
+            self._policy_record(policy_model)
+            computed_request_digest = digest_payload_v0(
+                {
+                    "tool_id": tool_id,
+                    "contract_version": contract_version,
+                    "arguments": arguments_document,
+                }
+            )
+            key = arguments_document.get("idempotency_key")
+            if not isinstance(key, str):
+                raise ValueError("approval arguments require an idempotency_key")
+            computed_key_digest = digest_payload_v0(key)
+            if (
+                request_digest != computed_request_digest
+                or idempotency_key_digest != computed_key_digest
+            ):
+                raise PersistenceIntegrityError(
+                    "caller approval fingerprints do not match the frozen request"
+                )
+            self._require_policy_decision_provenance(
+                run_id=authoritative_run.run_id,
+                policy=authoritative_policy,
+                tool_id=tool_id,
+                arguments=arguments_document,
+                logical_call_id=logical_call_id,
+                requested_attempt_id=requested_attempt_id,
+                decision_id=decision_id,
+                decision_event_id=decision_event_id,
+                idempotency_key_digest=computed_key_digest,
+            )
+            approval_id = approval_identity(
+                run_id=authoritative_run.run_id,
+                scenario_id=authoritative_run.scenario.id,
+                scenario_revision=authoritative_run.scenario.revision,
+                scenario_digest=authoritative_run.scenario.digest,
+                policy_id=authoritative_policy.id,
+                policy_revision=authoritative_policy.revision,
+                policy_digest=authoritative_policy.digest,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                request_digest=computed_request_digest,
+                idempotency_key_digest=computed_key_digest,
+            )
+            existing = self._session.get(ApprovalRequestModel, approval_id)
+            if existing is not None:
+                record = self._approval_record(existing)
+                if not self._approval_matches(
+                    record,
+                    run=authoritative_run,
+                    policy=authoritative_policy,
+                    tool_id=tool_id,
+                    contract_version=contract_version,
+                    request_digest=computed_request_digest,
+                    idempotency_key_digest=computed_key_digest,
+                    arguments=arguments_document,
+                ):
+                    raise ApprovalConflictError(
+                        f"approval_id {approval_id!r} is bound to different content"
+                    )
+                return record
+            model = ApprovalRequestModel(
+                approval_id=approval_id,
+                run_id=authoritative_run.run_id,
+                scenario_id=authoritative_run.scenario.id,
+                scenario_revision=authoritative_run.scenario.revision,
+                scenario_digest=authoritative_run.scenario.digest,
+                policy_id=authoritative_policy.id,
+                policy_revision=authoritative_policy.revision,
+                policy_digest=authoritative_policy.digest,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                request_digest=computed_request_digest,
+                idempotency_key_digest=computed_key_digest,
+                arguments_document=arguments_document,
+                logical_call_id=logical_call_id,
+                requested_attempt_id=requested_attempt_id,
+                lease_attempt=lease_attempt,
+                decision_id=decision_id,
+                decision_event_id=decision_event_id,
+                request_event_id=request_event_id,
+            )
+            self._session.add(model)
+            self._session.flush()
+            observed = self.database_time()
+            producer: dict[str, object] = {"component": producer_component}
+            if producer_instance_id is not None:
+                producer["instance_id"] = producer_instance_id
+            payload: dict[str, object] = {
+                "approval_id": approval_id,
+                "decision_id": decision_id,
+                "action_digest": computed_request_digest,
+            }
+
+            def event_factory(sequence: int) -> RunEvent:
+                document: dict[str, object] = {
+                    "schema_version": "chaosagent.run-event/v0",
+                    "event_id": request_event_id,
+                    "run_id": authoritative_run.run_id,
+                    "sequence": sequence,
+                    "occurred_at": _event_timestamp(observed),
+                    "recorded_at": _event_timestamp(observed),
+                    "event_type": "approval.requested",
+                    "producer": producer,
+                    "correlation_id": logical_call_id,
+                    "causation_event_id": decision_event_id,
+                    "payload": payload,
+                    "payload_digest": digest_payload_v0(payload),
+                }
+                return loads_run_event(json.dumps(document))
+
+            self.append_event_allocated(authoritative_run.run_id, event_factory)
+            record = self._approval_record(model)
+            return replace(record, newly_created=True)
+
+    def resolve_approval_request(
+        self,
+        approval_id: str,
+        *,
+        result: Literal["approved", "denied"],
+        actor_id: str,
+        resolution_event_id: str,
+        producer_component: str = "approval-service",
+        producer_instance_id: str | None = None,
+    ) -> ApprovalRequestRecord:
+        """Resolve once and append approval.resolved without touching Run lifecycle."""
+        _require_identifier(approval_id, "approval_id")
+        _require_identifier(actor_id, "actor_id")
+        _require_identifier(resolution_event_id, "resolution_event_id")
+        if result not in {"approved", "denied"}:
+            raise ValueError("result must be approved or denied")
+        with self._session.begin_nested():
+            request = self._session.get(ApprovalRequestModel, approval_id)
+            if request is None:
+                raise ReferenceNotFoundError(f"approval {approval_id!r} does not exist")
+            self._session.scalar(
+                select(RunModel.run_id).where(RunModel.run_id == request.run_id).with_for_update()
+            )
+            request = self._session.scalar(
+                select(ApprovalRequestModel)
+                .where(ApprovalRequestModel.approval_id == approval_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            assert request is not None
+            self._approval_record(request)
+            existing = self._session.get(ApprovalResolutionModel, approval_id)
+            if existing is not None:
+                raise ApprovalAlreadyResolvedError(
+                    f"approval {approval_id!r} is already {existing.result}"
+                )
+            resolution = ApprovalResolutionModel(
+                approval_id=approval_id,
+                run_id=request.run_id,
+                result=result,
+                actor_id=actor_id,
+                responder_type="human",
+                resolution_event_id=resolution_event_id,
+            )
+            self._session.add(resolution)
+            self._session.flush()
+            observed = self.database_time()
+            producer: dict[str, object] = {"component": producer_component}
+            if producer_instance_id is not None:
+                producer["instance_id"] = producer_instance_id
+            payload: dict[str, object] = {
+                "approval_id": approval_id,
+                "request_event_id": request.request_event_id,
+                "result": result,
+                "responder_type": "human",
+            }
+
+            def event_factory(sequence: int) -> RunEvent:
+                document: dict[str, object] = {
+                    "schema_version": "chaosagent.run-event/v0",
+                    "event_id": resolution_event_id,
+                    "run_id": request.run_id,
+                    "sequence": sequence,
+                    "occurred_at": _event_timestamp(observed),
+                    "recorded_at": _event_timestamp(observed),
+                    "event_type": "approval.resolved",
+                    "producer": producer,
+                    "correlation_id": approval_id,
+                    "causation_event_id": request.request_event_id,
+                    "payload": payload,
+                    "payload_digest": digest_payload_v0(payload),
+                }
+                return loads_run_event(json.dumps(document))
+
+            self.append_event_allocated(request.run_id, event_factory)
+            return self._approval_record(request)
+
     def fetch_events(
         self, run_id: str, *, after_sequence: int = 0, through_sequence: int | None = None
     ) -> tuple[RunEventRecord, ...]:
@@ -1788,6 +2214,15 @@ class PersistenceRepository:
             )
         return self._agent_configuration_record(model)
 
+    def _same_policy_or_conflict(
+        self, model: PolicyRevisionModel, policy: Policy
+    ) -> PolicyRevisionRecord:
+        if model.canonical_digest != policy.digest or model.canonical_document != policy.to_dict():
+            raise RevisionConflictError(
+                f"policy revision {(model.policy_id, model.revision)!r} has different content"
+            )
+        return self._policy_record(model)
+
     def _same_report_or_conflict(self, model: RunReportModel, report: RunReport) -> RunReportRecord:
         if model.document != report.to_dict():
             raise FinalReportConflictError(f"run {model.run_id!r} already has a different report")
@@ -1907,6 +2342,294 @@ class PersistenceRepository:
         if scenario.digest != model.canonical_digest:
             raise PersistenceIntegrityError("stored scenario document does not match its digest")
         return ScenarioRevisionRecord(scenario, model.created_at, model.created_by)
+
+    @staticmethod
+    def _policy_record(model: PolicyRevisionModel) -> PolicyRevisionRecord:
+        try:
+            policy = loads_policy(_json_text(model.canonical_document))
+        except PolicyValidationError as error:
+            raise PersistenceIntegrityError(
+                "stored policy document violates its contract"
+            ) from error
+        if policy.digest != model.canonical_digest:
+            raise PersistenceIntegrityError("stored policy document does not match its digest")
+        return PolicyRevisionRecord(policy, model.created_at, model.created_by)
+
+    def _require_policy_decision_provenance(
+        self,
+        *,
+        run_id: str,
+        policy: RevisionReference,
+        tool_id: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        requested_attempt_id: str,
+        decision_id: str,
+        decision_event_id: str,
+        idempotency_key_digest: str,
+    ) -> None:
+        decision_model = self._session.get(RunEventModel, decision_event_id)
+        if decision_model is None:
+            raise PersistenceIntegrityError("approval policy-decision event does not exist")
+        decision = self._event_record(decision_model).event.to_dict()
+        payload = cast(dict[str, object], decision["payload"])
+        policy_value = payload.get("policy")
+        if not isinstance(policy_value, dict):
+            raise PersistenceIntegrityError("approval policy-decision reference is malformed")
+        if not (
+            decision["run_id"] == run_id
+            and decision["event_type"] == "policy.decision"
+            and payload.get("decision") == "require_approval"
+            and payload.get("decision_id") == decision_id
+            and payload.get("logical_call_id") == logical_call_id
+            and decision.get("correlation_id") == logical_call_id
+            and (
+                policy_value.get("id"),
+                policy_value.get("revision"),
+                policy_value.get("digest"),
+            )
+            == (policy.id, policy.revision, policy.digest)
+        ):
+            raise PersistenceIntegrityError("approval policy-decision provenance does not match")
+        request_event_id = decision.get("causation_event_id")
+        request_model = (
+            self._session.get(RunEventModel, request_event_id)
+            if isinstance(request_event_id, str)
+            else None
+        )
+        if request_model is None:
+            raise PersistenceIntegrityError("approval tool-request provenance does not exist")
+        request = self._event_record(request_model).event.to_dict()
+        request_payload = cast(dict[str, object], request["payload"])
+        if not (
+            request["run_id"] == run_id
+            and request["event_type"] == "tool.requested"
+            and request_payload.get("logical_call_id") == logical_call_id
+            and request_payload.get("attempt_id") == requested_attempt_id
+            and request_payload.get("tool_id") == tool_id
+            and request_payload.get("arguments_digest") == digest_payload_v0(arguments)
+            and request_payload.get("idempotency_key_digest") == idempotency_key_digest
+            and request.get("correlation_id") == logical_call_id
+            and cast(int, request["sequence"]) < cast(int, decision["sequence"])
+        ):
+            raise PersistenceIntegrityError("approval tool-request provenance does not match")
+
+    def _approval_record(self, model: ApprovalRequestModel) -> ApprovalRequestRecord:
+        resolution = self._session.get(ApprovalResolutionModel, model.approval_id)
+        self._validate_approval_integrity(model, resolution)
+        status: Literal["pending", "approved", "denied"] = (
+            "pending"
+            if resolution is None
+            else cast(Literal["approved", "denied"], resolution.result)
+        )
+        return ApprovalRequestRecord(
+            approval_id=model.approval_id,
+            run_id=model.run_id,
+            scenario=RevisionReference(
+                model.scenario_id, model.scenario_revision, model.scenario_digest
+            ),
+            policy=RevisionReference(model.policy_id, model.policy_revision, model.policy_digest),
+            tool_id=model.tool_id,
+            contract_version=model.contract_version,
+            request_digest=model.request_digest,
+            idempotency_key_digest=model.idempotency_key_digest,
+            arguments=MappingProxyType(deepcopy(model.arguments_document)),
+            logical_call_id=model.logical_call_id,
+            requested_attempt_id=model.requested_attempt_id,
+            lease_attempt=model.lease_attempt,
+            decision_id=model.decision_id,
+            decision_event_id=model.decision_event_id,
+            request_event_id=model.request_event_id,
+            status=status,
+            created_at=model.created_at,
+            resolved_at=None if resolution is None else resolution.resolved_at,
+            actor_id=None if resolution is None else resolution.actor_id,
+            resolution_event_id=None if resolution is None else resolution.resolution_event_id,
+        )
+
+    def _validate_approval_integrity(
+        self,
+        model: ApprovalRequestModel,
+        resolution: ApprovalResolutionModel | None,
+    ) -> None:
+        """Recompute every authoritative approval binding and evidence reference."""
+        arguments = model.arguments_document
+        if type(arguments) is not dict:
+            raise PersistenceIntegrityError("stored approval arguments are not an object")
+        try:
+            request_digest = digest_payload_v0(
+                {
+                    "tool_id": model.tool_id,
+                    "contract_version": model.contract_version,
+                    "arguments": arguments,
+                }
+            )
+        except EvidenceValidationError as error:
+            raise PersistenceIntegrityError(
+                "stored approval request cannot be fingerprinted"
+            ) from error
+        key = arguments.get("idempotency_key")
+        if not isinstance(key, str):
+            raise PersistenceIntegrityError("stored approval has no idempotency identity")
+        try:
+            key_digest = digest_payload_v0(key)
+        except EvidenceValidationError as error:
+            raise PersistenceIntegrityError(
+                "stored approval idempotency identity cannot be fingerprinted"
+            ) from error
+        expected_id = approval_identity(
+            run_id=model.run_id,
+            scenario_id=model.scenario_id,
+            scenario_revision=model.scenario_revision,
+            scenario_digest=model.scenario_digest,
+            policy_id=model.policy_id,
+            policy_revision=model.policy_revision,
+            policy_digest=model.policy_digest,
+            tool_id=model.tool_id,
+            contract_version=model.contract_version,
+            request_digest=request_digest,
+            idempotency_key_digest=key_digest,
+        )
+        if (
+            model.approval_id != expected_id
+            or model.request_digest != request_digest
+            or model.idempotency_key_digest != key_digest
+        ):
+            raise PersistenceIntegrityError("stored approval identity or request digest is corrupt")
+
+        run = self._fresh_run(model.run_id)
+        run_scenario = (run.scenario_id, run.scenario_revision, run.scenario_digest)
+        approval_scenario = (model.scenario_id, model.scenario_revision, model.scenario_digest)
+        if approval_scenario != run_scenario:
+            raise PersistenceIntegrityError("stored approval Scenario does not match its Run")
+        if model.lease_attempt > run.attempt:
+            raise PersistenceIntegrityError("stored approval refers to an impossible Run attempt")
+        scenario_model = self._session.get(
+            ScenarioRevisionModel, (model.scenario_id, model.scenario_revision)
+        )
+        if scenario_model is None or scenario_model.canonical_digest != model.scenario_digest:
+            raise PersistenceIntegrityError("stored approval Scenario reference does not resolve")
+        scenario = self._scenario_record(scenario_model).scenario.to_dict()
+        scenario_policy = cast(dict[str, object], scenario["policy"])
+        approval_policy = (model.policy_id, model.policy_revision, model.policy_digest)
+        expected_policy = (
+            scenario_policy["id"],
+            scenario_policy["revision"],
+            scenario_policy["digest"],
+        )
+        if approval_policy != expected_policy:
+            raise PersistenceIntegrityError("stored approval Policy does not match its Scenario")
+        policy_model = self._session.get(
+            PolicyRevisionModel, (model.policy_id, model.policy_revision)
+        )
+        if policy_model is None or policy_model.canonical_digest != model.policy_digest:
+            raise PersistenceIntegrityError("stored approval Policy reference does not resolve")
+        self._policy_record(policy_model)
+
+        decision_model = self._session.get(RunEventModel, model.decision_event_id)
+        request_model = self._session.get(RunEventModel, model.request_event_id)
+        if decision_model is None or request_model is None:
+            raise PersistenceIntegrityError("stored approval evidence reference does not resolve")
+        decision = self._event_record(decision_model).event.to_dict()
+        approval_requested = self._event_record(request_model).event.to_dict()
+        decision_payload = cast(dict[str, object], decision["payload"])
+        requested_payload = cast(dict[str, object], approval_requested["payload"])
+        policy_value = decision_payload.get("policy")
+        if not isinstance(policy_value, dict):
+            raise PersistenceIntegrityError("stored approval Policy evidence is malformed")
+        if not (
+            decision["run_id"] == model.run_id
+            and decision["event_type"] == "policy.decision"
+            and decision_payload.get("decision") == "require_approval"
+            and decision_payload.get("decision_id") == model.decision_id
+            and decision_payload.get("logical_call_id") == model.logical_call_id
+            and decision.get("correlation_id") == model.logical_call_id
+            and (
+                policy_value.get("id"),
+                policy_value.get("revision"),
+                policy_value.get("digest"),
+            )
+            == approval_policy
+        ):
+            raise PersistenceIntegrityError("stored approval policy-decision provenance is corrupt")
+        tool_request_id = decision.get("causation_event_id")
+        tool_request_model = (
+            self._session.get(RunEventModel, tool_request_id)
+            if isinstance(tool_request_id, str)
+            else None
+        )
+        if tool_request_model is None:
+            raise PersistenceIntegrityError("stored approval tool-request provenance is missing")
+        tool_request = self._event_record(tool_request_model).event.to_dict()
+        tool_payload = cast(dict[str, object], tool_request["payload"])
+        if not (
+            tool_request["run_id"] == model.run_id
+            and tool_request["event_type"] == "tool.requested"
+            and tool_payload.get("logical_call_id") == model.logical_call_id
+            and tool_payload.get("attempt_id") == model.requested_attempt_id
+            and tool_payload.get("tool_id") == model.tool_id
+            and tool_payload.get("arguments_digest") == digest_payload_v0(arguments)
+            and tool_payload.get("idempotency_key_digest") == key_digest
+            and tool_request.get("correlation_id") == model.logical_call_id
+            and cast(int, tool_request["sequence"]) < cast(int, decision["sequence"])
+        ):
+            raise PersistenceIntegrityError("stored approval tool-request provenance is corrupt")
+        if not (
+            approval_requested["run_id"] == model.run_id
+            and approval_requested["event_type"] == "approval.requested"
+            and approval_requested.get("causation_event_id") == model.decision_event_id
+            and requested_payload.get("approval_id") == model.approval_id
+            and requested_payload.get("decision_id") == model.decision_id
+            and requested_payload.get("action_digest") == model.request_digest
+            and approval_requested.get("correlation_id") == model.logical_call_id
+            and cast(int, decision["sequence"]) < cast(int, approval_requested["sequence"])
+        ):
+            raise PersistenceIntegrityError("stored approval-request evidence is corrupt")
+
+        if resolution is None:
+            return
+        resolution_model = self._session.get(RunEventModel, resolution.resolution_event_id)
+        if resolution_model is None:
+            raise PersistenceIntegrityError("stored approval resolution evidence is missing")
+        resolved = self._event_record(resolution_model).event.to_dict()
+        resolved_payload = cast(dict[str, object], resolved["payload"])
+        if not (
+            resolution.run_id == model.run_id
+            and resolution.result in {"approved", "denied"}
+            and resolved["run_id"] == model.run_id
+            and resolved["event_type"] == "approval.resolved"
+            and resolved.get("causation_event_id") == model.request_event_id
+            and resolved_payload.get("approval_id") == model.approval_id
+            and resolved_payload.get("request_event_id") == model.request_event_id
+            and resolved_payload.get("result") == resolution.result
+            and resolved_payload.get("responder_type") == resolution.responder_type
+            and resolved.get("correlation_id") == model.approval_id
+            and cast(int, approval_requested["sequence"]) < cast(int, resolved["sequence"])
+        ):
+            raise PersistenceIntegrityError("stored approval resolution provenance is corrupt")
+
+    @staticmethod
+    def _approval_matches(
+        record: ApprovalRequestRecord,
+        *,
+        run: RunRecord,
+        policy: RevisionReference,
+        tool_id: str,
+        contract_version: str,
+        request_digest: str,
+        idempotency_key_digest: str,
+        arguments: Mapping[str, object],
+    ) -> bool:
+        return (
+            record.run_id == run.run_id
+            and record.scenario == run.scenario
+            and record.policy == policy
+            and record.tool_id == tool_id
+            and record.contract_version == contract_version
+            and record.request_digest == request_digest
+            and record.idempotency_key_digest == idempotency_key_digest
+            and dict(record.arguments) == dict(arguments)
+        )
 
     @staticmethod
     def _fixture_record(model: FixtureRevisionModel) -> FixtureRevisionRecord:

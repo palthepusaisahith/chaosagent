@@ -1,0 +1,28 @@
+{
+  "description": "Structural Issue #10 examples only; these are not captured executions.",
+  "scenario_entities": {
+    "order_id": "ORD-1007",
+    "payment_id": "PAY-1007"
+  },
+  "examples": [
+    { "case": "automatic refund", "amount_minor": 5000, "decision": "allow" },
+    {
+      "case": "approval required",
+      "amount_minor": 6000,
+      "decision": "require_approval",
+      "durable_status": "pending"
+    },
+    {
+      "case": "approval granted",
+      "amount_minor": 6000,
+      "resolution": "approved"
+    },
+    {
+      "case": "approved execution",
+      "amount_minor": 6000,
+      "effect": "refund.created"
+    },
+    { "case": "approval denied", "amount_minor": 6000, "resolution": "denied" },
+    { "case": "excessive refund", "amount_minor": 12001, "decision": "deny" }
+  ]
+}

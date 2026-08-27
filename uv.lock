@@ -8,6 +8,7 @@ members = [
     "chaosagent-evidence",
     "chaosagent-fixtures",
     "chaosagent-persistence",
+    "chaosagent-policies",
     "chaosagent-scenarios",
     "chaosagent-tool-gateway",
     "chaosagent-workspace",
@@ -80,6 +81,7 @@ dependencies = [
     { name = "alembic" },
     { name = "chaosagent-evidence" },
     { name = "chaosagent-fixtures" },
+    { name = "chaosagent-policies" },
     { name = "chaosagent-scenarios" },
     { name = "psycopg", extra = ["binary"] },
     { name = "sqlalchemy" },
@@ -90,9 +92,25 @@ requires-dist = [
     { name = "alembic", specifier = "==1.19.1" },
     { name = "chaosagent-evidence", editable = "packages/evidence" },
     { name = "chaosagent-fixtures", editable = "packages/fixtures" },
+    { name = "chaosagent-policies", editable = "packages/policies" },
     { name = "chaosagent-scenarios", editable = "packages/scenarios" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.4" },
     { name = "sqlalchemy", specifier = "==2.0.52" },
+]
+
+[[package]]
+name = "chaosagent-policies"
+version = "0.0.0"
+source = { editable = "packages/policies" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "rfc8785" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "rfc8785", specifier = "==0.1.4" },
 ]
 
 [[package]]
@@ -116,6 +134,7 @@ version = "0.0.0"
 source = { editable = "packages/tool-gateway" }
 dependencies = [
     { name = "chaosagent-evidence" },
+    { name = "chaosagent-policies" },
     { name = "chaosagent-persistence" },
     { name = "jsonschema" },
     { name = "sqlalchemy" },
@@ -124,6 +143,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-policies", editable = "packages/policies" },
     { name = "chaosagent-persistence", editable = "packages/persistence" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "sqlalchemy", specifier = "==2.0.52" },
