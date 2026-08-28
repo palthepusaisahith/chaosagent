@@ -22,11 +22,11 @@ The tables have deliberately different responsibilities:
   resolution. A composite foreign key binds the approval's full Scenario tuple
   to its Run; repository validation additionally proves its Policy is the Policy
   frozen by that Scenario and revalidates the complete evidence chain.
-- `agent_configuration_revisions` is only an immutable `{id, revision, digest}`
-  reference registry. There is no Agent Configuration contract yet, so this
-  table does not claim that the referenced content was loaded or that its digest
-  was independently verified. In particular, the all-zero digest in structural
-  examples remains an explicit unresolved placeholder.
+- `agent_configuration_revisions` stores either a legacy immutable
+  `{id, revision, digest}` placeholder for scripted Issue #11 adapters or a
+  validated hosted Agent Configuration v0 document and verified digest. The
+  hosted document freezes its exact model snapshot, compatibility profile, and
+  deterministic token-accounting schedule; it contains no credentials.
 - `runs` assigns a stable Run ID and freezes the Scenario and Agent
   Configuration keys _and digests_. New Issue #7 Runs also freeze the Fixture
   reference resolved from their Scenario. Issue #6 makes `status` authoritative
@@ -53,6 +53,20 @@ become campaign persistence here, preserving the boundary established in Issue
 #3.
 
 ## Relational columns and JSONB documents
+
+Migration 0007 extends `agent_configuration_revisions` with nullable
+`schema_version` and `canonical_document` columns. New hosted configurations use
+the strict `chaosagent.agent-configuration/v0` document and verified digest;
+pre-Issue-12 scripted placeholder rows retain both columns as NULL. Projection
+checks fail closed when a hosted document omits or contradicts its ID, revision,
+or schema version. Semantic loading additionally requires the embedded
+accounting model to equal the configured exact model snapshot. Because the
+entire document participates in the digest, accounting rates cannot change
+without a new configuration revision/digest. The existing immutability trigger
+continues to reject UPDATE and DELETE for both forms. Downgrading 0007 to 0006
+intentionally removes the hosted document and schema columns while retaining the
+original identity/digest placeholder; re-upgrade cannot reconstruct removed
+configuration content.
 
 Opaque contract IDs remain bounded text rather than UUIDs. JSONB stores the
 validated semantic JSON value; PostgreSQL does not preserve the input's key
@@ -181,7 +195,7 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #11
+## Deferred beyond Issue #12
 
 - worker processes/daemons, heartbeats, and automatic recovery scheduling;
 - external side-effect fencing or reconciliation beyond the committed local
@@ -190,5 +204,4 @@ none of those capabilities, so all three are necessary runtime dependencies.
 - authentication/RBAC, approval UI/notifications, expiry workflows, fault
   activations, evaluators, SSE, telemetry, exports, and deployment role
   creation;
-- an actual versioned Agent Configuration document contract;
 - any report rebuild/version history policy.

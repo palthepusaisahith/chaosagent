@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "PostgreSQL persistence adapter for ChaosAgent contracts"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "chaosagent-agent-configurations",
     "chaosagent-policies",
     "alembic==1.19.1",
     "chaosagent-evidence",
@@ -14,6 +15,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
+chaosagent-agent-configurations = { workspace = true }
 chaosagent-evidence = { workspace = true }
 chaosagent-fixtures = { workspace = true }
 chaosagent-policies = { workspace = true }

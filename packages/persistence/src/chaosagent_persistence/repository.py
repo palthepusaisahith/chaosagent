@@ -13,6 +13,11 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Literal, NoReturn, cast
 
+from chaosagent_agent_configurations import (
+    AgentConfiguration,
+    AgentConfigurationValidationError,
+    loads_agent_configuration,
+)
 from chaosagent_evidence import (
     EvidenceValidationError,
     RunEvent,
@@ -177,6 +182,7 @@ class FixtureRevisionRecord:
 @dataclass(frozen=True, slots=True)
 class AgentConfigurationRevisionRecord:
     reference: RevisionReference
+    configuration: AgentConfiguration | None
     created_at: datetime
     created_by: str
 
@@ -622,6 +628,57 @@ class PersistenceRepository:
             _raise_integrity(error, "agent configuration reference insert")
         return self._agent_configuration_record(model)
 
+    def insert_agent_configuration(
+        self, configuration: AgentConfiguration, *, created_by: str
+    ) -> AgentConfigurationRevisionRecord:
+        document = configuration.to_dict()
+        _validate_jsonb_persistence_profile(document, "agent configuration")
+        identifier = cast(str, document["agent_configuration_id"])
+        revision = cast(str, document["revision"])
+        existing = self._session.get(AgentConfigurationRevisionModel, (identifier, revision))
+        if existing is not None:
+            record = self._agent_configuration_record(existing)
+            if (
+                record.reference.digest != configuration.digest
+                or record.configuration is None
+                or record.configuration.canonical_bytes != configuration.canonical_bytes
+            ):
+                raise RevisionConflictError(
+                    f"agent configuration revision {(identifier, revision)!r} has different content"
+                )
+            return record
+        model = AgentConfigurationRevisionModel(
+            agent_configuration_id=identifier,
+            revision=revision,
+            digest=configuration.digest,
+            schema_version=cast(str, document["schema_version"]),
+            canonical_document=document,
+            created_by=created_by,
+        )
+        try:
+            with self._session.begin_nested():
+                self._session.add(model)
+                self._session.flush()
+        except IntegrityError as error:
+            if _constraint_name(error) == "pk_agent_configuration_revisions":
+                concurrent = self._session.get(
+                    AgentConfigurationRevisionModel, (identifier, revision)
+                )
+                if concurrent is not None:
+                    record = self._agent_configuration_record(concurrent)
+                    if (
+                        record.reference.digest == configuration.digest
+                        and record.configuration is not None
+                        and record.configuration.canonical_bytes == configuration.canonical_bytes
+                    ):
+                        return record
+                    raise RevisionConflictError(
+                        "agent configuration revision "
+                        f"{(identifier, revision)!r} has different content"
+                    ) from error
+            _raise_integrity(error, "agent configuration revision insert")
+        return self._agent_configuration_record(model)
+
     def get_agent_configuration_reference(
         self, agent_configuration_id: str, revision: str
     ) -> AgentConfigurationRevisionRecord | None:
@@ -684,14 +741,15 @@ class PersistenceRepository:
                 "agent configuration revision "
                 f"{(agent_configuration_id, agent_configuration_revision)!r} does not exist"
             )
+        agent_record = self._agent_configuration_record(agent)
         model = RunModel(
             run_id=run_id,
             scenario_id=scenario.scenario_id,
             scenario_revision=scenario.revision,
             scenario_digest=scenario.canonical_digest,
-            agent_configuration_id=agent.agent_configuration_id,
-            agent_configuration_revision=agent.revision,
-            agent_configuration_digest=agent.digest,
+            agent_configuration_id=agent_record.reference.id,
+            agent_configuration_revision=agent_record.reference.revision,
+            agent_configuration_digest=agent_record.reference.digest,
             fixture_id=fixture.fixture_id,
             fixture_revision=fixture.revision,
             fixture_digest=fixture.canonical_digest,
@@ -2797,8 +2855,27 @@ class PersistenceRepository:
     def _agent_configuration_record(
         model: AgentConfigurationRevisionModel,
     ) -> AgentConfigurationRevisionRecord:
+        configuration = None
+        if model.canonical_document is not None:
+            try:
+                configuration = loads_agent_configuration(_json_text(model.canonical_document))
+            except AgentConfigurationValidationError as error:
+                raise PersistenceIntegrityError(
+                    "stored Agent Configuration document is invalid"
+                ) from error
+            document = configuration.to_dict()
+            if (
+                configuration.digest != model.digest
+                or document["agent_configuration_id"] != model.agent_configuration_id
+                or document["revision"] != model.revision
+                or document["schema_version"] != model.schema_version
+            ):
+                raise PersistenceIntegrityError(
+                    "stored Agent Configuration projections or digest are inconsistent"
+                )
         return AgentConfigurationRevisionRecord(
             RevisionReference(model.agent_configuration_id, model.revision, model.digest),
+            configuration,
             model.created_at,
             model.created_by,
         )

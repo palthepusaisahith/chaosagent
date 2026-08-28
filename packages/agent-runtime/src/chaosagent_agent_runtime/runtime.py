@@ -93,6 +93,16 @@ class AgentUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentProviderMetadata:
+    """Safe provider invocation identifiers for evidence, never provider objects."""
+
+    provider: str
+    requested_model: str
+    resolved_model: str | None = None
+    provider_request_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentToolCall:
     call_id: str
     tool_id: str
@@ -106,6 +116,7 @@ class AgentOutput:
     tool_calls: tuple[AgentToolCall, ...] = ()
     final: bool = False
     usage: AgentUsage = AgentUsage()
+    provider_metadata: AgentProviderMetadata | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +176,11 @@ class ScriptedAgentAdapter:
     @property
     def adapter_version(self) -> str:
         return self._adapter_version
+
+    @property
+    def configuration_digest(self) -> None:
+        """Scripted adapters retain the legacy unresolved reference contract."""
+        return None
 
     def invoke(self, context: AgentContext) -> AgentOutput:
         index = context.step_number - 1
@@ -312,7 +328,7 @@ def execute_run(
         try:
             output = adapter.invoke(context)
             elapsed_ms = _elapsed_ms(started)
-            validated = _validated_output(output, state.scenario, tool_registry)
+            validated = _validated_output(output, state.scenario, tool_registry, adapter)
         except AgentProviderTimeout:
             return _terminate(
                 engine,
@@ -450,6 +466,19 @@ def _load_state(
             raise PersistenceIntegrityError(
                 "adapter version does not match the frozen Run reference"
             )
+        configuration_digest = getattr(adapter, "configuration_digest", None)
+        if configuration_digest is not None:
+            configuration = repository.get_agent_configuration_reference(
+                run.agent_configuration.id, run.agent_configuration.revision
+            )
+            if (
+                configuration is None
+                or configuration.configuration is None
+                or configuration_digest != run.agent_configuration.digest
+            ):
+                raise PersistenceIntegrityError(
+                    "hosted adapter configuration does not match the frozen Run reference"
+                )
         _require_name(adapter.adapter_id, "adapter_id")
         _require_name(producer_component, "producer_component")
         record = repository.get_execution_checkpoint(run.run_id)
@@ -468,7 +497,7 @@ def _load_state(
                 raise PersistenceIntegrityError(
                     "checkpoint last_event_sequence does not identify committed Run evidence"
                 )
-            _validate_checkpoint_evidence(checkpoint, evidence, scenario, registry, run)
+            _validate_checkpoint_evidence(checkpoint, evidence, scenario, registry, run, adapter)
             _validate_evidence_after_checkpoint(checkpoint, all_evidence[len(evidence) :])
         if run.status == "evaluating" and (
             checkpoint is None or checkpoint.get("status") != "final"
@@ -688,6 +717,7 @@ def _validate_checkpoint_evidence(
     scenario: dict[str, object],
     registry: ToolRegistry,
     run: RunRecord,
+    adapter: AgentAdapter,
 ) -> None:
     documents = [record.event.to_dict() for record in evidence]
     by_id = {cast(str, document["event_id"]): document for document in documents}
@@ -698,7 +728,6 @@ def _validate_checkpoint_evidence(
     used_agent_events: set[str] = set()
     prior_sequence = 0
     prefix: list[dict[str, object]] = []
-    adapter_ref = cast(dict[str, object], checkpoint["adapter"])
     for turn in trajectory:
         if turn["kind"] == "assistant":
             step_number = cast(int, turn["step_number"])
@@ -717,11 +746,7 @@ def _validate_checkpoint_evidence(
                 or payload.get("step_number") != step_number
                 or payload.get("model_call_id")
                 != _identity("model-call", run.run_id, str(step_number))
-                or payload.get("model")
-                != {
-                    "provider": adapter_ref["id"],
-                    "requested_model": adapter_ref["version"],
-                }
+                or not _model_matches_adapter(payload.get("model"), adapter)
                 or payload.get("input_digest") != digest_payload_v0(_context_payload(context))
                 or payload.get("output_digest") != digest_payload_v0(expected_output)
             ):
@@ -1046,7 +1071,10 @@ def _tool_spec(definition: ToolDefinition) -> AgentToolSpec:
 
 
 def _validated_output(
-    output: object, scenario: dict[str, object], registry: ToolRegistry
+    output: object,
+    scenario: dict[str, object],
+    registry: ToolRegistry,
+    adapter: AgentAdapter,
 ) -> AgentOutput:
     if type(output) is not AgentOutput:
         raise AgentOutputValidationError("adapter output must be AgentOutput")
@@ -1060,6 +1088,7 @@ def _validated_output(
     if output.final and output.tool_calls:
         raise AgentOutputValidationError("final answer cannot also request tools")
     _validate_usage(output.usage)
+    _validate_provider_metadata(output.provider_metadata, adapter)
     allowed = set(cast(list[str], cast(dict[str, object], scenario["agent"])["allowed_tools"]))
     seen: set[str] = set()
     validated_calls: list[AgentToolCall] = []
@@ -1099,6 +1128,7 @@ def _validated_output(
         tuple(validated_calls),
         output.final,
         output.usage,
+        output.provider_metadata,
     )
     try:
         validate_jsonb_persistence_profile(_output_payload(validated, 0), "agent output")
@@ -1152,6 +1182,7 @@ def _persist_agent_output(
             step_number,
             input_payload,
             output_payload,
+            output.provider_metadata,
             producer_component,
         )
         previous = prior.checkpoint
@@ -1247,6 +1278,7 @@ def _append_agent_step(
     step_number: int,
     input_payload: object,
     output_payload: object,
+    provider_metadata: AgentProviderMetadata | None,
     producer_component: str,
 ) -> RunEventRecord:
     observed = repository.database_time()
@@ -1256,7 +1288,7 @@ def _append_agent_step(
         "step_number": step_number,
         "phase": "completed",
         "model_call_id": _identity("model-call", run.run_id, str(step_number)),
-        "model": {"provider": adapter.adapter_id, "requested_model": adapter.adapter_version},
+        "model": _provider_model(adapter, provider_metadata),
         "input_digest": digest_payload_v0(input_payload),
         "output_digest": digest_payload_v0(output_payload),
     }
@@ -1559,7 +1591,7 @@ def _append_failed_agent_step(
         "step_number": step_number,
         "phase": "failed",
         "model_call_id": _identity("model-call", run.run_id, str(step_number)),
-        "model": {"provider": adapter.adapter_id, "requested_model": adapter.adapter_version},
+        "model": _provider_model(adapter, None),
         "input_digest": digest_payload_v0(
             _context_payload(context)
             if context is not None
@@ -1590,6 +1622,60 @@ def lease_owner(run: RunRecord) -> str:
     if run.lease_owner is None:
         raise PersistenceIntegrityError("active Run has no lease owner")
     return run.lease_owner
+
+
+def _validate_provider_metadata(metadata: object, adapter: AgentAdapter) -> None:
+    if metadata is None:
+        return
+    if type(metadata) is not AgentProviderMetadata:
+        raise AgentOutputValidationError("provider metadata must be AgentProviderMetadata")
+    assert isinstance(metadata, AgentProviderMetadata)
+    _require_name(metadata.provider, "provider")
+    for value, field, maximum in (
+        (metadata.requested_model, "requested_model", 256),
+        (metadata.resolved_model, "resolved_model", 256),
+        (metadata.provider_request_id, "provider_request_id", 128),
+    ):
+        if value is None:
+            continue
+        if type(value) is not str or not value or len(value) > maximum:
+            raise AgentOutputValidationError(f"{field} is invalid")
+        if field == "provider_request_id":
+            _require_id(value, field)
+    expected_provider = getattr(adapter, "provider_name", adapter.adapter_id)
+    expected_model = getattr(adapter, "requested_model", adapter.adapter_version)
+    if metadata.provider != expected_provider or metadata.requested_model != expected_model:
+        raise AgentOutputValidationError("provider metadata does not match the active adapter")
+
+
+def _provider_model(
+    adapter: AgentAdapter, metadata: AgentProviderMetadata | None
+) -> dict[str, object]:
+    if metadata is None:
+        return {
+            "provider": getattr(adapter, "provider_name", adapter.adapter_id),
+            "requested_model": getattr(adapter, "requested_model", adapter.adapter_version),
+        }
+    model: dict[str, object] = {
+        "provider": metadata.provider,
+        "requested_model": metadata.requested_model,
+    }
+    if metadata.resolved_model is not None:
+        model["resolved_model"] = metadata.resolved_model
+    if metadata.provider_request_id is not None:
+        model["provider_request_id"] = metadata.provider_request_id
+    return model
+
+
+def _model_matches_adapter(value: object, adapter: AgentAdapter) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected_provider = getattr(adapter, "provider_name", adapter.adapter_id)
+    expected_model = getattr(adapter, "requested_model", adapter.adapter_version)
+    return (
+        value.get("provider") == expected_provider
+        and value.get("requested_model") == expected_model
+    )
 
 
 def _pre_step_budget_error(

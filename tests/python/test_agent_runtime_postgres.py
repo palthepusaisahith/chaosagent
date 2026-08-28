@@ -13,10 +13,12 @@ import chaosagent_agent_runtime.runtime as runtime_module
 import pytest
 from alembic import command
 from alembic.config import Config
+from chaosagent_agent_configurations import AgentConfiguration, loads_agent_configuration
 from chaosagent_agent_runtime import (
     AgentContext,
     AgentOutput,
     AgentProviderError,
+    AgentProviderMetadata,
     AgentProviderTimeout,
     AgentToolCall,
     AgentUsage,
@@ -38,6 +40,7 @@ from chaosagent_persistence import (
     create_postgres_engine,
 )
 from chaosagent_policies import load_policy
+from chaosagent_provider_openai import OpenAIResponsesAdapter
 from chaosagent_scenarios import loads_scenario
 from chaosagent_tool_gateway import (
     ORDERS_GET_V0,
@@ -46,9 +49,9 @@ from chaosagent_tool_gateway import (
     SUPPORT_UPDATE_TICKET_V0,
     ToolGateway,
 )
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.postgres
@@ -101,6 +104,7 @@ def _create_run(
     *,
     budgets: dict[str, int] | None = None,
     worker: str = "worker-runtime",
+    agent_configuration: AgentConfiguration | None = None,
 ) -> ClaimedRun:
     run_id = _unique("run")
     scenario_document = cast(
@@ -117,13 +121,20 @@ def _create_run(
         repository.insert_fixture_revision(load_fixture(FIXTURE_PATH), created_by="runtime-test")
         repository.insert_policy_revision(load_policy(POLICY_PATH), created_by="runtime-test")
         repository.insert_scenario_revision(scenario, created_by="runtime-test")
-        repository.insert_agent_configuration_reference(AGENT, created_by="runtime-test")
+        if agent_configuration is None:
+            agent_reference = AGENT
+            repository.insert_agent_configuration_reference(AGENT, created_by="runtime-test")
+        else:
+            record = repository.insert_agent_configuration(
+                agent_configuration, created_by="runtime-test"
+            )
+            agent_reference = record.reference
         repository.create_run(
             run_id,
             scenario_id=cast(str, scenario_document["scenario_id"]),
             scenario_revision="1",
-            agent_configuration_id=AGENT.id,
-            agent_configuration_revision=AGENT.revision,
+            agent_configuration_id=agent_reference.id,
+            agent_configuration_revision=agent_reference.revision,
             created_by="runtime-test",
         )
         repository.initialize_run_company_state(run_id)
@@ -216,6 +227,80 @@ def _assert_corruption_stops_before_progress(engine: Engine, claimed: ClaimedRun
 
 def _usage(cost: int | None = 0) -> AgentUsage:
     return AgentUsage(input_tokens=10, output_tokens=5, cost_microusd=cost)
+
+
+def _hosted_configuration(prefix: str) -> AgentConfiguration:
+    return loads_agent_configuration(
+        json.dumps(
+            {
+                "schema_version": "chaosagent.agent-configuration/v0",
+                "agent_configuration_id": _unique(prefix),
+                "revision": "r1",
+                "provider": "openai",
+                "adapter": {"id": "openai-responses", "version": "v0"},
+                "model": "gpt-4.1-2025-04-14",
+                "compatibility_profile": "openai-responses-stateless-non-reasoning/v0",
+                "token_accounting": {
+                    "schema_version": "chaosagent.token-accounting/v0",
+                    "schedule_id": "test-openai-rates",
+                    "revision": "2026-08-28",
+                    "model": "gpt-4.1-2025-04-14",
+                    "unit": "microusd",
+                    "tokens_per_rate_unit": 1000000,
+                    "rounding": "ceiling_per_response",
+                    "input_rate_microusd": 1000000,
+                    "cached_input_rate_microusd": 500000,
+                    "output_rate_microusd": 2000000,
+                },
+                "timeout_ms": 5000,
+                "max_output_tokens": 256,
+                "temperature": None,
+                "parallel_tool_calls": True,
+                "store": False,
+                "max_retries": 0,
+            }
+        )
+    )
+
+
+def _provider_response(identifier: str, *output: object, usage: object = ...) -> dict[str, object]:
+    reported_usage = (
+        {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 15,
+        }
+        if usage is ...
+        else usage
+    )
+    return {
+        "id": identifier,
+        "model": "gpt-4.1-2025-04-14",
+        "status": "completed",
+        "error": None,
+        "output": list(output),
+        "usage": reported_usage,
+    }
+
+
+class _ProviderResponses:
+    def __init__(self, outputs: list[object]) -> None:
+        self.outputs = outputs
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.requests.append(dict(kwargs))
+        return self.outputs.pop(0)
+
+
+class _ProviderClient:
+    def __init__(self, *outputs: object) -> None:
+        self.responses = _ProviderResponses(list(outputs))
+
+    def with_options(self, **kwargs: object) -> _ProviderClient:
+        return self
 
 
 def _expire_requeue_and_reclaim(engine: Engine, claimed: ClaimedRun, *, worker: str) -> ClaimedRun:
@@ -2192,6 +2277,661 @@ def test_database_rejects_checkpoint_document_run_mismatch(runtime_engine: Engin
             )
 
 
+def test_fake_openai_end_to_end_uses_real_runtime_gateway_and_evidence(
+    runtime_engine: Engine,
+) -> None:
+    configuration = loads_agent_configuration(
+        json.dumps(
+            {
+                "schema_version": "chaosagent.agent-configuration/v0",
+                "agent_configuration_id": "openai-e2e-agent",
+                "revision": "r1",
+                "provider": "openai",
+                "adapter": {"id": "openai-responses", "version": "v0"},
+                "model": "gpt-4.1-2025-04-14",
+                "compatibility_profile": "openai-responses-stateless-non-reasoning/v0",
+                "token_accounting": {
+                    "schema_version": "chaosagent.token-accounting/v0",
+                    "schedule_id": "e2e-openai-rates",
+                    "revision": "2026-08-28",
+                    "model": "gpt-4.1-2025-04-14",
+                    "unit": "microusd",
+                    "tokens_per_rate_unit": 1000000,
+                    "rounding": "ceiling_per_response",
+                    "input_rate_microusd": 1000000,
+                    "cached_input_rate_microusd": 500000,
+                    "output_rate_microusd": 2000000,
+                },
+                "timeout_ms": 5000,
+                "max_output_tokens": 256,
+                "temperature": None,
+                "parallel_tool_calls": True,
+                "store": False,
+                "max_retries": 0,
+            }
+        )
+    )
+
+    def response(index: int, item: dict[str, object]) -> dict[str, object]:
+        return {
+            "id": f"resp_e2e_{index}",
+            "model": "gpt-4.1-2025-04-14",
+            "status": "completed",
+            "error": None,
+            "output": [item],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 15,
+            },
+        }
+
+    def function(name: str, call_id: str, arguments: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "function_call",
+            "name": name,
+            "call_id": call_id,
+            "arguments": json.dumps(arguments),
+        }
+
+    outputs = [
+        response(1, function("chaosagent_orders__get", "provider-order", {"order_id": "ORD-1007"})),
+        response(
+            2,
+            function(
+                "chaosagent_shipping__get_status",
+                "provider-shipping",
+                {"order_id": "ORD-1007"},
+            ),
+        ),
+        response(
+            3,
+            function(
+                "chaosagent_payments__refund",
+                "provider-refund",
+                {
+                    "order_id": "ORD-1007",
+                    "payment_id": "PAY-1007",
+                    "amount_minor": 5000,
+                    "reason": "Failed shipment",
+                    "idempotency_key": "openai-e2e-refund",
+                },
+            ),
+        ),
+        response(
+            4,
+            function(
+                "chaosagent_support__update_ticket",
+                "provider-ticket",
+                {
+                    "ticket_id": "TKT-204",
+                    "status": "closed",
+                    "note": "Failed shipment verified and refund applied.",
+                    "idempotency_key": "openai-e2e-ticket",
+                },
+            ),
+        ),
+        response(
+            5,
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Refunded and closed."}],
+            },
+        ),
+    ]
+
+    class Responses:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.requests.append(dict(kwargs))
+            return outputs.pop(0)
+
+    class Client:
+        def __init__(self) -> None:
+            self.responses = Responses()
+
+        def with_options(self, **kwargs: object) -> Client:
+            return self
+
+    claimed = _create_run(runtime_engine, agent_configuration=configuration)
+    client = Client()
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(configuration, client=client),
+    )
+    assert result.status == "evaluation_ready" and result.final_answer == "Refunded and closed.", (
+        result,
+        len(client.responses.requests),
+    )
+    assert len(client.responses.requests) == 5
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(claimed.run.run_id)]
+        assert run is not None and run.status == "evaluating"
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        assert checkpoint is not None
+        assert checkpoint.document["known_cost_microusd"] == 100
+        assert checkpoint.document["cost_complete"] is True
+        trajectory = cast(list[dict[str, object]], _plain(checkpoint.document["trajectory"]))
+        assert [
+            cast(dict[str, object], turn["usage"])["cost_microusd"]
+            for turn in trajectory
+            if turn["kind"] == "assistant"
+        ] == [20, 20, 20, 20, 20]
+        assert state is not None and len(state.refunds) == 1
+        assert state.support_tickets[0].status == "closed"
+        assert [event["event_type"] for event in events].count("tool.requested") == 4
+        completed_steps = [
+            event
+            for event in events
+            if event["event_type"] == "agent.step"
+            and cast(dict[str, object], event["payload"])["phase"] == "completed"
+        ]
+        assert len(completed_steps) == 5
+        assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+        assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 2
+        first_model = cast(dict[str, object], completed_steps[0]["payload"])["model"]
+        assert cast(dict[str, object], first_model)["provider_request_id"] == "resp_e2e_1"
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected_status", "expected_error"),
+    [(20, "evaluation_ready", None), (19, "timed_out", "max_cost_exceeded")],
+)
+def test_production_openai_first_turn_cost_budget(
+    runtime_engine: Engine,
+    budget: int,
+    expected_status: str,
+    expected_error: str | None,
+) -> None:
+    configuration = _hosted_configuration("openai-first-turn")
+    claimed = _create_run(
+        runtime_engine,
+        agent_configuration=configuration,
+        budgets={
+            "max_steps": 2,
+            "max_tool_calls": 1,
+            "max_wall_time_ms": 120000,
+            "max_cost_microusd": budget,
+        },
+    )
+    client = _ProviderClient(
+        _provider_response(
+            "resp_first_turn",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done"}],
+            },
+        )
+    )
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(configuration, client=client),
+    )
+    assert result.status == expected_status and result.error_code == expected_error
+    with Session(runtime_engine) as session:
+        checkpoint = PersistenceRepository(session).get_execution_checkpoint(claimed.run.run_id)
+        assert checkpoint is not None
+        assert checkpoint.document["known_cost_microusd"] == 20
+        assert checkpoint.document["cost_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 15,
+        },
+        {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 15,
+            "future_billed_tokens": 1,
+        },
+    ],
+)
+def test_production_openai_incomplete_usage_fails_closed(
+    runtime_engine: Engine, usage: object
+) -> None:
+    configuration = _hosted_configuration("openai-missing-usage")
+    claimed = _create_run(runtime_engine, agent_configuration=configuration)
+    client = _ProviderClient(
+        _provider_response(
+            "resp_missing_usage",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Not chargeable"}],
+            },
+            usage=usage,
+        )
+    )
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(configuration, client=client),
+    )
+    assert result.status == "timed_out" and result.error_code == "cost_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("reported_provider", "reported_model"),
+    [
+        ("fabricated-provider", "gpt-4.1-2025-04-14"),
+        ("openai", "fabricated-model"),
+    ],
+)
+def test_provider_metadata_must_match_active_hosted_adapter_before_step_persistence(
+    runtime_engine: Engine, reported_provider: str, reported_model: str
+) -> None:
+    configuration = _hosted_configuration("openai-metadata-binding")
+    document = configuration.to_dict()
+    claimed = _create_run(runtime_engine, agent_configuration=configuration)
+
+    class MismatchedMetadataAdapter:
+        adapter_id = cast(str, document["agent_configuration_id"])
+        adapter_version = cast(str, document["revision"])
+        configuration_digest = configuration.digest
+        provider_name = "openai"
+        requested_model = cast(str, document["model"])
+
+        def invoke(self, context: AgentContext) -> AgentOutput:
+            return AgentOutput(
+                "untrusted metadata",
+                final=True,
+                usage=_usage(),
+                provider_metadata=AgentProviderMetadata(
+                    reported_provider,
+                    reported_model,
+                    self.requested_model,
+                    "resp_fabricated",
+                ),
+            )
+
+    result = execute_run(runtime_engine, claimed.lease, MismatchedMetadataAdapter())
+    assert result.status == "failed" and result.error_code == "invalid_agent_output"
+    with Session(runtime_engine) as session:
+        events = [
+            record.event.to_dict()
+            for record in PersistenceRepository(session).fetch_events(claimed.run.run_id)
+        ]
+    assert not any(
+        event["event_type"] == "agent.step"
+        and cast(dict[str, object], event["payload"])["phase"] == "completed"
+        for event in events
+    )
+
+
+def test_openai_approval_resume_uses_fresh_adapter_and_durable_trajectory(
+    runtime_engine: Engine,
+) -> None:
+    configuration = _hosted_configuration("openai-approval-restart")
+    claimed = _create_run(runtime_engine, agent_configuration=configuration)
+    first_client = _ProviderClient(
+        _provider_response(
+            "resp_approval_request",
+            {
+                "type": "function_call",
+                "name": "chaosagent_payments__refund",
+                "call_id": "provider-approval-refund",
+                "arguments": json.dumps(
+                    {
+                        "order_id": "ORD-1007",
+                        "payment_id": "PAY-1007",
+                        "amount_minor": 6000,
+                        "reason": "Approval restart test",
+                        "idempotency_key": "openai-approval-restart",
+                    }
+                ),
+            },
+        )
+    )
+    paused = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(configuration, client=first_client),
+    )
+    assert paused.status == "waiting_for_approval" and paused.approval_id is not None
+    with Session(runtime_engine) as session, session.begin():
+        PersistenceRepository(session).resolve_approval_request(
+            paused.approval_id,
+            result="approved",
+            actor_id="reviewer-openai-restart",
+            resolution_event_id=_unique("event-openai-approval-resolution"),
+        )
+
+    configuration_document = configuration.to_dict()
+    configuration_id = cast(str, configuration_document["agent_configuration_id"])
+    configuration_revision = cast(str, configuration_document["revision"])
+    del configuration_document, configuration, first_client
+    with Session(runtime_engine) as session:
+        persisted = PersistenceRepository(session).get_agent_configuration_reference(
+            configuration_id, configuration_revision
+        )
+        assert persisted is not None and persisted.configuration is not None
+        reloaded = persisted.configuration
+    second_client = _ProviderClient(
+        _provider_response(
+            "resp_after_approval",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Approved refund complete"}],
+            },
+        )
+    )
+    resumed = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(reloaded, client=second_client),
+    )
+    assert resumed.status == "evaluation_ready"
+    provider_input = cast(list[dict[str, object]], second_client.responses.requests[0]["input"])
+    assert any(item.get("type") == "function_call_output" for item in provider_input)
+    assert any("retry/approval outcome" in json.dumps(item) for item in provider_input)
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        assert state is not None and len(state.refunds) == 1
+        assert checkpoint is not None and checkpoint.document["known_cost_microusd"] == 40
+
+
+def test_agent_configuration_document_persistence_and_projection_guard(
+    runtime_engine: Engine,
+) -> None:
+    configuration = loads_agent_configuration(
+        json.dumps(
+            {
+                "schema_version": "chaosagent.agent-configuration/v0",
+                "agent_configuration_id": _unique("openai-config"),
+                "revision": "r1",
+                "provider": "openai",
+                "adapter": {"id": "openai-responses", "version": "v0"},
+                "model": "gpt-4.1-2025-04-14",
+                "compatibility_profile": "openai-responses-stateless-non-reasoning/v0",
+                "token_accounting": {
+                    "schema_version": "chaosagent.token-accounting/v0",
+                    "schedule_id": "projection-openai-rates",
+                    "revision": "2026-08-28",
+                    "model": "gpt-4.1-2025-04-14",
+                    "unit": "microusd",
+                    "tokens_per_rate_unit": 1000000,
+                    "rounding": "ceiling_per_response",
+                    "input_rate_microusd": 1000000,
+                    "cached_input_rate_microusd": 500000,
+                    "output_rate_microusd": 2000000,
+                },
+                "timeout_ms": 1000,
+                "max_output_tokens": 32,
+                "temperature": 0,
+                "parallel_tool_calls": False,
+                "store": False,
+                "max_retries": 0,
+            }
+        )
+    )
+    with Session(runtime_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        record = repository.insert_agent_configuration(configuration, created_by="runtime-test")
+        assert record.configuration is not None
+        assert record.configuration.digest == configuration.digest
+    identifier = cast(str, configuration.to_dict()["agent_configuration_id"])
+    with pytest.raises(DBAPIError), runtime_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE public.agent_configuration_revisions SET created_by = 'attacker' "
+                "WHERE agent_configuration_id = :id AND revision = 'r1'"
+            ),
+            {"id": identifier},
+        )
+    with pytest.raises(DBAPIError), runtime_engine.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM public.agent_configuration_revisions "
+                "WHERE agent_configuration_id = :id AND revision = 'r1'"
+            ),
+            {"id": identifier},
+        )
+    document = configuration.to_dict()
+    document.pop("revision")
+    with runtime_engine.begin() as connection, pytest.raises(IntegrityError):
+        connection.execute(
+            text(
+                "INSERT INTO public.agent_configuration_revisions "
+                "(agent_configuration_id, revision, digest, schema_version, "
+                "canonical_document, created_by) VALUES "
+                "(:id, 'r1', :digest, 'chaosagent.agent-configuration/v0', "
+                "CAST(:document AS jsonb), 'raw-test')"
+            ),
+            {
+                "id": _unique("broken-openai-config"),
+                "digest": "sha256:" + "a" * 64,
+                "document": json.dumps(document),
+            },
+        )
+    complete_document = configuration.to_dict()
+    with runtime_engine.begin() as connection, pytest.raises(IntegrityError):
+        connection.execute(
+            text(
+                "INSERT INTO public.agent_configuration_revisions "
+                "(agent_configuration_id, revision, digest, schema_version, "
+                "canonical_document, created_by) VALUES "
+                "(:id, 'r1', :digest, NULL, CAST(:document AS jsonb), 'raw-test')"
+            ),
+            {
+                "id": cast(str, complete_document["agent_configuration_id"]),
+                "digest": configuration.digest,
+                "document": json.dumps(complete_document),
+            },
+        )
+
+
+def test_projection_valid_corrupt_agent_configuration_digest_blocks_run_creation(
+    runtime_engine: Engine,
+) -> None:
+    configuration = _hosted_configuration("corrupt-openai-config")
+    document = configuration.to_dict()
+    identifier = cast(str, document["agent_configuration_id"])
+    corrupt_digest = "sha256:" + "a" * 64
+    assert corrupt_digest != configuration.digest
+    with runtime_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO public.agent_configuration_revisions "
+                "(agent_configuration_id, revision, digest, schema_version, "
+                "canonical_document, created_by) VALUES "
+                "(:id, 'r1', :digest, 'chaosagent.agent-configuration/v0', "
+                "CAST(:document AS jsonb), 'corruption-test')"
+            ),
+            {
+                "id": identifier,
+                "digest": corrupt_digest,
+                "document": json.dumps(document),
+            },
+        )
+    with Session(runtime_engine) as session:
+        with pytest.raises(PersistenceIntegrityError, match="inconsistent"):
+            PersistenceRepository(session).get_agent_configuration_reference(identifier, "r1")
+
+    scenario_document = cast(
+        dict[str, object], json.loads(SCENARIO_PATH.read_text(encoding="utf-8"))
+    )
+    scenario_document["scenario_id"] = _unique("scenario-corrupt-config")
+    scenario_document["revision"] = "1"
+    scenario_document["faults"] = []
+    scenario = loads_scenario(json.dumps(scenario_document))
+    with Session(runtime_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        repository.insert_fixture_revision(load_fixture(FIXTURE_PATH), created_by="runtime-test")
+        repository.insert_policy_revision(load_policy(POLICY_PATH), created_by="runtime-test")
+        repository.insert_scenario_revision(scenario, created_by="runtime-test")
+        with pytest.raises(PersistenceIntegrityError, match="inconsistent"):
+            repository.create_run(
+                _unique("run-corrupt-config"),
+                scenario_id=cast(str, scenario_document["scenario_id"]),
+                scenario_revision="1",
+                agent_configuration_id=identifier,
+                agent_configuration_revision="r1",
+                created_by="runtime-test",
+            )
+
+
+def test_hosted_adapter_digest_must_match_run_frozen_configuration(
+    runtime_engine: Engine,
+) -> None:
+    base = {
+        "schema_version": "chaosagent.agent-configuration/v0",
+        "agent_configuration_id": _unique("openai-binding"),
+        "revision": "r1",
+        "provider": "openai",
+        "adapter": {"id": "openai-responses", "version": "v0"},
+        "model": "gpt-4.1-2025-04-14",
+        "compatibility_profile": "openai-responses-stateless-non-reasoning/v0",
+        "token_accounting": {
+            "schema_version": "chaosagent.token-accounting/v0",
+            "schedule_id": "binding-openai-rates",
+            "revision": "2026-08-28",
+            "model": "gpt-4.1-2025-04-14",
+            "unit": "microusd",
+            "tokens_per_rate_unit": 1000000,
+            "rounding": "ceiling_per_response",
+            "input_rate_microusd": 1000000,
+            "cached_input_rate_microusd": 500000,
+            "output_rate_microusd": 2000000,
+        },
+        "timeout_ms": 1000,
+        "max_output_tokens": 32,
+        "temperature": None,
+        "parallel_tool_calls": False,
+        "store": False,
+        "max_retries": 0,
+    }
+    frozen = loads_agent_configuration(json.dumps(base))
+    different = loads_agent_configuration(json.dumps({**base, "timeout_ms": 2000}))
+
+    class Responses:
+        calls = 0
+
+        def create(self, **kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("provider must not be called")
+
+    class Client:
+        def __init__(self) -> None:
+            self.responses = Responses()
+
+        def with_options(self, **kwargs: object) -> Client:
+            return self
+
+    claimed = _create_run(runtime_engine, agent_configuration=frozen)
+    client = Client()
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        OpenAIResponsesAdapter(different, client=client),
+    )
+    assert result.status == "run_not_ready" and result.error_code == "internal_error"
+    assert client.responses.calls == 0
+
+
+def test_migration_0007_downgrade_and_reupgrade_is_isolated() -> None:
+    database_url = os.environ.get("CHAOSAGENT_TEST_DATABASE_URL")
+    if database_url is None:
+        pytest.skip("CHAOSAGENT_TEST_DATABASE_URL is not configured")
+    if os.environ.get("CHAOSAGENT_ALLOW_DESTRUCTIVE_DATABASE_TESTS") != "1":
+        raise RuntimeError("destructive PostgreSQL tests require explicit opt-in")
+    if not (make_url(database_url).database or "").endswith("_test"):
+        raise RuntimeError("PostgreSQL integration database name must end with '_test'")
+    migration_database = f"chaosagent_0007_{uuid4().hex}_test"
+    source_url = make_url(database_url)
+    admin_engine = create_engine(source_url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    isolated_url = source_url.set(database=migration_database)
+    isolated_url_text = isolated_url.render_as_string(hide_password=False)
+    configuration = Config(str(ALEMBIC_INI))
+    legacy = RevisionReference(_unique("legacy-before-downgrade"), "r1", "sha256:" + "b" * 64)
+    hosted = _hosted_configuration("hosted-before-downgrade")
+    previous_url = os.environ.get("CHAOSAGENT_DATABASE_URL")
+    isolated_engine: Engine | None = None
+    try:
+        with admin_engine.connect() as connection:
+            connection.execute(text(f'CREATE DATABASE "{migration_database}"'))
+        os.environ["CHAOSAGENT_DATABASE_URL"] = isolated_url_text
+        command.upgrade(configuration, "head")
+        isolated_engine = create_postgres_engine(isolated_url_text)
+        with Session(isolated_engine) as session, session.begin():
+            repository = PersistenceRepository(session)
+            repository.insert_agent_configuration_reference(legacy, created_by="migration-test")
+            repository.insert_agent_configuration(hosted, created_by="migration-test")
+        command.downgrade(configuration, "0006_execution_checkpoints")
+        with isolated_engine.connect() as connection:
+            columns = connection.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = "
+                    "'agent_configuration_revisions'"
+                )
+            ).scalars()
+            assert "canonical_document" not in set(columns)
+        command.upgrade(configuration, "head")
+        with isolated_engine.connect() as connection:
+            columns = connection.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = "
+                    "'agent_configuration_revisions'"
+                )
+            ).scalars()
+            assert {"schema_version", "canonical_document"} <= set(columns)
+        hosted_document = hosted.to_dict()
+        with Session(isolated_engine) as session:
+            repository = PersistenceRepository(session)
+            restored_legacy = repository.get_agent_configuration_reference(
+                legacy.id, legacy.revision
+            )
+            restored_hosted = repository.get_agent_configuration_reference(
+                cast(str, hosted_document["agent_configuration_id"]),
+                cast(str, hosted_document["revision"]),
+            )
+            assert restored_legacy is not None and restored_legacy.configuration is None
+            assert restored_hosted is not None and restored_hosted.configuration is None
+            assert restored_hosted.reference.digest == hosted.digest
+    finally:
+        if isolated_engine is not None:
+            isolated_engine.dispose()
+        if previous_url is None:
+            os.environ.pop("CHAOSAGENT_DATABASE_URL", None)
+        else:
+            os.environ["CHAOSAGENT_DATABASE_URL"] = previous_url
+        with admin_engine.connect() as connection:
+            connection.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :database AND pid <> pg_backend_pid()"
+                ),
+                {"database": migration_database},
+            )
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{migration_database}"'))
+        admin_engine.dispose()
+
+
 def test_migration_0006_downgrade_and_reupgrade(runtime_engine: Engine) -> None:
     database_url = os.environ["CHAOSAGENT_TEST_DATABASE_URL"]
     os.environ["CHAOSAGENT_DATABASE_URL"] = database_url
@@ -2204,7 +2944,7 @@ def test_migration_0006_downgrade_and_reupgrade(runtime_engine: Engine) -> None:
             ).scalar_one()
             is None
         )
-    command.upgrade(configuration, "0006_execution_checkpoints")
+    command.upgrade(configuration, "head")
     with runtime_engine.connect() as connection:
         assert (
             connection.execute(

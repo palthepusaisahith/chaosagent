@@ -4,15 +4,17 @@
 
 Issue #11 provides the provider-neutral execution loop for one already-created,
 initialized, and leased Run. It supplies an in-process deterministic scripted
-adapter and does not call a hosted model. Issue #12 will add the first real
-provider adapter. Agent Configuration remains the committed immutable
-`{id, revision, digest}` reference placeholder; this issue does not define its
-content contract or provider settings.
+adapter. Issue #12 adds the first hosted adapter without changing that runtime
+contract. Scripted adapters may retain the committed immutable
+`{id, revision, digest}` placeholder. Hosted adapters use a strict Agent
+Configuration v0 document and must present its digest; the runtime resolves and
+validates that document against the Run before invocation.
 
 The runtime accepts an `Engine`, current `LeaseIdentity`, and `AgentAdapter`.
 The adapter ID and version must exactly match the Run's frozen Agent
-Configuration ID and revision. The unresolved digest is not represented as a
-verified adapter configuration document.
+Configuration ID and revision. For a hosted configuration the digest covers the
+complete immutable provider configuration, compatibility profile, and
+token-accounting schedule.
 
 ## Provider-neutral contract
 
@@ -175,17 +177,17 @@ attempt cannot write a checkpoint, event, tool result, or lifecycle mutation.
 
 The adapter receives remaining active wall time, and late returned output is
 budget-checked and lease-fenced. V0's synchronous `invoke` contract cannot
-forcibly interrupt arbitrary Python code; a future hosted-provider adapter must
-translate the remaining duration into its own request timeout. The runtime does
-not claim a forcibly interruptible hard deadline and does not add threads or
-process killing.
+forcibly interrupt arbitrary Python code; the OpenAI hosted-provider adapter
+translates the remaining duration into its per-request SDK timeout. The runtime
+does not claim a forcibly interruptible hard deadline and does not add threads
+or process killing.
 
 The runtime does not guarantee automatic heartbeat, lease renewal, scheduling,
 model cancellation after lease expiry, retries/backoff, provider determinism,
 fault injection, evaluation, campaigns, streaming, telemetry, or sandboxing.
-Those remain Issue #12 or later work. If accepted output persistence fails, the
-failed transaction is rolled back and a fresh fenced transaction attempts to
-record sanitized `run.error` plus an `infra_error` lifecycle transition; invalid
+Those remain later work. If accepted output persistence fails, the failed
+transaction is rolled back and a fresh fenced transaction attempts to record
+sanitized `run.error` plus an `infra_error` lifecycle transition; invalid
 adapter output terminates as `failed`. If PostgreSQL itself is unavailable, no
 system can promise that terminal evidence was recorded, and the public result
 reports `run_not_ready`/`internal_error` without claiming that the Run reached a

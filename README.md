@@ -9,16 +9,17 @@ ChaosAgent is pre-1.0 and under active design.
 
 - **Implemented:** versioned Scenario/Fixture/Policy/Evidence contracts,
   PostgreSQL persistence and leases, isolated synthetic-company state, the four
-  bounded tool contracts with idempotent mutations and approval enforcement, and
-  the provider-neutral deterministic Issue #11 execution runtime.
+  bounded tool contracts with idempotent mutations and approval enforcement, the
+  provider-neutral deterministic execution runtime, and the bounded OpenAI
+  Responses hosted-provider adapter.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
-The execution runtime currently supports only deterministic in-process adapters;
-there is no hosted model adapter, fault engine, evaluator, campaign service, or
-user interface yet.
+The execution runtime supports deterministic in-process adapters and the strict
+Issue #12 OpenAI Responses v0 profile. There is no fault engine, evaluator,
+campaign service, or user interface yet.
 
 ## Why ChaosAgent exists
 
@@ -102,6 +103,11 @@ make check
 ```
 
 ## Repository layout
+
+`packages/agent-configurations` owns the minimal immutable hosted-agent
+configuration contract. `packages/providers-openai` owns the OpenAI Responses
+SDK integration; the provider-neutral runtime does not import the SDK. See
+[`docs/providers/OPENAI_RESPONSES_V0.md`](docs/providers/OPENAI_RESPONSES_V0.md).
 
 ```text
 apps/web/                  TypeScript web-package placeholder

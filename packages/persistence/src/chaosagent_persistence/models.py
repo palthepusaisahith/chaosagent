@@ -155,7 +155,7 @@ class FixtureRevisionModel(Base):
 
 
 class AgentConfigurationRevisionModel(Base):
-    """Immutable identity/digest placeholder until an Agent Configuration contract exists."""
+    """Immutable identity/digest, optionally backed by a v0 canonical document."""
 
     __tablename__ = "agent_configuration_revisions"
     __table_args__ = (
@@ -165,6 +165,18 @@ class AgentConfigurationRevisionModel(Base):
         ),
         CheckConstraint("revision ~ '" + REVISION_CHECK + "'", name="revision_format"),
         CheckConstraint("digest ~ '" + DIGEST_CHECK + "'", name="digest_format"),
+        CheckConstraint(
+            "(schema_version IS NULL AND canonical_document IS NULL) OR "
+            "(schema_version IS NOT NULL AND "
+            "schema_version = 'chaosagent.agent-configuration/v0' AND "
+            "canonical_document IS NOT NULL AND "
+            "jsonb_typeof(canonical_document) IS NOT DISTINCT FROM 'object' AND "
+            "(canonical_document ->> 'schema_version') IS NOT DISTINCT FROM schema_version AND "
+            "(canonical_document ->> 'agent_configuration_id') IS NOT DISTINCT FROM "
+            "agent_configuration_id AND "
+            "(canonical_document ->> 'revision') IS NOT DISTINCT FROM revision)",
+            name="document_projection",
+        ),
         UniqueConstraint(
             "agent_configuration_id",
             "revision",
@@ -177,6 +189,8 @@ class AgentConfigurationRevisionModel(Base):
     agent_configuration_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     revision: Mapped[str] = mapped_column(String(64), primary_key=True)
     digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    schema_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    canonical_document: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )

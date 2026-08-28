@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/agent-configuration/v0/schema.json",
+  "title": "ChaosAgent Agent Configuration v0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "agent_configuration_id",
+    "revision",
+    "provider",
+    "adapter",
+    "model",
+    "compatibility_profile",
+    "token_accounting",
+    "timeout_ms",
+    "max_output_tokens",
+    "temperature",
+    "parallel_tool_calls",
+    "store",
+    "max_retries"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.agent-configuration/v0" },
+    "agent_configuration_id": { "$ref": "#/$defs/id" },
+    "revision": { "$ref": "#/$defs/revision" },
+    "provider": { "const": "openai" },
+    "adapter": {
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "const": "openai-responses" },
+        "version": { "const": "v0" }
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "enum": ["gpt-4.1-2025-04-14", "gpt-4o-2024-08-06"]
+    },
+    "compatibility_profile": {
+      "const": "openai-responses-stateless-non-reasoning/v0"
+    },
+    "token_accounting": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "schedule_id",
+        "revision",
+        "model",
+        "unit",
+        "tokens_per_rate_unit",
+        "rounding",
+        "input_rate_microusd",
+        "cached_input_rate_microusd",
+        "output_rate_microusd"
+      ],
+      "properties": {
+        "schema_version": { "const": "chaosagent.token-accounting/v0" },
+        "schedule_id": { "$ref": "#/$defs/id" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "model": {
+          "enum": ["gpt-4.1-2025-04-14", "gpt-4o-2024-08-06"]
+        },
+        "unit": { "const": "microusd" },
+        "tokens_per_rate_unit": { "const": 1000000 },
+        "rounding": { "const": "ceiling_per_response" },
+        "input_rate_microusd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000000
+        },
+        "cached_input_rate_microusd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000000
+        },
+        "output_rate_microusd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000000
+        }
+      },
+      "additionalProperties": false
+    },
+    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+    "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 2 },
+    "parallel_tool_calls": { "type": "boolean" },
+    "store": { "const": false },
+    "max_retries": { "const": 0 }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$"
+    }
+  }
+}
