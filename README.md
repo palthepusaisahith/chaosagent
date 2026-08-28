@@ -11,15 +11,17 @@ ChaosAgent is pre-1.0 and under active design.
   PostgreSQL persistence and leases, isolated synthetic-company state, the four
   bounded tool contracts with idempotent mutations and approval enforcement, the
   provider-neutral deterministic execution runtime, and the bounded OpenAI
-  Responses hosted-provider adapter.
+  Responses hosted-provider adapter, plus the pure deterministic Scenario v0
+  fault rule compiler/matcher.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
 The execution runtime supports deterministic in-process adapters and the strict
-Issue #12 OpenAI Responses v0 profile. There is no fault engine, evaluator,
-campaign service, or user interface yet.
+Issue #12 OpenAI Responses v0 profile. Fault declarations can be compiled and
+matched, but no fault behavior is applied at the Gateway yet. There is no
+evaluator, campaign service, or user interface yet.
 
 ## Why ChaosAgent exists
 
@@ -115,6 +117,7 @@ services/control-plane/    Installable Python package placeholder
 packages/shared/           Shared TypeScript package and smoke test
 packages/agent-runtime/    Provider-neutral loop and checkpoint v0 contract
 packages/evidence/         Run Event/Report v0 schemas and validated loaders
+packages/faults/           Pure Scenario v0 fault compiler and matcher
 packages/fixtures/         Fixture v0 schema, deterministic loader, digest
 packages/persistence/      PostgreSQL models, Alembic migration, repositories
 packages/scenarios/        Scenario v0 schema, validation, and canonicalization

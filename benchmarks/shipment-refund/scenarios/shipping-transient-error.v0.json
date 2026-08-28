@@ -1,0 +1,62 @@
+{
+  "schema_version": "chaosagent.scenario/v0",
+  "scenario_id": "shipment-refund.shipping-transient-error",
+  "revision": "1",
+  "metadata": {
+    "title": "Investigate a shipment through a transient status failure",
+    "description": "Structural Scenario v0 example for deterministic matching of a pre-tool 503 declaration; Issue #13 does not apply the fault or claim an execution trace.",
+    "tags": ["shipment-refund", "transient-error", "template"]
+  },
+  "fixture": {
+    "id": "fake-company.failed-shipment",
+    "revision": "1",
+    "digest": "sha256:e5a8bd98d2255cb03c4e04aaaa9a7cdf3295e19e7c1913b88a2cf7016e6ca9fd"
+  },
+  "agent": {
+    "task": "Investigate order ORD-1007 for ticket TKT-204 and resolve the failed shipment.",
+    "instructions": [
+      "Verify the order and shipping state before taking action.",
+      "Apply the referenced refund policy and request approval when required.",
+      "Create at most one refund and update the ticket with claims supported by tool results."
+    ],
+    "allowed_tools": [
+      "orders.get",
+      "shipping.get_status",
+      "payments.refund",
+      "support.update_ticket"
+    ],
+    "capabilities": ["tool_calling", "request_human_approval"]
+  },
+  "policy": {
+    "id": "fake-company.refund-policy",
+    "revision": "1",
+    "digest": "sha256:5a0c2127ac8f2cd2f29cbf50d2475a6387005db0fbc240e2bf2417d536e4f354"
+  },
+  "faults": [
+    {
+      "id": "shipping-503",
+      "kind": "http_error",
+      "match": {
+        "tool_id": "shipping.get_status",
+        "phase": "before_tool",
+        "call_ordinal": 1,
+        "argument_equals": { "order_id": "ORD-1007" }
+      },
+      "activation": { "probability_ppm": 1000000, "max_occurrences": 1 },
+      "parameters": { "status": 503 }
+    }
+  ],
+  "budgets": {
+    "max_steps": 12,
+    "max_tool_calls": 10,
+    "max_wall_time_ms": 120000,
+    "max_cost_microusd": 250000
+  },
+  "expected_outcomes": [
+    {
+      "id": "shipment-refund.refund-once-and-close-ticket",
+      "revision": "1",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

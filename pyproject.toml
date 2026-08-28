@@ -23,6 +23,7 @@ build-constraint-dependencies = ["hatchling==1.32.0"]
 members = [
     "packages/agent-configurations",
     "packages/agent-runtime",
+    "packages/faults",
     "packages/providers-openai",
     "packages/evidence",
     "packages/fixtures",
@@ -49,6 +50,7 @@ strict = true
 files = [
     "packages/agent-configurations/src",
     "packages/agent-runtime/src",
+    "packages/faults/src",
     "packages/providers-openai/src",
     "packages/evidence/src",
     "packages/fixtures/src",

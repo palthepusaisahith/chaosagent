@@ -8,6 +8,7 @@ members = [
     "chaosagent-agent-runtime",
     "chaosagent-control-plane",
     "chaosagent-evidence",
+    "chaosagent-faults",
     "chaosagent-fixtures",
     "chaosagent-persistence",
     "chaosagent-policies",
@@ -116,6 +117,21 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+]
+
+[[package]]
+name = "chaosagent-faults"
+version = "0.0.0"
+source = { editable = "packages/faults" }
+dependencies = [
+    { name = "chaosagent-scenarios" },
+    { name = "rfc8785" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "chaosagent-scenarios", editable = "packages/scenarios" },
     { name = "rfc8785", specifier = "==0.1.4" },
 ]
 
