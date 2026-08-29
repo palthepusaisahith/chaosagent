@@ -85,6 +85,7 @@ version = "0.0.0"
 source = { editable = "packages/agent-runtime" }
 dependencies = [
     { name = "chaosagent-evidence" },
+    { name = "chaosagent-faults" },
     { name = "chaosagent-persistence" },
     { name = "chaosagent-tool-gateway" },
     { name = "jsonschema" },
@@ -94,6 +95,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-faults", editable = "packages/faults" },
     { name = "chaosagent-persistence", editable = "packages/persistence" },
     { name = "chaosagent-tool-gateway", editable = "packages/tool-gateway" },
     { name = "jsonschema", specifier = "==4.26.0" },
@@ -230,6 +232,7 @@ version = "0.0.0"
 source = { editable = "packages/tool-gateway" }
 dependencies = [
     { name = "chaosagent-evidence" },
+    { name = "chaosagent-faults" },
     { name = "chaosagent-persistence" },
     { name = "chaosagent-policies" },
     { name = "jsonschema" },
@@ -239,6 +242,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-faults", editable = "packages/faults" },
     { name = "chaosagent-persistence", editable = "packages/persistence" },
     { name = "chaosagent-policies", editable = "packages/policies" },
     { name = "jsonschema", specifier = "==4.26.0" },

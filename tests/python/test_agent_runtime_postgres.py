@@ -26,6 +26,7 @@ from chaosagent_agent_runtime import (
     execute_run,
 )
 from chaosagent_evidence import EvidenceValidationError, digest_payload_v0
+from chaosagent_faults import FaultEngine, compile_fault_plan_v0
 from chaosagent_fixtures import load_fixture
 from chaosagent_persistence import (
     CheckpointConflictError,
@@ -105,6 +106,7 @@ def _create_run(
     budgets: dict[str, int] | None = None,
     worker: str = "worker-runtime",
     agent_configuration: AgentConfiguration | None = None,
+    faults: list[dict[str, object]] | None = None,
 ) -> ClaimedRun:
     run_id = _unique("run")
     scenario_document = cast(
@@ -112,7 +114,7 @@ def _create_run(
     )
     scenario_document["scenario_id"] = _unique("scenario")
     scenario_document["revision"] = "1"
-    scenario_document["faults"] = []
+    scenario_document["faults"] = [] if faults is None else faults
     if budgets is not None:
         scenario_document["budgets"] = budgets
     scenario = loads_scenario(json.dumps(scenario_document))
@@ -499,6 +501,208 @@ def test_deterministic_full_fixture_tool_trajectory(runtime_engine: Engine) -> N
         ]
         assert event_types.count("agent.step") == 5
         assert event_types.count("tool.requested") == 4
+
+
+def test_scripted_runtime_receives_faulted_gateway_observation(runtime_engine: Engine) -> None:
+    claimed = _create_run(
+        runtime_engine,
+        faults=[
+            {
+                "id": "shipping-runtime-503",
+                "kind": "http_error",
+                "match": {
+                    "tool_id": "shipping.get_status",
+                    "phase": "before_tool",
+                    "call_ordinal": 1,
+                },
+                "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+                "parameters": {"status": 503},
+            }
+        ],
+    )
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2026)
+
+    class RecordingAdapter(ScriptedAgentAdapter):
+        contexts: list[AgentContext]
+
+        def __init__(self) -> None:
+            super().__init__(
+                AGENT.id,
+                AGENT.revision,
+                (
+                    _call(
+                        "ship",
+                        "shipping.get_status",
+                        SHIPPING_GET_STATUS_V0,
+                        {"order_id": "ORD-1007"},
+                    ),
+                    AgentOutput(
+                        "Observed a transient shipping failure.", final=True, usage=_usage()
+                    ),
+                ),
+            )
+            self.contexts = []
+
+        def invoke(self, context: AgentContext) -> AgentOutput:
+            self.contexts.append(context)
+            return super().invoke(context)
+
+    adapter = RecordingAdapter()
+    result = execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    assert result.status == "evaluation_ready"
+    assert len(adapter.contexts) == 2
+    tool_turn = cast(dict[str, object], dict(adapter.contexts[1].trajectory[-1]))
+    assert tool_turn["outcome"] == "failed"
+    assert cast(dict[str, object], tool_turn["error"])["code"] == "fault_http_503"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        event_types = [
+            item.event.to_dict()["event_type"]
+            for item in repository.fetch_events(claimed.run.run_id)
+        ]
+        assert event_types.count("fault.matched") == 1
+        assert event_types.count("fault.applied") == 1
+        assert event_types.count("fault.observed") == 1
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        assert checkpoint is not None
+
+
+def test_scripted_runtime_receives_after_tool_faulted_response(runtime_engine: Engine) -> None:
+    claimed = _create_run(
+        runtime_engine,
+        faults=[
+            {
+                "id": "shipping-runtime-stale",
+                "kind": "stale_field",
+                "match": {
+                    "tool_id": "shipping.get_status",
+                    "phase": "after_tool",
+                    "call_ordinal": 1,
+                },
+                "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+                "parameters": {"json_pointer": "/status", "value": "in_transit"},
+            }
+        ],
+    )
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2027)
+
+    class RecordingAdapter(ScriptedAgentAdapter):
+        contexts: list[AgentContext]
+
+        def __init__(self) -> None:
+            super().__init__(
+                AGENT.id,
+                AGENT.revision,
+                (
+                    _call(
+                        "ship",
+                        "shipping.get_status",
+                        SHIPPING_GET_STATUS_V0,
+                        {"order_id": "ORD-1007"},
+                    ),
+                    AgentOutput("Observed a stale shipping status.", final=True, usage=_usage()),
+                ),
+            )
+            self.contexts = []
+
+        def invoke(self, context: AgentContext) -> AgentOutput:
+            self.contexts.append(context)
+            return super().invoke(context)
+
+    adapter = RecordingAdapter()
+    result = execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    assert result.status == "evaluation_ready"
+    tool_turn = cast(dict[str, object], dict(adapter.contexts[1].trajectory[-1]))
+    output = cast(dict[str, object], tool_turn["output"])
+    assert output["status"] == "in_transit"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        shipment = repository.get_company_shipment_for_order(claimed.run.run_id, "ORD-1007")
+        assert shipment is not None and shipment.status == "failed"
+
+
+def test_malformed_response_checkpoint_resumes_without_replaying_fault(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _create_run(
+        runtime_engine,
+        faults=[
+            {
+                "id": "shipping-runtime-malformed",
+                "kind": "malformed_response",
+                "match": {
+                    "tool_id": "shipping.get_status",
+                    "phase": "after_tool",
+                    "call_ordinal": 1,
+                },
+                "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+                "parameters": {"mode": "invalid_json"},
+            }
+        ],
+    )
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2028)
+
+    output = _multi_call(
+        AgentToolCall(
+            "shipping-malformed",
+            "shipping.get_status",
+            SHIPPING_GET_STATUS_V0,
+            {"order_id": "ORD-1007"},
+        ),
+        AgentToolCall("order", "orders.get", ORDERS_GET_V0, {"order_id": "ORD-1007"}),
+    )
+    adapter = _adapter(
+        output, AgentOutput("Recovered malformed observation.", final=True, usage=_usage())
+    )
+    original = ToolGateway.execute
+    calls = 0
+
+    class Crash(BaseException):
+        pass
+
+    def crash_second(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise Crash
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ToolGateway, "execute", crash_second)
+    with pytest.raises(Crash):
+        execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+
+    with Session(runtime_engine) as session:
+        checkpoint = PersistenceRepository(session).get_execution_checkpoint(claimed.run.run_id)
+        assert checkpoint is not None
+        trajectory = cast(list[dict[str, object]], _plain(checkpoint.document["trajectory"]))
+        tool_turn = next(turn for turn in trajectory if turn["kind"] == "tool")
+        assert tool_turn["outcome"] == "failed"
+        assert cast(dict[str, object], tool_turn["error"])["code"] == ("fault_malformed_response")
+
+    resumed = execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    assert resumed.status == "evaluation_ready"
+    with Session(runtime_engine) as session:
+        events = [
+            item.event.to_dict()
+            for item in PersistenceRepository(session).fetch_events(claimed.run.run_id)
+        ]
+        assert sum(item["event_type"] == "fault.applied" for item in events) == 1
+        assert sum(item["event_type"] == "tool.requested" for item in events) == 2
 
 
 def test_two_read_calls_from_one_step_are_ordered_and_checkpointed(

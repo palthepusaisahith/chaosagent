@@ -4,7 +4,7 @@
   "revision": "1",
   "metadata": {
     "title": "Investigate a shipment through a transient status failure",
-    "description": "Structural Scenario v0 example for deterministic matching of a pre-tool 503 declaration; Issue #13 does not apply the fault or claim an execution trace.",
+    "description": "Structural Scenario v0 example for deterministic matching and Issue #14 Gateway application of a pre-tool 503 declaration; it does not claim a stored execution trace.",
     "tags": ["shipment-refund", "transient-error", "template"]
   },
   "fixture": {

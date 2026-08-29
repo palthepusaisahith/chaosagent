@@ -5,6 +5,7 @@ description = "Provider-neutral deterministic execution loop for ChaosAgent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "chaosagent-evidence",
+    "chaosagent-faults",
     "chaosagent-persistence",
     "chaosagent-tool-gateway",
     "jsonschema==4.26.0",
@@ -13,6 +14,7 @@ dependencies = [
 
 [tool.uv.sources]
 chaosagent-evidence = { workspace = true }
+chaosagent-faults = { workspace = true }
 chaosagent-persistence = { workspace = true }
 chaosagent-tool-gateway = { workspace = true }
 

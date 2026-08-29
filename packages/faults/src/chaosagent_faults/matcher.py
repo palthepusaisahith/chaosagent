@@ -206,6 +206,45 @@ def match_fault_plan_v0(
     return tuple(_match_fault_rule_v0(rule, snapshot) for rule in plan.rules)
 
 
+def expected_fault_activation_id_v0(
+    rule: CompiledFaultRule,
+    *,
+    run_seed: int,
+    run_id: str,
+    logical_call_id: str,
+    physical_attempt_id: str,
+    attempt_number: int,
+    call_ordinal: int,
+    arguments_digest: str,
+) -> str | None:
+    """Recompute one Issue #13 activation identity from persisted request facts."""
+    _validate_compiled_rule(rule)
+    for field_name, value in (
+        ("run_id", run_id),
+        ("logical_call_id", logical_call_id),
+        ("physical_attempt_id", physical_attempt_id),
+    ):
+        if not isinstance(value, str) or _ID_RE.fullmatch(value) is None:
+            raise FaultRuleValidationError(f"{field_name} is malformed")
+    _require_nonnegative_integer(run_seed, "run_seed", maximum=_JSON_SAFE_INTEGER_MAX)
+    _require_positive_integer(attempt_number, "attempt_number", maximum=_JSON_SAFE_INTEGER_MAX)
+    _require_positive_integer(call_ordinal, "call_ordinal", maximum=1000)
+    _require_digest(arguments_digest, "arguments_digest")
+    material = _selection_material_values(
+        rule,
+        run_seed=run_seed,
+        run_id=run_id,
+        logical_call_id=logical_call_id,
+        attempt_number=attempt_number,
+        call_ordinal=call_ordinal,
+        arguments_digest=arguments_digest,
+    )
+    if _selection_bucket(material) >= rule.probability_ppm:
+        return None
+    activation_material = material + b"\x00" + physical_attempt_id.encode("utf-8")
+    return f"activation-{hashlib.sha256(activation_material).hexdigest()}"
+
+
 def _match_fault_rule_v0(rule: CompiledFaultRule, context: _FaultMatchSnapshot) -> FaultDecision:
     """Evaluate one trusted compiled rule against one immutable context snapshot."""
     if context.scenario_digest != rule.scenario_digest:
@@ -521,18 +560,39 @@ def _validate_context_values(context: _FaultMatchSnapshot) -> None:
 
 
 def _selection_material(rule: CompiledFaultRule, context: _FaultMatchSnapshot) -> bytes:
+    return _selection_material_values(
+        rule,
+        run_seed=context.run_seed,
+        run_id=context.run_id,
+        logical_call_id=context.logical_call_id,
+        attempt_number=context.attempt_number,
+        call_ordinal=context.call_ordinal,
+        arguments_digest=context.arguments_digest,
+    )
+
+
+def _selection_material_values(
+    rule: CompiledFaultRule,
+    *,
+    run_seed: int,
+    run_id: str,
+    logical_call_id: str,
+    attempt_number: int,
+    call_ordinal: int,
+    arguments_digest: str,
+) -> bytes:
     value: dict[str, JsonValue] = {
         "algorithm": FAULT_MATCHER_V0_ALGORITHM,
-        "run_seed": context.run_seed,
-        "run_id": context.run_id,
-        "scenario_digest": context.scenario_digest,
+        "run_seed": run_seed,
+        "run_id": run_id,
+        "scenario_digest": rule.scenario_digest,
         "fault_id": rule.fault_id,
-        "tool_id": context.tool_id,
-        "phase": context.phase,
-        "logical_call_id": context.logical_call_id,
-        "attempt_number": context.attempt_number,
-        "call_ordinal": context.call_ordinal,
-        "arguments_digest": context.arguments_digest,
+        "tool_id": rule.tool_id,
+        "phase": rule.phase,
+        "logical_call_id": logical_call_id,
+        "attempt_number": attempt_number,
+        "call_ordinal": call_ordinal,
+        "arguments_digest": arguments_digest,
     }
     return rfc8785.dumps(value)
 

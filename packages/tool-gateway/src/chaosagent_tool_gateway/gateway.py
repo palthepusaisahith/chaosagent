@@ -21,6 +21,14 @@ from chaosagent_evidence import (
     RunEvent,
     digest_payload_v0,
     loads_run_event,
+    validate_run_event_stream_v0,
+)
+from chaosagent_faults import (
+    AppliedFault,
+    FaultApplicationError,
+    FaultEngine,
+    FaultRuleValidationError,
+    FaultSelection,
 )
 from chaosagent_persistence import (
     BusinessRuleViolationError,
@@ -61,6 +69,12 @@ type ToolErrorCode = Literal[
     "approval_mismatch",
     "policy_integrity_error",
     "infrastructure_error",
+    "fault_timeout",
+    "fault_http_429",
+    "fault_http_503",
+    "fault_auth_401",
+    "fault_auth_403",
+    "fault_malformed_response",
 ]
 
 TOOL_EVENT_SCHEMA_VERSION = "chaosagent.run-event/v0"
@@ -72,6 +86,7 @@ SUPPORT_UPDATE_TICKET_V0 = "chaosagent.tool/support.update_ticket/v0"
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _CONTRACT_VERSION_RE = re.compile(r"^chaosagent\.tool/[a-z0-9._-]+/v[0-9]+$")
+_ACTIVATION_ID_RE = re.compile(r"^activation-[0-9a-f]{64}$")
 SCENARIO_V0_TOOL_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
         "orders.get": ORDERS_GET_V0,
@@ -105,7 +120,7 @@ class ToolError:
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
-    """Provider-neutral result; output mappings are immutable and flat in v0."""
+    """Provider-neutral result with recursively immutable JSON output."""
 
     tool_id: str
     contract_version: str
@@ -363,6 +378,7 @@ class ToolGateway:
         registry: ToolRegistry | None = None,
         producer_component: str = "tool-gateway",
         producer_instance_id: str | None = None,
+        fault_engine: FaultEngine | None = None,
     ) -> None:
         self._session = session
         self._repository = PersistenceRepository(session)
@@ -371,6 +387,7 @@ class ToolGateway:
         _require_optional_id(producer_instance_id, "producer_instance_id")
         self._producer_component = producer_component
         self._producer_instance_id = producer_instance_id
+        self._fault_engine = fault_engine
 
     def execute(
         self,
@@ -382,6 +399,7 @@ class ToolGateway:
         logical_call_id: object,
         attempt_id: object,
         attempt_number: object = 1,
+        call_ordinal: object | None = None,
         step_id: object | None = None,
         causation_event_id: object | None = None,
         approval_id: object | None = None,
@@ -394,6 +412,7 @@ class ToolGateway:
             logical_call_id,
             attempt_id,
             attempt_number,
+            call_ordinal,
             step_id,
             causation_event_id,
             approval_id,
@@ -413,9 +432,20 @@ class ToolGateway:
         assert isinstance(logical_call_id, str)
         assert isinstance(attempt_id, str)
         assert isinstance(attempt_number, int) and not isinstance(attempt_number, bool)
+        assert call_ordinal is None or (
+            isinstance(call_ordinal, int) and not isinstance(call_ordinal, bool)
+        )
         assert step_id is None or isinstance(step_id, str)
         assert causation_event_id is None or isinstance(causation_event_id, str)
         assert approval_id is None or isinstance(approval_id, str)
+        if self._fault_engine is not None and call_ordinal is None:
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "invalid_request",
+                "fault-aware execution requires an explicit logical call ordinal",
+            )
+        effective_call_ordinal = 1 if call_ordinal is None else call_ordinal
         definition = self._registry.resolve(tool_id, contract_version)
         if definition is None:
             message = (
@@ -470,6 +500,14 @@ class ToolGateway:
                     or scenario_record.scenario.digest != run.scenario.digest
                 ):
                     raise ReferenceNotFoundError("Run Scenario binding does not resolve")
+                if self._fault_engine is not None and (
+                    self._fault_engine.scenario_id != run.scenario.id
+                    or self._fault_engine.scenario_revision != run.scenario.revision
+                    or self._fault_engine.scenario_digest != run.scenario.digest
+                ):
+                    raise PersistenceIntegrityError(
+                        "fault engine does not match the authoritative Run Scenario"
+                    )
                 scenario = scenario_record.scenario.to_dict()
                 agent = cast(dict[str, object], scenario["agent"])
                 if tool_id not in cast(list[str], agent["allowed_tools"]):
@@ -533,12 +571,13 @@ class ToolGateway:
                     idempotency_key_digest = digest_payload_v0(
                         cast(str, arguments_snapshot["idempotency_key"])
                     )
+                arguments_digest = digest_payload_v0(arguments_snapshot)
                 request_payload: dict[str, object] = {
                     "logical_call_id": logical_call_id,
                     "attempt_id": attempt_id,
                     "attempt_number": attempt_number,
                     "tool_id": tool_id,
-                    "arguments_digest": digest_payload_v0(arguments_snapshot),
+                    "arguments_digest": arguments_digest,
                 }
                 if step_id is not None:
                     request_payload["step_id"] = step_id
@@ -591,6 +630,7 @@ class ToolGateway:
                 output: dict[str, object] | None = None
                 tool_error: ToolError | None = None
                 effect: CompanyEffect | None = None
+                applied_faults: list[tuple[AppliedFault, str]] = []
                 effective_approval_id: str | None = None
                 result_causation_event_id = policy_decision_event_id
                 if decision.decision == "deny":
@@ -667,6 +707,47 @@ class ToolGateway:
                         else:
                             assert approval.resolution_event_id is not None
                             result_causation_event_id = approval.resolution_event_id
+                if tool_error is None:
+                    before = self._select_faults(
+                        run_id=run.run_id,
+                        request_event_id=request_event_id,
+                        scenario_digest=run.scenario.digest,
+                        tool_id=tool_id,
+                        phase="before_tool",
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=effective_call_ordinal,
+                        arguments=arguments_snapshot,
+                        arguments_digest=arguments_digest,
+                    )
+                    matched_event_ids = self._record_fault_selection(
+                        run.run_id, request_event_id, logical_call_id, before
+                    )
+                    if before is None:
+                        before_result = None
+                    else:
+                        assert self._fault_engine is not None
+                        before_result = self._fault_engine.apply_before(before)
+                    if before_result is not None:
+                        applied_faults.extend(
+                            self._record_applied_faults(
+                                run.run_id,
+                                request_event_id,
+                                logical_call_id,
+                                before_result.applied,
+                                matched_event_ids,
+                            )
+                        )
+                        if before_result.failure_code is not None:
+                            tool_error = ToolError(
+                                before_result.failure_code,
+                                "tool execution was replaced by a declared fault",
+                            )
+                    try:
+                        self._repository.lock_current_lease(lease)
+                    except (StaleLeaseError, LeaseExpiredError) as error:
+                        raise _LeaseLostDuringExecution from error
                 try:
                     with self._session.begin_nested(), _execute_when_authorized(tool_error):
                         if definition.capability == "read":
@@ -736,6 +817,56 @@ class ToolGateway:
                     tool_error = ToolError(
                         "infrastructure_error", "tool execution failed internally"
                     )
+                if definition.capability == "read" and output is not None and tool_error is None:
+                    try:
+                        self._repository.lock_current_lease(lease)
+                    except (StaleLeaseError, LeaseExpiredError) as error:
+                        raise _LeaseLostDuringExecution from error
+                    after = self._select_faults(
+                        run_id=run.run_id,
+                        request_event_id=request_event_id,
+                        scenario_digest=run.scenario.digest,
+                        tool_id=tool_id,
+                        phase="after_tool",
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=effective_call_ordinal,
+                        arguments=arguments_snapshot,
+                        arguments_digest=arguments_digest,
+                    )
+                    after_matched_event_ids = self._record_fault_selection(
+                        run.run_id, request_event_id, logical_call_id, after
+                    )
+                    if after is None:
+                        after_result = None
+                    else:
+                        assert self._fault_engine is not None
+                        after_result = self._fault_engine.apply_after(after, output)
+                    if after_result is not None:
+                        try:
+                            self._repository.lock_current_lease(lease)
+                        except (StaleLeaseError, LeaseExpiredError) as error:
+                            raise _LeaseLostDuringExecution from error
+                        applied_faults.extend(
+                            self._record_applied_faults(
+                                run.run_id,
+                                request_event_id,
+                                logical_call_id,
+                                after_result.applied,
+                                after_matched_event_ids,
+                            )
+                        )
+                        output = (
+                            None
+                            if after_result.output is None
+                            else cast(dict[str, object], _thaw_json(after_result.output))
+                        )
+                        if after_result.failure_code is not None:
+                            tool_error = ToolError(
+                                after_result.failure_code,
+                                "tool observation was replaced by a declared fault",
+                            )
                 if effect is not None:
                     try:
                         self._repository.lock_current_lease(lease)
@@ -749,14 +880,21 @@ class ToolGateway:
                     "attempt_id": attempt_id,
                     "attempt_number": attempt_number,
                     "tool_id": tool_id,
-                    "outcome": "succeeded" if tool_error is None else "failed",
+                    "outcome": (
+                        "succeeded"
+                        if tool_error is None
+                        else "timed_out"
+                        if tool_error.code == "fault_timeout"
+                        else "failed"
+                    ),
                     "duration_ms": duration_ms,
                 }
                 if output is not None:
                     result_payload["response_digest"] = digest_payload_v0(output)
-                else:
-                    assert tool_error is not None
+                if tool_error is not None:
                     result_payload["error_code"] = tool_error.code
+                if applied_faults:
+                    result_causation_event_id = applied_faults[-1][1]
                 self._append_event(
                     run.run_id,
                     result_event_id,
@@ -765,6 +903,23 @@ class ToolGateway:
                     correlation_id=logical_call_id,
                     causation_event_id=result_causation_event_id,
                 )
+                for applied, applied_event_id in applied_faults:
+                    self._append_event(
+                        run.run_id,
+                        _event_id(),
+                        "fault.observed",
+                        {
+                            "fault_id": applied.rule.fault_id,
+                            "activation_id": applied.activation_id,
+                            "related_event_ids": [
+                                request_event_id,
+                                applied_event_id,
+                                result_event_id,
+                            ],
+                        },
+                        correlation_id=logical_call_id,
+                        causation_event_id=result_event_id,
+                    )
                 state_evidence_event_id: str | None = None
                 if effect is not None and effect.newly_applied:
                     state_evidence_event_id = _event_id()
@@ -789,7 +944,9 @@ class ToolGateway:
                     tool_id=tool_id,
                     contract_version=contract_version,
                     outcome=self._result_outcome(tool_error),
-                    output=None if output is None else MappingProxyType(deepcopy(output)),
+                    output=None
+                    if output is None
+                    else cast(Mapping[str, object], _freeze_json(output)),
                     error=tool_error,
                     request_event_id=request_event_id,
                     result_event_id=result_event_id,
@@ -811,13 +968,306 @@ class ToolGateway:
                 "policy_integrity_error",
                 "the frozen Policy could not be evaluated",
             )
-        except (EvidenceValidationError, PersistenceError, SQLAlchemyError):
+        except (
+            EvidenceValidationError,
+            FaultApplicationError,
+            FaultRuleValidationError,
+            PersistenceError,
+            SQLAlchemyError,
+        ):
             return self._rejected(
                 tool_id,
                 contract_version,
                 "infrastructure_error",
                 "tool evidence could not be persisted",
             )
+
+    def _select_faults(
+        self,
+        *,
+        run_id: str,
+        request_event_id: str,
+        scenario_digest: str,
+        tool_id: str,
+        phase: Literal["before_tool", "after_tool"],
+        logical_call_id: str,
+        attempt_id: str,
+        attempt_number: int,
+        call_ordinal: int,
+        arguments: Mapping[str, object],
+        arguments_digest: str,
+    ) -> FaultSelection | None:
+        if self._fault_engine is None:
+            return None
+        if self._fault_engine.scenario_digest != scenario_digest:
+            raise FaultApplicationError("fault engine does not match the Run Scenario")
+        history = self._authoritative_fault_history(
+            run_id=run_id,
+            scenario_digest=scenario_digest,
+            current_request_event_id=request_event_id,
+        )
+        return self._fault_engine.select(
+            run_id=run_id,
+            scenario_digest=scenario_digest,
+            tool_id=tool_id,
+            phase=phase,
+            logical_call_id=logical_call_id,
+            physical_attempt_id=attempt_id,
+            attempt_number=attempt_number,
+            call_ordinal=call_ordinal,
+            arguments=arguments,
+            arguments_digest=arguments_digest,
+            prior_applied_occurrences=history,
+        )
+
+    def _authoritative_fault_history(
+        self,
+        *,
+        run_id: str,
+        scenario_digest: str,
+        current_request_event_id: str,
+    ) -> dict[str, int]:
+        """Authenticate complete committed fault chains before counting them."""
+        assert self._fault_engine is not None
+        if self._fault_engine.scenario_digest != scenario_digest:
+            raise PersistenceIntegrityError("fault history has the wrong Scenario digest")
+        records = self._repository.fetch_events(run_id)
+        events = tuple(record.event for record in records)
+        documents = [event.to_dict() for event in events]
+        if events:
+            try:
+                validate_run_event_stream_v0(documents, complete=True)
+            except EvidenceValidationError as error:
+                raise PersistenceIntegrityError("Run Event history is incoherent") from error
+        by_id = {cast(str, item["event_id"]): item for item in documents}
+        rules = {rule.fault_id: rule for rule in self._fault_engine.rules}
+        history = {fault_id: 0 for fault_id in rules}
+        matched_activations: dict[str, str] = {}
+        applied_activations: set[str] = set()
+
+        for document in documents:
+            if document["event_type"] != "fault.matched":
+                continue
+            payload = cast(dict[str, object], document["payload"])
+            related = cast(list[str], payload["related_event_ids"])
+            if current_request_event_id in related:
+                continue
+            fault_id = cast(str, payload["fault_id"])
+            activation_id = cast(str, payload["activation_id"])
+            rule = rules.get(fault_id)
+            request = by_id.get(related[0]) if len(related) == 1 else None
+            if (
+                rule is None
+                or rule.scenario_digest != scenario_digest
+                or rule.phase == "after_commit"
+                or _ACTIVATION_ID_RE.fullmatch(activation_id) is None
+                or activation_id in matched_activations
+                or request is None
+                or request["event_type"] != "tool.requested"
+                or document.get("causation_event_id") != request["event_id"]
+                or document["correlation_id"] != request["correlation_id"]
+                or document["producer"] != request["producer"]
+                or cast(dict[str, object], document["producer"])["component"]
+                != self._producer_component
+            ):
+                raise PersistenceIntegrityError("fault.matched history is incoherent")
+            request_payload = cast(dict[str, object], request["payload"])
+            if (
+                request["run_id"] != run_id
+                or request["correlation_id"] != request_payload["logical_call_id"]
+                or request_payload["tool_id"] != rule.tool_id
+                or not self._fault_engine.authenticates_activation(
+                    rule,
+                    run_id=run_id,
+                    logical_call_id=cast(str, request_payload["logical_call_id"]),
+                    physical_attempt_id=cast(str, request_payload["attempt_id"]),
+                    attempt_number=cast(int, request_payload["attempt_number"]),
+                    arguments_digest=cast(str, request_payload["arguments_digest"]),
+                    activation_id=activation_id,
+                )
+                or cast(int, request["sequence"]) >= cast(int, document["sequence"])
+            ):
+                raise PersistenceIntegrityError("fault.matched request binding is incoherent")
+            matched_activations[activation_id] = cast(str, document["event_id"])
+
+        for document in documents:
+            if document["event_type"] != "fault.applied":
+                continue
+            payload = cast(dict[str, object], document["payload"])
+            related = cast(list[str], payload["related_event_ids"])
+            if current_request_event_id in related:
+                continue
+            fault_id = cast(str, payload["fault_id"])
+            activation_id = cast(str, payload["activation_id"])
+            rule = rules.get(fault_id)
+            matched_id = matched_activations.get(activation_id)
+            matched = by_id.get(matched_id) if matched_id is not None else None
+            request_ids = [
+                item
+                for item in related
+                if (candidate := by_id.get(item)) is not None
+                and candidate["event_type"] == "tool.requested"
+            ]
+            if (
+                rule is None
+                or matched is None
+                or activation_id in applied_activations
+                or matched_id not in related
+                or len(request_ids) != 1
+                or set(related) != {request_ids[0], matched_id}
+                or document.get("causation_event_id") != matched_id
+                or document["correlation_id"] != matched["correlation_id"]
+                or document["producer"] != matched["producer"]
+            ):
+                raise PersistenceIntegrityError("fault.applied history is incoherent")
+            matched_payload = cast(dict[str, object], matched["payload"])
+            if (
+                matched_payload["fault_id"] != fault_id
+                or matched_payload["activation_id"] != activation_id
+                or set(cast(list[str], matched_payload["related_event_ids"])) != {request_ids[0]}
+                or cast(int, matched["sequence"]) >= cast(int, document["sequence"])
+            ):
+                raise PersistenceIntegrityError("fault application identity is incoherent")
+            request = by_id[request_ids[0]]
+            result_candidates = [
+                item
+                for item in documents
+                if item["event_type"] == "tool.result"
+                and cast(dict[str, object], item["payload"])["request_event_id"]
+                == request["event_id"]
+            ]
+            observed_candidates = [
+                item
+                for item in documents
+                if item["event_type"] == "fault.observed"
+                and cast(dict[str, object], item["payload"])["activation_id"] == activation_id
+            ]
+            if len(result_candidates) != 1 or len(observed_candidates) != 1:
+                raise PersistenceIntegrityError("fault application has no unique observed result")
+            result = result_candidates[0]
+            observed = observed_candidates[0]
+            result_payload = cast(dict[str, object], result["payload"])
+            observed_payload = cast(dict[str, object], observed["payload"])
+            request_payload = cast(dict[str, object], request["payload"])
+            request_applications = [
+                item
+                for item in documents
+                if item["event_type"] == "fault.applied"
+                and request_ids[0]
+                in cast(list[str], cast(dict[str, object], item["payload"])["related_event_ids"])
+            ]
+            last_application = max(
+                request_applications, key=lambda item: cast(int, item["sequence"])
+            )
+            if (
+                result_payload["logical_call_id"] != request_payload["logical_call_id"]
+                or result_payload["attempt_id"] != request_payload["attempt_id"]
+                or result_payload["attempt_number"] != request_payload["attempt_number"]
+                or result_payload["tool_id"] != request_payload["tool_id"]
+                or observed_payload["fault_id"] != fault_id
+                or set(cast(list[str], observed_payload["related_event_ids"]))
+                != {
+                    cast(str, request["event_id"]),
+                    cast(str, document["event_id"]),
+                    cast(str, result["event_id"]),
+                }
+                or observed.get("causation_event_id") != result["event_id"]
+                or observed["correlation_id"] != request["correlation_id"]
+                or observed["producer"] != request["producer"]
+                or result.get("causation_event_id") != last_application["event_id"]
+                or result["correlation_id"] != request["correlation_id"]
+                or result["producer"] != request["producer"]
+                or not (
+                    cast(int, document["sequence"])
+                    < cast(int, result["sequence"])
+                    < cast(int, observed["sequence"])
+                )
+            ):
+                raise PersistenceIntegrityError("fault observation history is incoherent")
+            applied_activations.add(activation_id)
+            history[fault_id] += 1
+
+        for document in documents:
+            if document["event_type"] != "fault.observed":
+                continue
+            payload = cast(dict[str, object], document["payload"])
+            if current_request_event_id in cast(list[str], payload["related_event_ids"]):
+                continue
+            if cast(str, payload["activation_id"]) not in applied_activations:
+                raise PersistenceIntegrityError("fault.observed has no authoritative application")
+        return history
+
+    def _record_fault_selection(
+        self,
+        run_id: str,
+        request_event_id: str,
+        logical_call_id: str,
+        selection: FaultSelection | None,
+    ) -> dict[str, str]:
+        if selection is None:
+            return {}
+        for decision in selection.reportable_not_matched:
+            self._append_event(
+                run_id,
+                _event_id(),
+                "fault.not_matched",
+                {"fault_id": decision.fault_id, "reason_code": decision.reason},
+                correlation_id=logical_call_id,
+                causation_event_id=request_event_id,
+            )
+        matched_event_ids: dict[str, str] = {}
+        for rule in selection.matched_rules:
+            activation_ids = [
+                item.activation_id
+                for item in selection.decisions
+                if item.matched and item.fault_id == rule.fault_id
+            ]
+            if len(activation_ids) != 1 or activation_ids[0] is None:
+                raise FaultApplicationError("matched fault has no unique activation identity")
+            event_id = _event_id()
+            self._append_event(
+                run_id,
+                event_id,
+                "fault.matched",
+                {
+                    "fault_id": rule.fault_id,
+                    "activation_id": activation_ids[0],
+                    "related_event_ids": [request_event_id],
+                },
+                correlation_id=logical_call_id,
+                causation_event_id=request_event_id,
+            )
+            matched_event_ids[rule.fault_id] = event_id
+        return matched_event_ids
+
+    def _record_applied_faults(
+        self,
+        run_id: str,
+        request_event_id: str,
+        logical_call_id: str,
+        applied: tuple[AppliedFault, ...],
+        matched_event_ids: Mapping[str, str],
+    ) -> list[tuple[AppliedFault, str]]:
+        records: list[tuple[AppliedFault, str]] = []
+        for item in applied:
+            matched_event_id = matched_event_ids.get(item.rule.fault_id)
+            if matched_event_id is None:
+                raise FaultApplicationError("applied fault has no matched evidence")
+            event_id = _event_id()
+            self._append_event(
+                run_id,
+                event_id,
+                "fault.applied",
+                {
+                    "fault_id": item.rule.fault_id,
+                    "activation_id": item.activation_id,
+                    "related_event_ids": [request_event_id, matched_event_id],
+                },
+                correlation_id=logical_call_id,
+                causation_event_id=matched_event_id,
+            )
+            records.append((item, event_id))
+        return records
 
     def _apply_mutation_intent(
         self,
@@ -894,6 +1344,10 @@ class ToolGateway:
             "tool.result",
             "state.evidence_recorded",
             "policy.decision",
+            "fault.not_matched",
+            "fault.matched",
+            "fault.applied",
+            "fault.observed",
         ],
         payload: dict[str, object],
         *,
@@ -981,6 +1435,7 @@ def _validate_call_fields(
     logical_call_id: object,
     attempt_id: object,
     attempt_number: object,
+    call_ordinal: object,
     step_id: object | None,
     causation_event_id: object | None,
     approval_id: object | None,
@@ -1014,12 +1469,19 @@ def _validate_call_fields(
     ):
         if value is not None and (not isinstance(value, str) or _ID_RE.fullmatch(value) is None):
             return f"{name} is malformed"
-    if (
-        isinstance(attempt_number, bool)
-        or not isinstance(attempt_number, int)
-        or not 1 <= attempt_number <= 9_007_199_254_740_991
+    for name, value in (("attempt_number", attempt_number),):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 9_007_199_254_740_991
+        ):
+            return f"{name} must be a positive JSON safe integer"
+    if call_ordinal is not None and (
+        isinstance(call_ordinal, bool)
+        or not isinstance(call_ordinal, int)
+        or not 1 <= call_ordinal <= 9_007_199_254_740_991
     ):
-        return "attempt_number must be a positive JSON safe integer"
+        return "call_ordinal must be a positive JSON safe integer"
     return None
 
 

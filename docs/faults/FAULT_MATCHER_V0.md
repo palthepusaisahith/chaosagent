@@ -6,11 +6,11 @@ for declarations already frozen by Scenario v0. The implementation is in
 provider, clock, or persistence dependency.
 
 This is the boundary approved by the architecture backlog. Transport and data
-fault application belongs to Issue #14. Ambiguous post-commit execution belongs
-to Issue #15. Consequently Issue #13 does **not** invoke tools, change tool
-results, sleep, mutate synthetic state, reserve idempotency effects, or emit
-`fault.*` evidence. The shipment/refund and shipping-503 files are structural
-Scenario examples, not execution traces.
+fault application is defined separately in `FAULT_APPLICATION_V0.md`. Ambiguous
+post-commit execution belongs to Issue #15. Consequently Issue #13 does **not**
+invoke tools, change tool results, sleep, mutate synthetic state, reserve
+idempotency effects, or emit `fault.*` evidence. The shipment/refund and
+shipping-503 files are structural Scenario examples, not execution traces.
 
 ## Compilation
 

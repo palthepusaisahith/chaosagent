@@ -20,6 +20,7 @@ from chaosagent_evidence import (
     digest_payload_v0,
     loads_run_event,
 )
+from chaosagent_faults import FaultEngine
 from chaosagent_persistence import (
     CheckpointConflictError,
     ExecutionCheckpointRecord,
@@ -250,6 +251,7 @@ def execute_run(
     *,
     registry: ToolRegistry | None = None,
     producer_component: str = "agent-runtime",
+    fault_engine: FaultEngine | None = None,
 ) -> ExecutionResult:
     """Execute one leased Run until evaluation-ready, approval wait, or failure."""
     tool_registry = registry or default_tool_registry()
@@ -275,7 +277,13 @@ def execute_run(
         checkpoint = state.checkpoint
         if checkpoint is not None and cast(list[object], checkpoint["pending_tool_calls"]):
             result = _dispatch_pending(
-                engine, lease, adapter, tool_registry, state, producer_component
+                engine,
+                lease,
+                adapter,
+                tool_registry,
+                state,
+                producer_component,
+                fault_engine,
             )
             if result is not None:
                 return result
@@ -895,7 +903,7 @@ def _tool_result_matches_checkpoint(
             and result_payload.get("response_digest") == digest_payload_v0(turn["output"])
             and "error_code" not in result_payload
         )
-    if not isinstance(error, dict) or turn["output"] is not None:
+    if not isinstance(error, dict):
         return False
     code = error.get("code")
     denied_codes = {
@@ -906,12 +914,20 @@ def _tool_result_matches_checkpoint(
         "approval_denied",
         "approval_mismatch",
     }
-    expected_outcome = "denied" if code in denied_codes else "failed"
+    expected_checkpoint_outcome = "denied" if code in denied_codes else "failed"
+    expected_event_outcome = "timed_out" if code == "fault_timeout" else "failed"
+    output = turn["output"]
+    response_matches = (
+        "response_digest" not in result_payload
+        if output is None
+        else isinstance(output, dict)
+        and result_payload.get("response_digest") == digest_payload_v0(output)
+    )
     return (
-        result_payload["outcome"] == "failed"
-        and turn["outcome"] == expected_outcome
+        result_payload["outcome"] == expected_event_outcome
+        and turn["outcome"] == expected_checkpoint_outcome
         and result_payload.get("error_code") == code
-        and "response_digest" not in result_payload
+        and response_matches
     )
 
 
@@ -937,16 +953,102 @@ def _tool_causation_is_valid(
         return False
     cause_id = result.get("causation_event_id")
     if "approval_id" not in turn:
-        return cause_id == policy_events[0]["event_id"]
-    approval_id = turn["approval_id"]
-    expected_type = "approval.requested" if _is_approval_wait(turn) else "approval.resolved"
-    return any(
-        event["event_id"] == cause_id
-        and event["event_type"] == expected_type
-        and cast(dict[str, object], event["payload"]).get("approval_id") == approval_id
-        and cast(int, event["sequence"]) < cast(int, result["sequence"])
+        expected_base_cause = policy_events[0]["event_id"]
+    else:
+        approval_id = turn["approval_id"]
+        expected_type = "approval.requested" if _is_approval_wait(turn) else "approval.resolved"
+        approval_causes = [
+            event
+            for event in documents
+            if event["event_type"] == expected_type
+            and cast(dict[str, object], event["payload"]).get("approval_id") == approval_id
+            and cast(int, event["sequence"]) < cast(int, result["sequence"])
+        ]
+        if len(approval_causes) != 1:
+            return False
+        expected_base_cause = approval_causes[0]["event_id"]
+    if cause_id == expected_base_cause:
+        return True
+    return _fault_causation_is_valid(request, result, documents, turn)
+
+
+def _fault_causation_is_valid(
+    request: dict[str, object],
+    result: dict[str, object],
+    documents: Sequence[dict[str, object]],
+    turn: dict[str, object],
+) -> bool:
+    request_id = cast(str, request["event_id"])
+    result_id = cast(str, result["event_id"])
+    logical_id = turn["logical_call_id"]
+    request_sequence = cast(int, request["sequence"])
+    result_sequence = cast(int, result["sequence"])
+    relevant = [
+        event
         for event in documents
-    )
+        if event.get("correlation_id") == logical_id
+        and event["event_type"]
+        in {"fault.not_matched", "fault.matched", "fault.applied", "fault.observed"}
+        and (
+            event.get("causation_event_id") in {request_id, result_id}
+            or request_id
+            in cast(
+                list[object], cast(dict[str, object], event["payload"]).get("related_event_ids", [])
+            )
+        )
+    ]
+    by_id = {cast(str, event["event_id"]): event for event in relevant}
+    matched = [event for event in relevant if event["event_type"] == "fault.matched"]
+    applied = [event for event in relevant if event["event_type"] == "fault.applied"]
+    observed = [event for event in relevant if event["event_type"] == "fault.observed"]
+    not_matched = [event for event in relevant if event["event_type"] == "fault.not_matched"]
+    if (
+        not applied
+        or result.get("causation_event_id")
+        != max(applied, key=lambda event: cast(int, event["sequence"]))["event_id"]
+    ):
+        return False
+    if any(
+        event.get("causation_event_id") != request_id
+        or not request_sequence < cast(int, event["sequence"]) < result_sequence
+        for event in matched + not_matched
+    ):
+        return False
+    for application in applied:
+        payload = cast(dict[str, object], application["payload"])
+        matched_event = by_id.get(cast(str, application.get("causation_event_id")))
+        if matched_event is None or matched_event["event_type"] != "fault.matched":
+            return False
+        matched_payload = cast(dict[str, object], matched_event["payload"])
+        related = payload.get("related_event_ids")
+        if (
+            not isinstance(related, list)
+            or not request_sequence < cast(int, application["sequence"]) < result_sequence
+            or payload.get("fault_id") != matched_payload.get("fault_id")
+            or payload.get("activation_id") != matched_payload.get("activation_id")
+            or set(cast(list[str], related)) != {request_id, matched_event["event_id"]}
+        ):
+            return False
+        matching_observed = [
+            event
+            for event in observed
+            if event.get("causation_event_id") == result_id
+            and cast(dict[str, object], event["payload"]).get("fault_id") == payload.get("fault_id")
+            and cast(dict[str, object], event["payload"]).get("activation_id")
+            == payload.get("activation_id")
+        ]
+        if len(matching_observed) != 1:
+            return False
+        observed_payload = cast(dict[str, object], matching_observed[0]["payload"])
+        observed_related = observed_payload.get("related_event_ids")
+        if (
+            not isinstance(observed_related, list)
+            or cast(int, matching_observed[0]["sequence"]) <= result_sequence
+            or set(cast(list[str], observed_related))
+            != {request_id, application["event_id"], result_id}
+        ):
+            return False
+    return len(observed) == len(applied)
 
 
 def _agent_context_from_trajectory(
@@ -1319,6 +1421,7 @@ def _dispatch_pending(
     registry: ToolRegistry,
     state: _State,
     producer_component: str,
+    fault_engine: FaultEngine | None,
 ) -> ExecutionResult | None:
     checkpoint = state.checkpoint
     assert checkpoint is not None
@@ -1350,6 +1453,7 @@ def _dispatch_pending(
                 registry=registry,
                 producer_component="tool-gateway",
                 producer_instance_id=lease.worker_id,
+                fault_engine=fault_engine,
             )
             result = gateway.execute(
                 lease,
@@ -1359,6 +1463,7 @@ def _dispatch_pending(
                 logical_call_id=call["logical_call_id"],
                 attempt_id=attempt_id,
                 attempt_number=attempt_number,
+                call_ordinal=_logical_call_ordinal(checkpoint, cast(str, call["logical_call_id"])),
                 step_id=call["step_id"],
                 causation_event_id=_identity(
                     "event-agent",
@@ -1476,6 +1581,21 @@ def _checkpoint_after_tool(
         cast(int, updated["active_wall_time_ms"]), elapsed_ms, "active wall time"
     )
     return updated
+
+
+def _logical_call_ordinal(checkpoint: dict[str, object], logical_call_id: str) -> int:
+    """Return the stable one-based ordinal of a logical call across physical attempts."""
+    seen: list[str] = []
+    for item in cast(list[object], checkpoint["trajectory"]):
+        turn = cast(dict[str, object], item)
+        if turn.get("kind") != "tool":
+            continue
+        existing = cast(str, turn["logical_call_id"])
+        if existing not in seen:
+            seen.append(existing)
+    if logical_call_id in seen:
+        return seen.index(logical_call_id) + 1
+    return len(seen) + 1
 
 
 def _terminate(

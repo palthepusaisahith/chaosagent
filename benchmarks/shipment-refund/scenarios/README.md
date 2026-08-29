@@ -6,3 +6,7 @@ Fixture v0 document in `../fixtures`.
 Its policy reference resolves to the committed Policy v0 document in
 `../policies`. The expected-outcome reference still uses an all-zero SHA-256
 sentinel and does not claim that deferred content exists or was verified.
+
+`shipping-transient-error.v0.json` is the structural Issue #14 pre-tool 503
+example. Execution requires an explicitly compiled/selected fault plan and run
+seed; merely storing the Scenario does not activate a Campaign.
