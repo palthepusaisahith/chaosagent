@@ -109,3 +109,7 @@ provider/network chaos, or worker daemons.
 Issue #15 owns committed-effect acknowledgement ambiguity, including
 `ambiguous_post_commit_timeout`. Campaign selection/seeds, automatic retry and
 backoff, evaluators, reports, telemetry, streaming, and UI remain deferred.
+
+Issue #15's committed-effect boundary, recovery marker, and exact evidence
+ordering are specified in
+[POST_COMMIT_AMBIGUITY_V0.md](POST_COMMIT_AMBIGUITY_V0.md).

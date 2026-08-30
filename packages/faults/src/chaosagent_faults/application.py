@@ -116,6 +116,10 @@ class FaultEngine:
         _validate_plan(self._plan)
         return self._plan.rules
 
+    def has_after_commit_rule(self, tool_id: str) -> bool:
+        """Return whether the frozen plan can target this tool after commit."""
+        return any(rule.tool_id == tool_id and rule.phase == "after_commit" for rule in self.rules)
+
     def authenticates_activation(
         self,
         rule: CompiledFaultRule,
@@ -126,9 +130,16 @@ class FaultEngine:
         attempt_number: int,
         arguments_digest: str,
         activation_id: str,
+        call_ordinal: int | None = None,
     ) -> bool:
         """Verify history using Issue #13's exact activation identity material."""
-        ordinals = (rule.call_ordinal,) if rule.call_ordinal is not None else tuple(range(1, 1001))
+        ordinals = (
+            (call_ordinal,)
+            if call_ordinal is not None
+            else (rule.call_ordinal,)
+            if rule.call_ordinal is not None
+            else tuple(range(1, 1001))
+        )
         matches = 0
         for call_ordinal in ordinals:
             expected = expected_fault_activation_id_v0(
@@ -272,6 +283,18 @@ class FaultEngine:
         frozen = None if observed is None else cast(Mapping[str, object], _freeze_json(observed))
         return FaultApplicationResult(tuple(applied), frozen, failure)
 
+    def apply_post_commit(self, selection: FaultSelection) -> FaultApplicationResult:
+        """Replace only the acknowledgement of an already-established mutation."""
+        self._validate_selection(selection)
+        applied: list[AppliedFault] = []
+        for rule in selection.matched_rules:
+            _validate_parameters(rule)
+            if rule.kind != "ambiguous_post_commit_timeout" or rule.phase != "after_commit":
+                raise FaultApplicationError("unsupported after_commit fault directive")
+            if not applied:
+                applied.append(AppliedFault(rule, _activation_id(selection, rule)))
+        return FaultApplicationResult(tuple(applied), None, "fault_timeout" if applied else None)
+
     def _validate_selection(self, selection: FaultSelection) -> None:
         if not isinstance(selection, FaultSelection):
             raise FaultApplicationError("fault selection is malformed")
@@ -360,7 +383,7 @@ def _failure_code(rule: CompiledFaultRule) -> FaultFailureCode:
 
 def _validate_parameters(rule: CompiledFaultRule) -> None:
     parameters = rule.parameters
-    if rule.kind in {"delay", "timeout"}:
+    if rule.kind in {"delay", "timeout", "ambiguous_post_commit_timeout"}:
         if set(parameters) != {"duration_ms"}:
             raise FaultApplicationError("duration fault parameters are malformed")
         value = parameters["duration_ms"]

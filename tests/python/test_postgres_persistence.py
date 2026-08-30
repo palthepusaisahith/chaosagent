@@ -313,6 +313,7 @@ def test_migration_up_down_and_model_metadata_match(migrated_engine: Engine) -> 
         "company_support_tickets",
         "fixture_revisions",
         "policy_revisions",
+        "post_commit_acknowledgements",
         "run_company_state",
         "run_events",
         "run_reports",

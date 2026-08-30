@@ -631,6 +631,248 @@ def test_scripted_runtime_receives_after_tool_faulted_response(runtime_engine: E
         assert shipment is not None and shipment.status == "failed"
 
 
+def test_scripted_runtime_retries_ambiguous_refund_and_observes_already_applied(
+    runtime_engine: Engine,
+) -> None:
+    claimed = _create_run(
+        runtime_engine,
+        faults=[
+            {
+                "id": "refund-runtime-ambiguous",
+                "kind": "ambiguous_post_commit_timeout",
+                "match": {"tool_id": "payments.refund", "phase": "after_commit"},
+                "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+                "parameters": {"duration_ms": 25},
+            }
+        ],
+    )
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2029)
+
+    arguments = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 5000,
+        "reason": "Shipment failed",
+        "idempotency_key": "runtime-ambiguous-refund",
+    }
+
+    class RecordingAdapter(ScriptedAgentAdapter):
+        contexts: list[AgentContext]
+
+        def __init__(self) -> None:
+            super().__init__(
+                AGENT.id,
+                AGENT.revision,
+                (
+                    _call("refund-first", "payments.refund", PAYMENTS_REFUND_V0, arguments),
+                    _call("refund-retry", "payments.refund", PAYMENTS_REFUND_V0, arguments),
+                    AgentOutput("Refund confirmed exactly once.", final=True, usage=_usage()),
+                ),
+            )
+            self.contexts = []
+
+        def invoke(self, context: AgentContext) -> AgentOutput:
+            self.contexts.append(context)
+            return super().invoke(context)
+
+    adapter = RecordingAdapter()
+    result = execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    assert result.status == "evaluation_ready"
+    first_turn = cast(dict[str, object], dict(adapter.contexts[1].trajectory[-1]))
+    second_turn = cast(dict[str, object], dict(adapter.contexts[2].trajectory[-1]))
+    assert cast(dict[str, object], first_turn["error"])["code"] == "fault_timeout"
+    assert first_turn["output"] is None
+    assert cast(dict[str, object], second_turn["output"])["application"] == "already_applied"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+        assert state is not None and len(state.refunds) == 1
+        assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 1
+        assert sum(event["event_type"] == "fault.applied" for event in events) == 1
+
+
+def test_runtime_recovers_completed_ambiguity_after_checkpoint_crash_and_reclaim(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    faults: list[dict[str, object]] = [
+        {
+            "id": "refund-completed-before-checkpoint",
+            "kind": "ambiguous_post_commit_timeout",
+            "match": {"tool_id": "payments.refund", "phase": "after_commit"},
+            "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+            "parameters": {"duration_ms": 25},
+        }
+    ]
+    claimed = _create_run(runtime_engine, faults=faults)
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        scenario = scenario_record.scenario
+    arguments = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 5000,
+        "reason": "Shipment failed",
+        "idempotency_key": "runtime-completed-before-checkpoint",
+    }
+    outputs = (
+        _call("refund", "payments.refund", PAYMENTS_REFUND_V0, arguments),
+        AgentOutput("Recovered ambiguity.", final=True, usage=_usage()),
+    )
+    original_store = PersistenceRepository._store_execution_checkpoint
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_completed_acknowledgement(
+        repository: PersistenceRepository,
+        lease: LeaseIdentity,
+        document: Mapping[str, object],
+        *,
+        expected_version: int,
+    ) -> ExecutionCheckpointRecord:
+        trajectory = cast(list[dict[str, object]], document["trajectory"])
+        if trajectory and trajectory[-1]["kind"] == "tool":
+            raise SimulatedProcessCrash
+        return original_store(repository, lease, document, expected_version=expected_version)
+
+    monkeypatch.setattr(
+        PersistenceRepository, "_store_execution_checkpoint", crash_after_completed_acknowledgement
+    )
+    with pytest.raises(SimulatedProcessCrash):
+        execute_run(
+            runtime_engine,
+            claimed.lease,
+            ScriptedAgentAdapter(AGENT.id, AGENT.revision, outputs),
+            fault_engine=FaultEngine(compile_fault_plan_v0(scenario), run_seed=2031),
+        )
+    monkeypatch.undo()
+
+    with Session(runtime_engine) as session, session.begin():
+        session.execute(
+            text(
+                "UPDATE public.runs SET heartbeat_at = "
+                "clock_timestamp() - interval '2 seconds', lease_expires_at = "
+                "clock_timestamp() - interval '1 second' WHERE run_id = :run_id"
+            ),
+            {"run_id": claimed.run.run_id},
+        )
+    with Session(runtime_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        current = repository.get_run(claimed.run.run_id)
+        assert current is not None
+        repository.requeue_expired_run(
+            claimed.run.run_id,
+            expected_version=current.lifecycle_version,
+            evidence=_evidence("completed-checkpoint-requeue"),
+        )
+        replacement = repository.claim_next_run(
+            "fresh-runtime-worker",
+            lease_duration_seconds=600,
+            evidence=_evidence("completed-checkpoint-reclaim"),
+            run_id=claimed.run.run_id,
+        )
+        assert replacement is not None
+
+    recovered = execute_run(
+        runtime_engine,
+        replacement.lease,
+        ScriptedAgentAdapter(AGENT.id, AGENT.revision, outputs),
+        fault_engine=FaultEngine(compile_fault_plan_v0(scenario), run_seed=2031),
+    )
+    assert recovered.status == "evaluation_ready"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        assert state is not None and len(state.refunds) == 1
+        assert checkpoint is not None and checkpoint.checkpoint_version >= 3
+        assert sum(item["event_type"] == "state.evidence_recorded" for item in events) == 1
+        assert sum(item["event_type"] == "fault.matched" for item in events) == 1
+        assert sum(item["event_type"] == "fault.applied" for item in events) == 1
+        assert sum(item["event_type"] == "fault.observed" for item in events) == 1
+
+
+def test_runtime_recovers_markerless_approval_result_after_checkpoint_crash(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _create_run(
+        runtime_engine,
+        faults=[
+            {
+                "id": "refund-approval-ambiguity-plan",
+                "kind": "ambiguous_post_commit_timeout",
+                "match": {"tool_id": "payments.refund", "phase": "after_commit"},
+                "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+                "parameters": {"duration_ms": 25},
+            }
+        ],
+    )
+    with Session(runtime_engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2030)
+    arguments = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 6000,
+        "reason": "Shipment failed",
+        "idempotency_key": "runtime-markerless-approval",
+    }
+    adapter = _adapter(_call("refund", "payments.refund", PAYMENTS_REFUND_V0, arguments))
+    original = PersistenceRepository._store_execution_checkpoint
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_gateway(
+        repository: PersistenceRepository,
+        lease: LeaseIdentity,
+        document: Mapping[str, object],
+        *,
+        expected_version: int,
+    ) -> ExecutionCheckpointRecord:
+        trajectory = cast(list[dict[str, object]], document["trajectory"])
+        if trajectory and trajectory[-1]["kind"] == "tool":
+            raise SimulatedProcessCrash
+        return original(repository, lease, document, expected_version=expected_version)
+
+    monkeypatch.setattr(PersistenceRepository, "_store_execution_checkpoint", crash_after_gateway)
+    with pytest.raises(SimulatedProcessCrash):
+        execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    monkeypatch.undo()
+
+    recovered = execute_run(runtime_engine, claimed.lease, adapter, fault_engine=fault_engine)
+    assert recovered.status == "waiting_for_approval"
+    assert recovered.approval_id is not None
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        assert state is not None and state.refunds == ()
+        assert checkpoint is not None
+        requests = [event for event in events if event["event_type"] == "tool.requested"]
+        results = [event for event in events if event["event_type"] == "tool.result"]
+        assert len(requests) == len(results) == 2
+        assert (
+            len({cast(dict[str, object], event["payload"])["attempt_id"] for event in requests})
+            == 2
+        )
+        assert sum(event["event_type"] == "approval.requested" for event in events) == 1
+
+
 def test_malformed_response_checkpoint_resumes_without_replaying_fault(
     runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2279,6 +2521,88 @@ def test_rewritten_checkpoint_boundary_cannot_hide_later_tool_evidence(
         )
 
     _assert_corruption_stops_before_progress(runtime_engine, claimed)
+
+
+def test_corrupt_pending_read_never_enters_mutation_recovery_or_leaks_keyerror(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _checkpoint_after_one_tool(runtime_engine, cost=10)
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        scenario_record = repository.get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        events = repository.fetch_events(claimed.run.run_id)
+        assert checkpoint is not None and scenario_record is not None
+        document = cast(dict[str, object], _plain(checkpoint.document))
+
+    trajectory = cast(list[dict[str, object]], document["trajectory"])
+    assistant = trajectory[0]
+    original_call = cast(list[dict[str, object]], assistant["tool_calls"])[0]
+    agent_event = next(
+        record.event.to_dict()
+        for record in events
+        if record.event.to_dict()["event_type"] == "agent.step"
+    )
+    document["trajectory"] = [assistant]
+    document["pending_tool_calls"] = [
+        {**original_call, "step_id": assistant["step_id"], "attempt_number": 1}
+    ]
+    document["tool_attempts"] = 0
+    document["active_wall_time_ms"] = assistant["duration_ms"]
+    document["last_event_sequence"] = agent_event["sequence"]
+    with runtime_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE public.execution_checkpoints "
+                "SET last_event_sequence = :sequence, document = CAST(:document AS jsonb), "
+                "document_digest = :digest WHERE run_id = :run_id"
+            ),
+            {
+                "sequence": agent_event["sequence"],
+                "document": json.dumps(document),
+                "digest": digest_payload_v0(document),
+                "run_id": claimed.run.run_id,
+            },
+        )
+
+    def mutation_recovery_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("read-only call entered committed-mutation recovery")
+
+    monkeypatch.setattr(
+        ToolGateway, "recover_committed_tool_attempt", mutation_recovery_must_not_run
+    )
+
+    class CountingAdapter(ScriptedAgentAdapter):
+        calls = 0
+
+        def invoke(self, context):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            return super().invoke(context)
+
+    adapter = CountingAdapter(
+        AGENT.id, AGENT.revision, (AgentOutput("unused", final=True, usage=_usage()),)
+    )
+    before_events = len(events)
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        adapter,
+        fault_engine=FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=2032),
+    )
+    assert result.status == "run_not_ready"
+    assert result.error_code == "internal_error"
+    assert adapter.calls == 0
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        after_checkpoint = repository.get_execution_checkpoint(claimed.run.run_id)
+        after_events = repository.fetch_events(claimed.run.run_id)
+        state = repository.get_run_company_state(claimed.run.run_id)
+        assert after_checkpoint is not None
+        assert _plain(after_checkpoint.document) == document
+        assert len(after_events) == before_events
+        assert state is not None and state.refunds == ()
 
 
 def test_rewritten_checkpoint_cannot_swap_evidence_between_calls(

@@ -199,3 +199,11 @@ SQL text, connection details, and stack traces are never copied into
 `ExecutionResult` or authoritative evidence. A failed operation gets at most one
 fresh terminalization attempt; failure of that attempt returns the non-terminal
 `run_not_ready` result rather than recursing or claiming an uncommitted state.
+
+For Issue #15 only, checkpoint reconciliation understands a validated
+post-commit marker/evidence chain and complete markerless durable mutation-tool
+attempts. Read-only pending calls never enter mutation recovery. Malformed
+idempotency state and evidence inconsistencies fail through the sanitized
+persistence-integrity path. Reconciliation never retries a mutation
+automatically; an agent must explicitly issue a new attempt. See
+[POST_COMMIT_AMBIGUITY_V0.md](../faults/POST_COMMIT_AMBIGUITY_V0.md).

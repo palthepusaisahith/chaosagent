@@ -391,6 +391,7 @@ class RunEventModel(Base):
     __tablename__ = "run_events"
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_run_events_run_sequence"),
+        UniqueConstraint("run_id", "event_id", name="uq_run_events_run_event"),
         CheckConstraint("event_id ~ '" + IDENTIFIER_CHECK + "'", name="event_id_format"),
         CheckConstraint("sequence BETWEEN 1 AND 9007199254740991", name="sequence_safe_integer"),
         CheckConstraint("jsonb_typeof(document) = 'object'", name="document_object"),
@@ -451,6 +452,7 @@ class ApprovalRequestModel(Base):
 
     __tablename__ = "approval_requests"
     __table_args__ = (
+        UniqueConstraint("run_id", "approval_id", name="uq_approval_requests_run_approval"),
         CheckConstraint("approval_id ~ '" + IDENTIFIER_CHECK + "'", name="approval_id_format"),
         CheckConstraint("decision_id ~ '" + IDENTIFIER_CHECK + "'", name="decision_id_format"),
         CheckConstraint("tool_id = 'payments.refund'", name="tool_id_value"),
@@ -964,6 +966,106 @@ class CompanyEffectModel(Base):
     logical_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
     first_attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
     lease_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+
+
+class PostCommitAcknowledgementModel(Base):
+    """Immutable recovery marker for an effect whose acknowledgement may be lost."""
+
+    __tablename__ = "post_commit_acknowledgements"
+    __table_args__ = (
+        CheckConstraint("attempt_number >= 1", name="attempt_number_positive"),
+        CheckConstraint("call_ordinal BETWEEN 1 AND 1000", name="call_ordinal"),
+        CheckConstraint("lease_attempt >= 1", name="lease_attempt_positive"),
+        CheckConstraint("attempt_id ~ '" + IDENTIFIER_CHECK + "'", name="attempt_id"),
+        CheckConstraint("logical_call_id ~ '" + IDENTIFIER_CHECK + "'", name="logical_call_id"),
+        CheckConstraint("effect_id ~ '" + IDENTIFIER_CHECK + "'", name="effect_id"),
+        CheckConstraint("tool_id IN ('payments.refund', 'support.update_ticket')", name="tool_id"),
+        CheckConstraint(
+            "contract_version IN ("
+            "'chaosagent.tool/payments.refund/v0', "
+            "'chaosagent.tool/support.update_ticket/v0')",
+            name="contract_version",
+        ),
+        CheckConstraint("request_digest ~ '" + DIGEST_CHECK + "'", name="request_digest"),
+        CheckConstraint("arguments_digest ~ '" + DIGEST_CHECK + "'", name="arguments_digest"),
+        CheckConstraint("idempotency_key_digest ~ '" + DIGEST_CHECK + "'", name="key_digest"),
+        CheckConstraint("fault_id ~ '" + IDENTIFIER_CHECK + "'", name="fault_id"),
+        CheckConstraint("activation_id ~ '^activation-[0-9a-f]{64}$'", name="activation_id"),
+        CheckConstraint("timeout_duration_ms BETWEEN 1 AND 600000", name="timeout_duration"),
+        CheckConstraint(
+            "matched_event_id <> applied_event_id AND "
+            "matched_event_id <> result_event_id AND "
+            "matched_event_id <> observed_event_id AND "
+            "applied_event_id <> result_event_id AND "
+            "applied_event_id <> observed_event_id AND "
+            "result_event_id <> observed_event_id",
+            name="planned_event_ids_distinct",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "tool_id", "contract_version", "idempotency_key_digest"],
+            [
+                "public.company_effects.run_id",
+                "public.company_effects.tool_id",
+                "public.company_effects.contract_version",
+                "public.company_effects.idempotency_key_digest",
+            ],
+            name="fk_post_commit_ack_effect",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "effect_id"],
+            ["public.company_effects.run_id", "public.company_effects.effect_id"],
+            name="fk_post_commit_ack_effect_id",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "request_event_id"],
+            ["public.run_events.run_id", "public.run_events.event_id"],
+            name="fk_post_commit_ack_request_event",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "state_evidence_event_id"],
+            ["public.run_events.run_id", "public.run_events.event_id"],
+            name="fk_post_commit_ack_state_event",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "policy_decision_event_id"],
+            ["public.run_events.run_id", "public.run_events.event_id"],
+            name="fk_post_commit_ack_policy_event",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "approval_id"],
+            ["public.approval_requests.run_id", "public.approval_requests.approval_id"],
+            name="fk_post_commit_ack_approval",
+        ),
+        UniqueConstraint("run_id", "effect_id", name="uq_post_commit_ack_effect"),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    logical_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    call_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tool_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(256), nullable=False)
+    idempotency_key_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    arguments_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    effect_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    lease_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state_evidence_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    policy_decision_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    approval_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fault_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    activation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    timeout_duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    matched_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    applied_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    result_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    observed_event_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
     )

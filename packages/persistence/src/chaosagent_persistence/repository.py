@@ -59,6 +59,7 @@ from .models import (
     ExecutionCheckpointModel,
     FixtureRevisionModel,
     PolicyRevisionModel,
+    PostCommitAcknowledgementModel,
     RunCompanyStateModel,
     RunEventModel,
     RunModel,
@@ -336,6 +337,36 @@ class CompanyEffect:
     lease_attempt: int
     created_at: datetime
     newly_applied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PostCommitAcknowledgement:
+    """Immutable effect-commit marker used to finish or replay an acknowledgement."""
+
+    run_id: str
+    attempt_id: str
+    logical_call_id: str
+    attempt_number: int
+    call_ordinal: int
+    tool_id: str
+    contract_version: str
+    idempotency_key_digest: str
+    request_digest: str
+    arguments_digest: str
+    effect_id: str
+    lease_attempt: int
+    request_event_id: str
+    state_evidence_event_id: str
+    policy_decision_event_id: str
+    approval_id: str | None
+    fault_id: str
+    activation_id: str
+    timeout_duration_ms: int
+    matched_event_id: str
+    applied_event_id: str
+    result_event_id: str
+    observed_event_id: str
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -945,6 +976,142 @@ class PersistenceRepository:
             populate_existing=True,
         )
         return None if model is None else self._company_effect_record(model, newly_applied=False)
+
+    def get_post_commit_acknowledgement(
+        self, run_id: str, attempt_id: str
+    ) -> PostCommitAcknowledgement | None:
+        """Fetch one immutable post-commit recovery marker."""
+        model = self._session.get(
+            PostCommitAcknowledgementModel, (run_id, attempt_id), populate_existing=True
+        )
+        return None if model is None else self._post_commit_acknowledgement_record(model)
+
+    def create_post_commit_acknowledgement(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        logical_call_id: str,
+        attempt_number: int,
+        call_ordinal: int,
+        tool_id: str,
+        contract_version: str,
+        idempotency_key_digest: str,
+        request_digest: str,
+        arguments_digest: str,
+        effect_id: str,
+        lease_attempt: int,
+        request_event_id: str,
+        state_evidence_event_id: str,
+        policy_decision_event_id: str,
+        approval_id: str | None,
+        fault_id: str,
+        activation_id: str,
+        timeout_duration_ms: int,
+        matched_event_id: str,
+        applied_event_id: str,
+        result_event_id: str,
+        observed_event_id: str,
+    ) -> PostCommitAcknowledgement:
+        """Insert the immutable marker in the same transaction as its effect evidence."""
+        planned_event_ids = (
+            matched_event_id,
+            applied_event_id,
+            result_event_id,
+            observed_event_id,
+        )
+        if len(set(planned_event_ids)) != len(planned_event_ids):
+            raise PersistenceIntegrityError(
+                "post-commit acknowledgement event identities must be distinct"
+            )
+        existing = self.get_post_commit_acknowledgement(run_id, attempt_id)
+        expected = (
+            logical_call_id,
+            attempt_number,
+            call_ordinal,
+            tool_id,
+            contract_version,
+            idempotency_key_digest,
+            request_digest,
+            arguments_digest,
+            effect_id,
+            lease_attempt,
+            request_event_id,
+            state_evidence_event_id,
+            policy_decision_event_id,
+            approval_id,
+            fault_id,
+            activation_id,
+            timeout_duration_ms,
+            matched_event_id,
+            applied_event_id,
+            result_event_id,
+            observed_event_id,
+        )
+        if existing is not None:
+            actual = (
+                existing.logical_call_id,
+                existing.attempt_number,
+                existing.call_ordinal,
+                existing.tool_id,
+                existing.contract_version,
+                existing.idempotency_key_digest,
+                existing.request_digest,
+                existing.arguments_digest,
+                existing.effect_id,
+                existing.lease_attempt,
+                existing.request_event_id,
+                existing.state_evidence_event_id,
+                existing.policy_decision_event_id,
+                existing.approval_id,
+                existing.fault_id,
+                existing.activation_id,
+                existing.timeout_duration_ms,
+                existing.matched_event_id,
+                existing.applied_event_id,
+                existing.result_event_id,
+                existing.observed_event_id,
+            )
+            if actual != expected:
+                raise PersistenceIntegrityError(
+                    "post-commit acknowledgement identity maps to different content"
+                )
+            return existing
+        model = PostCommitAcknowledgementModel(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            logical_call_id=logical_call_id,
+            attempt_number=attempt_number,
+            call_ordinal=call_ordinal,
+            tool_id=tool_id,
+            contract_version=contract_version,
+            idempotency_key_digest=idempotency_key_digest,
+            request_digest=request_digest,
+            arguments_digest=arguments_digest,
+            effect_id=effect_id,
+            lease_attempt=lease_attempt,
+            request_event_id=request_event_id,
+            state_evidence_event_id=state_evidence_event_id,
+            policy_decision_event_id=policy_decision_event_id,
+            approval_id=approval_id,
+            fault_id=fault_id,
+            activation_id=activation_id,
+            timeout_duration_ms=timeout_duration_ms,
+            matched_event_id=matched_event_id,
+            applied_event_id=applied_event_id,
+            result_event_id=result_event_id,
+            observed_event_id=observed_event_id,
+        )
+        try:
+            with self._session.begin_nested():
+                self._session.add(model)
+                self._session.flush()
+                self._session.refresh(model)
+        except IntegrityError as error:
+            raise PersistenceConflictError(
+                "post-commit acknowledgement marker conflicts with durable state"
+            ) from error
+        return self._post_commit_acknowledgement_record(model)
 
     def verify_company_effect(
         self,
@@ -2849,6 +3016,37 @@ class PersistenceRepository:
             lease_attempt=model.lease_attempt,
             created_at=model.created_at,
             newly_applied=newly_applied,
+        )
+
+    @staticmethod
+    def _post_commit_acknowledgement_record(
+        model: PostCommitAcknowledgementModel,
+    ) -> PostCommitAcknowledgement:
+        return PostCommitAcknowledgement(
+            run_id=model.run_id,
+            attempt_id=model.attempt_id,
+            logical_call_id=model.logical_call_id,
+            attempt_number=model.attempt_number,
+            call_ordinal=model.call_ordinal,
+            tool_id=model.tool_id,
+            contract_version=model.contract_version,
+            idempotency_key_digest=model.idempotency_key_digest,
+            request_digest=model.request_digest,
+            arguments_digest=model.arguments_digest,
+            effect_id=model.effect_id,
+            lease_attempt=model.lease_attempt,
+            request_event_id=model.request_event_id,
+            state_evidence_event_id=model.state_evidence_event_id,
+            policy_decision_event_id=model.policy_decision_event_id,
+            approval_id=model.approval_id,
+            fault_id=model.fault_id,
+            activation_id=model.activation_id,
+            timeout_duration_ms=model.timeout_duration_ms,
+            matched_event_id=model.matched_event_id,
+            applied_event_id=model.applied_event_id,
+            result_event_id=model.result_event_id,
+            observed_event_id=model.observed_event_id,
+            created_at=model.created_at,
         )
 
     @staticmethod

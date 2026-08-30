@@ -205,3 +205,13 @@ none of those capabilities, so all three are necessary runtime dependencies.
   activations, evaluators, SSE, telemetry, exports, and deployment role
   creation;
 - any report rebuild/version history policy.
+
+Migration `0008_post_commit_ack` adds the immutable
+`post_commit_acknowledgements` recovery table and same-Run event-reference
+constraints. The marker commits with the existing effect and state evidence;
+completion is derived from four mutually distinct planned immutable Event IDs,
+not mutable status. Repository authentication additionally binds the marker to
+the effect ledger's original logical call, physical attempt, and lease
+generation and resolves the persisted frozen Policy revision. Downgrade to
+`0007` intentionally drops markers while preserving effects and events. See
+[POST_COMMIT_AMBIGUITY_V0.md](../faults/POST_COMMIT_AMBIGUITY_V0.md).

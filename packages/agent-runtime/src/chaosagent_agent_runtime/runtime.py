@@ -256,7 +256,7 @@ def execute_run(
     """Execute one leased Run until evaluation-ready, approval wait, or failure."""
     tool_registry = registry or default_tool_registry()
     try:
-        state = _load_state(engine, lease, adapter, tool_registry, producer_component)
+        state = _load_state(engine, lease, adapter, tool_registry, producer_component, fault_engine)
     except (StaleLeaseError, LeaseExpiredError, CheckpointConflictError):
         return ExecutionResult("stale_lease", lease.run_id, None, error_code="stale_lease")
     except _INFRASTRUCTURE_EXCEPTIONS:
@@ -288,7 +288,9 @@ def execute_run(
             if result is not None:
                 return result
             try:
-                state = _load_state(engine, lease, adapter, tool_registry, producer_component)
+                state = _load_state(
+                    engine, lease, adapter, tool_registry, producer_component, fault_engine
+                )
             except (
                 StaleLeaseError,
                 LeaseExpiredError,
@@ -445,6 +447,7 @@ def _load_state(
     adapter: AgentAdapter,
     registry: ToolRegistry,
     producer_component: str,
+    fault_engine: FaultEngine | None,
 ) -> _State:
     with Session(engine) as session, session.begin():
         repository = PersistenceRepository(session)
@@ -493,6 +496,128 @@ def _load_state(
         checkpoint = None if record is None else _checkpoint_document(record, run, adapter)
         scenario = scenario_record.scenario.to_dict()
         if checkpoint is not None:
+            marker_allowed_ids: set[str] = set()
+            pending = cast(list[dict[str, object]], checkpoint["pending_tool_calls"])
+            if pending and fault_engine is not None:
+                call = pending[0]
+                tool_id = cast(str, call["tool_id"])
+                contract_version = cast(str, call["contract_version"])
+                definition = registry.resolve(tool_id, contract_version)
+                mutation_recovery = definition is not None and definition.capability == "mutation"
+                attempt_number = cast(int, call["attempt_number"])
+                attempt_id = _identity(
+                    "attempt", cast(str, call["logical_call_id"]), str(attempt_number)
+                )
+                marker = repository.get_post_commit_acknowledgement(run.run_id, attempt_id)
+                if marker is not None and not mutation_recovery:
+                    raise PersistenceIntegrityError(
+                        "post-commit marker is bound to a non-mutation pending call"
+                    )
+                if marker is not None:
+                    recovered_result = ToolGateway(
+                        session,
+                        registry=registry,
+                        producer_component="tool-gateway",
+                        producer_instance_id=lease.worker_id,
+                        fault_engine=fault_engine,
+                    ).recover_post_commit_attempt(
+                        lease,
+                        marker=marker,
+                        tool_id=cast(str, call["tool_id"]),
+                        contract_version=cast(str, call["contract_version"]),
+                        arguments=cast(dict[str, object], call["arguments"]),
+                        logical_call_id=cast(str, call["logical_call_id"]),
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=_logical_call_ordinal(
+                            checkpoint, cast(str, call["logical_call_id"])
+                        ),
+                    )
+                    marker_allowed_ids = {
+                        marker.request_event_id,
+                        marker.policy_decision_event_id,
+                        marker.state_evidence_event_id,
+                    }
+                    if recovered_result is not None:
+                        result_event = next(
+                            item.event.to_dict()
+                            for item in repository.fetch_events(run.run_id)
+                            if item.event.to_dict()["event_id"] == marker.result_event_id
+                        )
+                        result_payload = cast(dict[str, object], result_event["payload"])
+                        duration_ms = result_payload.get("duration_ms")
+                        if type(duration_ms) is not int:
+                            raise PersistenceIntegrityError(
+                                "post-commit acknowledgement duration is corrupt"
+                            )
+                        updated = _checkpoint_after_tool(
+                            checkpoint, call, attempt_id, recovered_result, duration_ms
+                        )
+                        all_events = repository.fetch_events(run.run_id)
+                        updated["last_event_sequence"] = cast(
+                            int, all_events[-1].event.to_dict()["sequence"]
+                        )
+                        updated["checkpoint_version"] = (
+                            cast(int, checkpoint["checkpoint_version"]) + 1
+                        )
+                        updated["lease_attempt"] = lease.attempt
+                        validate_execution_checkpoint(updated)
+                        stored = repository._store_execution_checkpoint(
+                            lease,
+                            updated,
+                            expected_version=cast(int, checkpoint["checkpoint_version"]),
+                        )
+                        checkpoint = _checkpoint_document(stored, run, adapter)
+                        marker_allowed_ids = set()
+                else:
+                    recovered_result = None
+                    if mutation_recovery:
+                        recovered_result = ToolGateway(
+                            session,
+                            registry=registry,
+                            producer_component="tool-gateway",
+                            producer_instance_id=lease.worker_id,
+                            fault_engine=fault_engine,
+                        ).recover_committed_tool_attempt(
+                            lease,
+                            tool_id=tool_id,
+                            contract_version=contract_version,
+                            arguments=cast(dict[str, object], call["arguments"]),
+                            logical_call_id=cast(str, call["logical_call_id"]),
+                            attempt_id=attempt_id,
+                            attempt_number=attempt_number,
+                        )
+                    if recovered_result is not None:
+                        result_event = next(
+                            item.event.to_dict()
+                            for item in repository.fetch_events(run.run_id)
+                            if item.event.to_dict()["event_id"] == recovered_result.result_event_id
+                        )
+                        duration_ms = cast(dict[str, object], result_event["payload"]).get(
+                            "duration_ms"
+                        )
+                        if type(duration_ms) is not int:
+                            raise PersistenceIntegrityError(
+                                "durable tool result duration is corrupt"
+                            )
+                        updated = _checkpoint_after_tool(
+                            checkpoint, call, attempt_id, recovered_result, duration_ms
+                        )
+                        all_events = repository.fetch_events(run.run_id)
+                        updated["last_event_sequence"] = cast(
+                            int, all_events[-1].event.to_dict()["sequence"]
+                        )
+                        updated["checkpoint_version"] = (
+                            cast(int, checkpoint["checkpoint_version"]) + 1
+                        )
+                        updated["lease_attempt"] = lease.attempt
+                        validate_execution_checkpoint(updated)
+                        stored = repository._store_execution_checkpoint(
+                            lease,
+                            updated,
+                            expected_version=cast(int, checkpoint["checkpoint_version"]),
+                        )
+                        checkpoint = _checkpoint_document(stored, run, adapter)
             _validate_checkpoint_semantics(checkpoint, scenario, registry, run)
             sequence = cast(int, checkpoint["last_event_sequence"])
             all_evidence = repository.fetch_events(run.run_id)
@@ -506,7 +631,11 @@ def _load_state(
                     "checkpoint last_event_sequence does not identify committed Run evidence"
                 )
             _validate_checkpoint_evidence(checkpoint, evidence, scenario, registry, run, adapter)
-            _validate_evidence_after_checkpoint(checkpoint, all_evidence[len(evidence) :])
+            _validate_evidence_after_checkpoint(
+                checkpoint,
+                all_evidence[len(evidence) :],
+                allowed_event_ids=marker_allowed_ids,
+            )
         if run.status == "evaluating" and (
             checkpoint is None or checkpoint.get("status") != "final"
         ):
@@ -834,7 +963,10 @@ def _validate_checkpoint_evidence(
 
 
 def _validate_evidence_after_checkpoint(
-    checkpoint: dict[str, object], later_evidence: Sequence[RunEventRecord]
+    checkpoint: dict[str, object],
+    later_evidence: Sequence[RunEventRecord],
+    *,
+    allowed_event_ids: set[str] | None = None,
 ) -> None:
     pending = cast(list[dict[str, object]], checkpoint["pending_tool_calls"])
     pending_approval = (
@@ -842,6 +974,8 @@ def _validate_evidence_after_checkpoint(
     )
     for record in later_evidence:
         event = record.event.to_dict()
+        if event["event_id"] in (allowed_event_ids or set()):
+            continue
         if event["event_type"] == "run.lifecycle":
             continue
         if (
@@ -1435,6 +1569,21 @@ def _dispatch_pending(
             engine, lease, state.run, "timed_out", "max_wall_time_exceeded", producer_component
         )
     call = cast(dict[str, object], cast(list[object], checkpoint["pending_tool_calls"])[0])
+    if (
+        fault_engine is not None
+        and isinstance(call.get("tool_id"), str)
+        and fault_engine.has_after_commit_rule(cast(str, call["tool_id"]))
+    ):
+        return _dispatch_pending_post_commit(
+            engine,
+            lease,
+            adapter,
+            registry,
+            state,
+            producer_component,
+            fault_engine,
+            call,
+        )
     try:
         with Session(engine) as session, session.begin():
             repository = PersistenceRepository(session)
@@ -1511,6 +1660,115 @@ def _dispatch_pending(
         CheckpointConflictError,
         LifecycleConflictError,
     ):
+        return ExecutionResult(
+            "stale_lease",
+            lease.run_id,
+            cast(int, checkpoint["checkpoint_version"]),
+            error_code="stale_lease",
+        )
+    except _INFRASTRUCTURE_EXCEPTIONS:
+        return _terminate(
+            engine, lease, state.run, "infra_error", "internal_error", producer_component
+        )
+    if new_checkpoint["status"] == "waiting_for_approval":
+        first = cast(dict[str, object], cast(list[object], new_checkpoint["pending_tool_calls"])[0])
+        return ExecutionResult(
+            "waiting_for_approval",
+            lease.run_id,
+            cast(int, new_checkpoint["checkpoint_version"]),
+            approval_id=cast(str, first["approval_id"]),
+            error_code="approval_pending",
+        )
+    return None
+
+
+def _dispatch_pending_post_commit(
+    engine: Engine,
+    lease: LeaseIdentity,
+    adapter: AgentAdapter,
+    registry: ToolRegistry,
+    state: _State,
+    producer_component: str,
+    fault_engine: FaultEngine,
+    call: dict[str, object],
+) -> ExecutionResult | None:
+    """Keep the effect/acknowledgement commits outside checkpoint persistence."""
+    checkpoint = state.checkpoint
+    assert checkpoint is not None
+    attempt_number = cast(int, call["attempt_number"])
+    attempt_id = _identity("attempt", cast(str, call["logical_call_id"]), str(attempt_number))
+    try:
+        with Session(engine) as validation_session, validation_session.begin():
+            repository = PersistenceRepository(validation_session)
+            run = repository.lock_current_lease(lease)
+            if run.status != "running":
+                raise LifecycleConflictError("Run left running before tool dispatch")
+            record = repository.get_execution_checkpoint(run.run_id)
+            if record is None or record.checkpoint_version != checkpoint["checkpoint_version"]:
+                raise CheckpointConflictError("tool dispatch is based on a stale checkpoint")
+
+        with Session(engine) as gateway_session:
+            result = ToolGateway(
+                gateway_session,
+                registry=registry,
+                producer_component="tool-gateway",
+                producer_instance_id=lease.worker_id,
+                fault_engine=fault_engine,
+            ).execute(
+                lease,
+                tool_id=call["tool_id"],
+                contract_version=call["contract_version"],
+                arguments=call["arguments"],
+                logical_call_id=call["logical_call_id"],
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                call_ordinal=_logical_call_ordinal(checkpoint, cast(str, call["logical_call_id"])),
+                step_id=call["step_id"],
+                causation_event_id=_identity(
+                    "event-agent",
+                    lease.run_id,
+                    str(cast(int, checkpoint["next_step_number"]) - 1),
+                ),
+                approval_id=call.get("approval_id"),
+            )
+        if result.error is not None and result.error.code == "stale_lease":
+            raise StaleLeaseError("gateway rejected stale execution lease")
+        if result.error is not None and result.error.code == "infrastructure_error":
+            raise PersistenceIntegrityError("gateway infrastructure failure")
+        if result.request_event_id is None or result.result_event_id is None:
+            raise PersistenceIntegrityError("gateway returned no authoritative tool evidence")
+
+        with Session(engine) as checkpoint_session, checkpoint_session.begin():
+            repository = PersistenceRepository(checkpoint_session)
+            run = repository.lock_current_lease(lease)
+            record = repository.get_execution_checkpoint(run.run_id)
+            if record is None or record.checkpoint_version != checkpoint["checkpoint_version"]:
+                raise CheckpointConflictError("tool dispatch is based on a stale checkpoint")
+            latest_events = repository.fetch_events(run.run_id)
+            result_documents = [
+                event.event.to_dict()
+                for event in latest_events
+                if event.event.to_dict()["event_id"] == result.result_event_id
+            ]
+            if len(result_documents) != 1:
+                raise PersistenceIntegrityError("gateway result evidence does not resolve")
+            duration_ms = cast(dict[str, object], result_documents[0]["payload"]).get("duration_ms")
+            if type(duration_ms) is not int:
+                raise PersistenceIntegrityError("gateway result duration is invalid")
+            updated = _checkpoint_after_tool(checkpoint, call, attempt_id, result, duration_ms)
+            updated["last_event_sequence"] = cast(
+                int, latest_events[-1].event.to_dict()["sequence"]
+            )
+            updated["checkpoint_version"] = cast(int, checkpoint["checkpoint_version"]) + 1
+            updated["lease_attempt"] = lease.attempt
+            validate_execution_checkpoint(updated)
+            stored = repository._store_execution_checkpoint(
+                lease,
+                updated,
+                expected_version=cast(int, checkpoint["checkpoint_version"]),
+            )
+            new_checkpoint = _checkpoint_document(stored, run, adapter)
+    except (StaleLeaseError, LeaseExpiredError, CheckpointConflictError, LifecycleConflictError):
         return ExecutionResult(
             "stale_lease",
             lease.run_id,

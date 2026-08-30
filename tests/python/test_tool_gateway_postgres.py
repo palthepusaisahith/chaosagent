@@ -26,12 +26,16 @@ from chaosagent_fixtures import load_fixture
 from chaosagent_persistence import (
     ClaimedRun,
     CompanyEffect,
+    LeaseExpiredError,
     LeaseIdentity,
     LifecycleEvidence,
     PersistenceError,
     PersistenceRepository,
+    PolicyRevisionRecord,
+    PostCommitAcknowledgement,
     RevisionReference,
     RunEventRecord,
+    RunRecord,
     create_postgres_engine,
 )
 from chaosagent_policies import load_policy, loads_policy
@@ -48,10 +52,11 @@ from chaosagent_tool_gateway import (
     ToolRegistry,
     default_tool_registry,
 )
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
 
 pytestmark = pytest.mark.postgres
 
@@ -163,6 +168,7 @@ def _call(
     logical_call_id: str | None = None,
     approval_id: str | None = None,
     call_ordinal: int = 1,
+    attempt_id: str | None = None,
 ) -> ToolExecutionResult:
     return gateway.execute(
         lease,
@@ -170,7 +176,7 @@ def _call(
         contract_version=version,
         arguments={"order_id": "ORD-1007"} if arguments is None else arguments,
         logical_call_id=logical_call_id or _unique("logical"),
-        attempt_id=_unique("attempt"),
+        attempt_id=attempt_id or _unique("attempt"),
         call_ordinal=call_ordinal,
         approval_id=approval_id,
     )
@@ -195,6 +201,7 @@ def _refund(
     arguments: object | None = None,
     logical_call_id: str | None = None,
     approval_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> ToolExecutionResult:
     return _call(
         gateway,
@@ -204,6 +211,7 @@ def _refund(
         arguments=_refund_arguments() if arguments is None else arguments,
         logical_call_id=logical_call_id,
         approval_id=approval_id,
+        attempt_id=attempt_id,
     )
 
 
@@ -448,6 +456,1022 @@ def test_after_tool_fault_is_not_applied_to_mutation(gateway_engine: Engine) -> 
             item.event.to_dict() for item in PersistenceRepository(session).fetch_events(run_id)
         ]
         assert not any(cast(str, item["event_type"]).startswith("fault.") for item in documents)
+
+
+def test_ambiguous_post_commit_refund_commits_effect_then_times_out_and_replays(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    arguments = _refund_arguments()
+    with Session(gateway_engine) as session:
+        first = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=arguments,
+            logical_call_id=_unique("logical-ambiguous"),
+        )
+    assert first.outcome == "failed"
+    assert first.error is not None and first.error.code == "fault_timeout"
+    assert first.output is None
+
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        effect = repository.get_company_effect(
+            run_id,
+            "payments.refund",
+            PAYMENTS_REFUND_V0,
+            digest_payload_v0(cast(str, arguments["idempotency_key"])),
+        )
+        assert state is not None and len(state.refunds) == 1
+        assert effect is not None
+        assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 1
+        assert [
+            event["event_type"]
+            for event in events
+            if event["event_id"]
+            in {
+                first.request_event_id,
+                first.state_evidence_event_id,
+                first.result_event_id,
+            }
+            or (
+                event.get("correlation_id")
+                == next(
+                    item["correlation_id"]
+                    for item in events
+                    if item["event_id"] == first.request_event_id
+                )
+                and event["event_type"] in {"fault.matched", "fault.applied", "fault.observed"}
+            )
+        ] == [
+            "tool.requested",
+            "state.evidence_recorded",
+            "fault.matched",
+            "fault.applied",
+            "tool.result",
+            "fault.observed",
+        ]
+
+    with Session(gateway_engine) as session:
+        replay = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=arguments,
+            logical_call_id=_unique("logical-replay"),
+        )
+    assert replay.outcome == "succeeded" and replay.error is None
+    assert replay.output is not None and replay.output["application"] == "already_applied"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        assert state is not None and len(state.refunds) == 1
+        assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 1
+        assert sum(event["event_type"] == "fault.applied" for event in events) == 1
+
+
+def test_ambiguous_post_commit_support_update_replays_without_duplicate_effect(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="support.update_ticket",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    key = _unique("support-post-commit")
+    with Session(gateway_engine) as session:
+        first = _update_ticket(
+            ToolGateway(session, fault_engine=fault_engine), claimed.lease, key=key
+        )
+    assert first.error is not None and first.error.code == "fault_timeout"
+    with Session(gateway_engine) as session:
+        replay = _update_ticket(
+            ToolGateway(session, fault_engine=fault_engine), claimed.lease, key=key
+        )
+    assert replay.output is not None and replay.output["application"] == "already_applied"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(run_id)]
+        assert state is not None
+        ticket = next(item for item in state.support_tickets if item.ticket_id == "TKT-204")
+        assert ticket.status == "closed"
+        assert sum(item["event_type"] == "state.evidence_recorded" for item in events) == 1
+        assert sum(item["event_type"] == "fault.applied" for item in events) == 1
+
+
+@pytest.mark.parametrize(
+    "failing_event_type",
+    ["fault.matched", "fault.applied", "tool.result", "fault.observed"],
+)
+def test_post_commit_ack_failure_preserves_effect_and_same_attempt_recovers(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_event_type: str,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-recover")
+    attempt_id = _unique("attempt-recover")
+    original = ToolGateway._append_event
+
+    def fail_selected(
+        self: ToolGateway,
+        run_id: str,
+        event_id: str,
+        event_type: Literal[
+            "tool.requested",
+            "tool.result",
+            "state.evidence_recorded",
+            "policy.decision",
+            "fault.not_matched",
+            "fault.matched",
+            "fault.applied",
+            "fault.observed",
+        ],
+        payload: dict[str, object],
+        *,
+        correlation_id: str,
+        causation_event_id: str | None,
+    ) -> None:
+        if event_type == failing_event_type:
+            raise PersistenceError("injected acknowledgement persistence failure")
+        original(
+            self,
+            run_id,
+            event_id,
+            event_type,
+            payload,
+            correlation_id=correlation_id,
+            causation_event_id=causation_event_id,
+        )
+
+    monkeypatch.setattr(ToolGateway, "_append_event", fail_selected)
+    with Session(gateway_engine) as session:
+        failed = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert failed.error is not None and failed.error.code == "infrastructure_error"
+    monkeypatch.undo()
+
+    independent_engine = create_engine(gateway_engine.url, poolclass=NullPool)
+    try:
+        with independent_engine.connect() as connection:
+            acquired = connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtextextended(:run_id, 15015))"),
+                {"run_id": run_id},
+            )
+            assert acquired is True
+            assert (
+                connection.scalar(
+                    text("SELECT pg_advisory_unlock(hashtextextended(:run_id, 15015))"),
+                    {"run_id": run_id},
+                )
+                is True
+            )
+    finally:
+        independent_engine.dispose()
+
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [record.event.to_dict() for record in repository.fetch_events(run_id)]
+        assert state is not None and len(state.refunds) == 1
+        assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 1
+        assert not any(
+            event["event_type"]
+            in {"fault.matched", "fault.applied", "tool.result", "fault.observed"}
+            and event.get("correlation_id") == logical_call_id
+            for event in events
+        )
+
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == "fault_timeout"
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 1
+
+
+def test_state_evidence_failure_rolls_back_post_commit_effect(
+    gateway_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    original = ToolGateway._append_state_evidence
+
+    def fail_state(*_args: object, **_kwargs: object) -> None:
+        raise PersistenceError("injected state evidence failure")
+
+    monkeypatch.setattr(ToolGateway, "_append_state_evidence", fail_state)
+    with Session(gateway_engine) as session:
+        result = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert result.error is not None and result.error.code == "infrastructure_error"
+    monkeypatch.setattr(ToolGateway, "_append_state_evidence", original)
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        count = session.scalar(
+            text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        )
+        marker_count = session.scalar(
+            text("SELECT count(*) FROM public.post_commit_acknowledgements WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        )
+        assert state is not None and len(state.refunds) == 0
+        assert count == 0 and marker_count == 0
+
+
+def test_post_commit_lease_expiry_preserves_effect_and_reclaim_recovers_ack(
+    gateway_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-post-commit-expiry")
+    attempt_id = _unique("attempt-post-commit-expiry")
+    original_lock = PersistenceRepository.lock_current_lease
+
+    def expire_after_marker(repository: PersistenceRepository, lease: LeaseIdentity) -> RunRecord:
+        if repository.get_post_commit_acknowledgement(lease.run_id, attempt_id) is not None:
+            raise LeaseExpiredError("injected expiry after effect commit")
+        return original_lock(repository, lease)
+
+    monkeypatch.setattr(PersistenceRepository, "lock_current_lease", expire_after_marker)
+    with Session(gateway_engine) as session:
+        stale = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert stale.error is not None and stale.error.code == "stale_lease"
+    monkeypatch.undo()
+
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        marker = repository.get_post_commit_acknowledgement(run_id, attempt_id)
+        assert state is not None and len(state.refunds) == 1 and marker is not None
+    with Session(gateway_engine) as session, session.begin():
+        session.execute(
+            text(
+                "UPDATE public.runs SET heartbeat_at = clock_timestamp() - interval '2 hours', "
+                "lease_expires_at = clock_timestamp() - interval '1 hour' WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        queued = repository.requeue_expired_run(
+            run_id,
+            expected_version=claimed.run.lifecycle_version,
+            evidence=_evidence("post-commit-expiry"),
+        )
+        replacement = repository.claim_next_run(
+            "post-commit-recovery-worker",
+            lease_duration_seconds=600,
+            evidence=_evidence("post-commit-reclaim"),
+            run_id=run_id,
+        )
+        assert queued.status == "queued" and replacement is not None
+        running = repository.transition_owned_run(
+            replacement.lease,
+            "running",
+            expected_version=replacement.run.lifecycle_version,
+            evidence=_evidence("post-commit-running"),
+        )
+        replacement = ClaimedRun(running, replacement.lease)
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            replacement.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == "fault_timeout"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(run_id)]
+        assert state is not None and len(state.refunds) == 1
+        assert sum(item["event_type"] == "fault.applied" for item in events) == 1
+
+
+def test_concurrent_same_key_post_commit_attempts_create_one_effect(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    barrier = Barrier(2)
+
+    def execute(index: int) -> ToolExecutionResult:
+        with Session(gateway_engine) as session:
+            barrier.wait(timeout=10)
+            return _refund(
+                ToolGateway(session, fault_engine=fault_engine),
+                claimed.lease,
+                logical_call_id=f"logical-post-commit-race-{index}",
+                attempt_id=f"attempt-post-commit-race-{index}",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(execute, range(2)))
+    error_codes = [None if item.error is None else item.error.code for item in results]
+    assert error_codes.count(None) == 1 and error_codes.count("fault_timeout") == 1
+    successful = next(item for item in results if item.error is None)
+    assert successful.output is not None and successful.output["application"] == "already_applied"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(run_id)]
+        assert state is not None and len(state.refunds) == 1
+        assert (
+            session.scalar(
+                text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+        assert sum(item["event_type"] == "state.evidence_recorded" for item in events) == 1
+        applied = [item for item in events if item["event_type"] == "fault.applied"]
+        assert len(applied) == 1
+        assert (
+            len({cast(dict[str, object], item["payload"])["activation_id"] for item in applied})
+            == 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("target_status", "expected_error"),
+    [
+        ("running", "fault_timeout"),
+        ("provisioning", "run_not_ready"),
+        ("evaluating", "run_not_ready"),
+        ("failed", "stale_lease"),
+    ],
+)
+def test_post_commit_recovery_requires_exact_running_status(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    target_status: str,
+    expected_error: str,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-status-recovery")
+    attempt_id = _unique("attempt-status-recovery")
+    original_append = ToolGateway._append_event
+
+    def fail_matched(
+        self: ToolGateway,
+        run_id: str,
+        event_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        correlation_id: str,
+        causation_event_id: str | None,
+    ) -> None:
+        if event_type == "fault.matched":
+            raise PersistenceError("leave a committed recovery marker")
+        original_append(
+            self,
+            run_id,
+            event_id,
+            cast(
+                Literal[
+                    "tool.requested",
+                    "tool.result",
+                    "state.evidence_recorded",
+                    "policy.decision",
+                    "fault.not_matched",
+                    "fault.matched",
+                    "fault.applied",
+                    "fault.observed",
+                ],
+                event_type,
+            ),
+            payload,
+            correlation_id=correlation_id,
+            causation_event_id=causation_event_id,
+        )
+
+    monkeypatch.setattr(ToolGateway, "_append_event", fail_matched)
+    with Session(gateway_engine) as session:
+        initial = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert initial.error is not None and initial.error.code == "infrastructure_error"
+    monkeypatch.undo()
+
+    recovery_lease = claimed.lease
+    with Session(gateway_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        current = repository.get_run(run_id)
+        assert current is not None
+        if target_status in {"evaluating", "failed"}:
+            repository.transition_owned_run(
+                claimed.lease,
+                cast(Literal["evaluating", "failed"], target_status),
+                expected_version=current.lifecycle_version,
+                evidence=_evidence(f"to-{target_status}"),
+            )
+        elif target_status == "provisioning":
+            session.execute(
+                text(
+                    "UPDATE public.runs SET heartbeat_at = "
+                    "clock_timestamp() - interval '2 seconds', lease_expires_at = "
+                    "clock_timestamp() - interval '1 second' WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+    if target_status == "provisioning":
+        with Session(gateway_engine) as session, session.begin():
+            repository = PersistenceRepository(session)
+            current = repository.get_run(run_id)
+            assert current is not None
+            repository.requeue_expired_run(
+                run_id,
+                expected_version=current.lifecycle_version,
+                evidence=_evidence("status-requeue"),
+            )
+            replacement = repository.claim_next_run(
+                "status-recovery-worker",
+                lease_duration_seconds=600,
+                evidence=_evidence("status-reclaim"),
+                run_id=run_id,
+            )
+            assert replacement is not None and replacement.run.status == "provisioning"
+            recovery_lease = replacement.lease
+
+    with Session(gateway_engine) as session:
+        before = len(PersistenceRepository(session).fetch_events(run_id))
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            recovery_lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == expected_error
+    with Session(gateway_engine) as session:
+        after = len(PersistenceRepository(session).fetch_events(run_id))
+    if target_status != "running":
+        assert after == before
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement_sql"),
+    [
+        ("logical_call_id", "'forged-logical-call'"),
+        ("first_attempt_id", "'forged-physical-attempt'"),
+        ("lease_attempt", "lease_attempt + 1"),
+    ],
+)
+def test_post_commit_marker_rejects_corrupt_effect_provenance(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    column: str,
+    replacement_sql: str,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-provenance")
+    attempt_id = _unique("attempt-provenance")
+    original_append = ToolGateway._append_event
+
+    def fail_matched(*args: object, **kwargs: object) -> None:
+        if len(args) > 3 and args[3] == "fault.matched":
+            raise PersistenceError("leave pending marker")
+        original_append(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ToolGateway, "_append_event", fail_matched)
+    with Session(gateway_engine) as session:
+        initial = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert initial.error is not None and initial.error.code == "infrastructure_error"
+    monkeypatch.undo()
+
+    with gateway_engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE public.company_effects DISABLE TRIGGER company_effects_immutable")
+        )
+        connection.execute(
+            text(
+                f"UPDATE public.company_effects SET {column} = {replacement_sql} "
+                "WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        connection.execute(
+            text("ALTER TABLE public.company_effects ENABLE TRIGGER company_effects_immutable")
+        )
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == "infrastructure_error"
+    with Session(gateway_engine) as session:
+        events = [
+            item.event.to_dict() for item in PersistenceRepository(session).fetch_events(run_id)
+        ]
+        assert not any(item["event_type"] == "fault.applied" for item in events)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("approval_id", "approval-forged"),
+        ("activation_id", "activation-" + "0" * 64),
+        ("result_event_id", "event-forged-result"),
+    ],
+)
+def test_completed_post_commit_marker_rejects_corrupt_authority_bindings(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-corrupt-marker")
+    attempt_id = _unique("attempt-corrupt-marker")
+    with Session(gateway_engine) as session:
+        first = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert first.error is not None and first.error.code == "fault_timeout"
+    original_get = PersistenceRepository.get_post_commit_acknowledgement
+
+    def corrupt_marker(
+        repository: PersistenceRepository, requested_run_id: str, requested_attempt_id: str
+    ) -> PostCommitAcknowledgement | None:
+        marker = original_get(repository, requested_run_id, requested_attempt_id)
+        if marker is None:
+            return None
+        if field == "approval_id":
+            return replace(marker, approval_id=value)
+        if field == "activation_id":
+            return replace(marker, activation_id=value)
+        if field == "result_event_id":
+            return replace(marker, result_event_id=value)
+        raise AssertionError(field)
+
+    monkeypatch.setattr(PersistenceRepository, "get_post_commit_acknowledgement", corrupt_marker)
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == "infrastructure_error"
+    with Session(gateway_engine) as session:
+        events = [
+            item.event.to_dict() for item in PersistenceRepository(session).fetch_events(run_id)
+        ]
+        assert sum(item["event_type"] == "fault.applied" for item in events) == 1
+
+
+@pytest.mark.parametrize("policy_failure", ["missing", "corrupt", "digest_mismatch"])
+def test_post_commit_recovery_fails_closed_for_unresolved_persisted_policy(
+    gateway_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_failure: str,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    _run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    logical_call_id = _unique("logical-policy-integrity")
+    attempt_id = _unique("attempt-policy-integrity")
+    with Session(gateway_engine) as session:
+        first = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert first.error is not None and first.error.code == "fault_timeout"
+    original_get = PersistenceRepository.get_policy_revision
+
+    def failed_policy_load(
+        repository: PersistenceRepository, policy_id: str, revision: str
+    ) -> PolicyRevisionRecord | None:
+        if policy_failure == "missing":
+            return None
+        if policy_failure == "corrupt":
+            raise PersistenceError("stored Policy document is corrupt")
+        record = original_get(repository, policy_id, revision)
+        assert record is not None
+        return replace(
+            record,
+            policy=loads_policy(
+                json.dumps(
+                    {
+                        **record.policy.to_dict(),
+                        "policy_id": _unique("wrong-policy"),
+                    }
+                )
+            ),
+        )
+
+    monkeypatch.setattr(PersistenceRepository, "get_policy_revision", failed_policy_load)
+    with Session(gateway_engine) as session:
+        recovered = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+        )
+    assert recovered.error is not None and recovered.error.code == "infrastructure_error"
+
+
+def test_post_commit_marker_planned_event_ids_must_be_distinct(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    with Session(gateway_engine) as session:
+        result = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert result.error is not None and result.error.code == "fault_timeout"
+    with gateway_engine.connect() as connection:
+        transaction = connection.begin()
+        connection.execute(
+            text(
+                "ALTER TABLE public.post_commit_acknowledgements "
+                "DISABLE TRIGGER post_commit_acknowledgements_immutable"
+            )
+        )
+        with pytest.raises(IntegrityError, match="planned_event_ids_distinct"):
+            connection.execute(
+                text(
+                    "UPDATE public.post_commit_acknowledgements "
+                    "SET result_event_id = applied_event_id WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        transaction.rollback()
+
+
+def test_different_key_after_ambiguous_refund_rechecks_business_rules(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    with Session(gateway_engine) as session:
+        first = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert first.error is not None and first.error.code == "fault_timeout"
+
+    different = _refund_arguments(key=_unique("different-key"), amount_minor=5000)
+    with Session(gateway_engine) as session:
+        accepted = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=different,
+        )
+    assert accepted.output is not None and accepted.output["application"] == "newly_applied"
+    excessive = _refund_arguments(key=_unique("third-key"), amount_minor=5000)
+    with Session(gateway_engine) as session:
+        rejected = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=excessive,
+        )
+    assert rejected.error is not None and rejected.error.code == "business_rule_violation"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 2
+        assert (
+            session.scalar(
+                text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 2
+        )
+
+
+def test_policy_and_approval_gate_post_commit_ambiguity(gateway_engine: Engine) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    excessive = _refund_arguments(key=_unique("post-commit-denied"), amount_minor=12001)
+    approved_arguments = _refund_arguments(key=_unique("post-commit-approved"), amount_minor=6000)
+    with Session(gateway_engine) as session:
+        denied = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=excessive,
+        )
+    assert denied.error is not None and denied.error.code == "policy_denied"
+    with Session(gateway_engine) as session:
+        requested = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=approved_arguments,
+        )
+    assert requested.error is not None and requested.error.code == "approval_required"
+    assert requested.approval_id is not None
+    with Session(gateway_engine) as session:
+        assert PersistenceRepository(session).get_run_company_state(run_id).refunds == ()  # type: ignore[union-attr]
+    with Session(gateway_engine) as session, session.begin():
+        PersistenceRepository(session).resolve_approval_request(
+            requested.approval_id,
+            result="approved",
+            actor_id="human-reviewer",
+            resolution_event_id=_unique("evt-post-commit-approved"),
+        )
+    with Session(gateway_engine) as session:
+        ambiguous = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=approved_arguments,
+            approval_id=requested.approval_id,
+        )
+    assert ambiguous.error is not None and ambiguous.error.code == "fault_timeout"
+    with Session(gateway_engine) as session:
+        replay = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=approved_arguments,
+            approval_id=requested.approval_id,
+        )
+    assert replay.output is not None and replay.output["application"] == "already_applied"
+
+    changed = dict(approved_arguments)
+    changed["amount_minor"] = 6001
+    with Session(gateway_engine) as session:
+        mismatch = _refund(
+            ToolGateway(session, fault_engine=fault_engine),
+            claimed.lease,
+            arguments=changed,
+            approval_id=requested.approval_id,
+        )
+    assert mismatch.error is not None and mismatch.error.code == "approval_mismatch"
+    with Session(gateway_engine) as session:
+        state = PersistenceRepository(session).get_run_company_state(run_id)
+        assert state is not None and len(state.refunds) == 1
+
+
+def test_post_commit_marker_failure_rolls_back_effect_unit(
+    gateway_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+
+    def fail_marker(*_args: object, **_kwargs: object) -> None:
+        raise PersistenceError("injected marker failure")
+
+    monkeypatch.setattr(PersistenceRepository, "create_post_commit_acknowledgement", fail_marker)
+    with Session(gateway_engine) as session:
+        failed = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert failed.error is not None and failed.error.code == "infrastructure_error"
+    with Session(gateway_engine) as session:
+        repository = PersistenceRepository(session)
+        state = repository.get_run_company_state(run_id)
+        assert state is not None and state.refunds == ()
+        assert (
+            session.scalar(
+                text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 0
+        )
+        assert not any(
+            item.event.to_dict()["event_type"] == "state.evidence_recorded"
+            for item in repository.fetch_events(run_id)
+        )
+
+
+def test_post_commit_marker_is_database_immutable(gateway_engine: Engine) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    with Session(gateway_engine) as session:
+        result = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert result.error is not None and result.error.code == "fault_timeout"
+    for statement in (
+        "UPDATE public.post_commit_acknowledgements SET fault_id = 'attacker' "
+        "WHERE run_id = :run_id",
+        "DELETE FROM public.post_commit_acknowledgements WHERE run_id = :run_id",
+    ):
+        with gateway_engine.connect() as connection:
+            transaction = connection.begin()
+            with pytest.raises(DBAPIError, match="append-only"):
+                connection.execute(text(statement), {"run_id": run_id})
+            transaction.rollback()
+
+    other_run_id, _ = _create_running_run(gateway_engine)
+    with Session(gateway_engine) as session:
+        other_event_id = cast(
+            str,
+            PersistenceRepository(session)
+            .fetch_events(other_run_id)[0]
+            .event.to_dict()["event_id"],
+        )
+    with gateway_engine.connect() as connection:
+        transaction = connection.begin()
+        connection.execute(
+            text(
+                "ALTER TABLE public.post_commit_acknowledgements "
+                "DISABLE TRIGGER post_commit_acknowledgements_immutable"
+            )
+        )
+        with pytest.raises(IntegrityError, match="fk_post_commit_ack_request_event"):
+            connection.execute(
+                text(
+                    "UPDATE public.post_commit_acknowledgements "
+                    "SET request_event_id = :event_id WHERE run_id = :run_id"
+                ),
+                {"event_id": other_event_id, "run_id": run_id},
+            )
+        transaction.rollback()
+
+
+def test_migration_0008_downgrades_populated_marker_and_reupgrades(
+    gateway_engine: Engine,
+) -> None:
+    document, fault_engine = _fault_scenario(
+        kind="ambiguous_post_commit_timeout",
+        phase="after_commit",
+        parameters={"duration_ms": 25},
+        tool_id="payments.refund",
+    )
+    run_id, claimed = _create_running_run(gateway_engine, scenario_document=document)
+    with Session(gateway_engine) as session:
+        result = _refund(ToolGateway(session, fault_engine=fault_engine), claimed.lease)
+    assert result.error is not None and result.error.code == "fault_timeout"
+    with gateway_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.post_commit_acknowledgements "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0007_agent_configuration_v0")
+    with gateway_engine.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT to_regclass('public.post_commit_acknowledgements')"))
+            is None
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.company_refunds WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.run_events WHERE run_id = :run_id "
+                    "AND event_type = 'state.evidence_recorded'"
+                ),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM public.run_events WHERE run_id = :run_id "
+                    "AND event_type IN ('fault.matched', 'fault.applied', "
+                    "'tool.result', 'fault.observed')"
+                ),
+                {"run_id": run_id},
+            )
+            == 4
+        )
+    command.upgrade(configuration, "0008_post_commit_ack")
+    with gateway_engine.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT to_regclass('public.post_commit_acknowledgements')"))
+            == "post_commit_acknowledgements"
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM pg_constraint WHERE conname = 'uq_run_events_run_event'")
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(text("SELECT count(*) FROM public.post_commit_acknowledgements")) == 0
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.company_effects WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+    command.check(configuration)
 
 
 @pytest.mark.parametrize("phase", ["before_tool", "after_tool"])

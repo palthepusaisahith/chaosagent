@@ -158,3 +158,8 @@ local PostgreSQL guarantee alone would be insufficient.
 Structural examples are in
 `benchmarks/shipment-refund/tools/v0/mutation-calls.json`. They use Fixture v0
 identities but are not claimed execution traces.
+
+Issue #15 adds no second effect authority. Its post-commit ambiguity marker
+references this immutable ledger, while same-key replay still returns
+`already_applied`; see
+[POST_COMMIT_AMBIGUITY_V0.md](../faults/POST_COMMIT_AMBIGUITY_V0.md).

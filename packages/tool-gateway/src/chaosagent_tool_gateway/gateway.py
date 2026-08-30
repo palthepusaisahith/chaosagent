@@ -41,6 +41,7 @@ from chaosagent_persistence import (
     PersistenceError,
     PersistenceIntegrityError,
     PersistenceRepository,
+    PostCommitAcknowledgement,
     ReferenceNotFoundError,
     RevisionReference,
     StaleLeaseError,
@@ -48,6 +49,7 @@ from chaosagent_persistence import (
 )
 from chaosagent_policies import PolicyValidationError, evaluate_policy_v0
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
+from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -132,6 +134,16 @@ class ToolExecutionResult:
     state_evidence_event_id: str | None
     policy_decision_event_id: str | None = None
     approval_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPostCommit:
+    marker: PostCommitAcknowledgement
+    selection: FaultSelection
+    effect: CompanyEffect
+    policy_decision_event_id: str
+    approval_id: str | None
+    started_ns: int
 
 
 class ReadOnlyCompanyState(Protocol):
@@ -379,6 +391,7 @@ class ToolGateway:
         producer_component: str = "tool-gateway",
         producer_instance_id: str | None = None,
         fault_engine: FaultEngine | None = None,
+        _durable_phase: bool = False,
     ) -> None:
         self._session = session
         self._repository = PersistenceRepository(session)
@@ -388,6 +401,7 @@ class ToolGateway:
         self._producer_component = producer_component
         self._producer_instance_id = producer_instance_id
         self._fault_engine = fault_engine
+        self._durable_phase = _durable_phase
 
     def execute(
         self,
@@ -473,6 +487,26 @@ class ToolGateway:
                 "invalid tool request: amount_minor must be an exact JSON integer",
             )
         arguments_snapshot = cast(dict[str, object], deepcopy(arguments))
+
+        if (
+            not self._durable_phase
+            and definition.capability == "mutation"
+            and self._fault_engine is not None
+            and self._fault_engine.has_after_commit_rule(tool_id)
+        ):
+            return self._execute_durable_post_commit(
+                lease,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                arguments=arguments_snapshot,
+                logical_call_id=logical_call_id,
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                call_ordinal=effective_call_ordinal,
+                step_id=step_id,
+                causation_event_id=causation_event_id,
+                approval_id=approval_id,
+            )
 
         try:
             with self._session.begin_nested():
@@ -817,6 +851,96 @@ class ToolGateway:
                     tool_error = ToolError(
                         "infrastructure_error", "tool execution failed internally"
                     )
+                if (
+                    self._durable_phase
+                    and definition.capability == "mutation"
+                    and effect is not None
+                    and effect.newly_applied
+                    and output is not None
+                    and tool_error is None
+                ):
+                    try:
+                        self._repository.lock_current_lease(lease)
+                    except (StaleLeaseError, LeaseExpiredError) as error:
+                        raise _LeaseLostDuringExecution from error
+                    post_commit = self._select_faults(
+                        run_id=run.run_id,
+                        request_event_id=request_event_id,
+                        scenario_digest=run.scenario.digest,
+                        tool_id=tool_id,
+                        phase="after_commit",
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=effective_call_ordinal,
+                        arguments=arguments_snapshot,
+                        arguments_digest=arguments_digest,
+                    )
+                    if post_commit is not None and post_commit.matched_rules:
+                        assert idempotency_key_digest is not None
+                        applied_rule = post_commit.matched_rules[0]
+                        activation_ids = [
+                            decision.activation_id
+                            for decision in post_commit.decisions
+                            if decision.matched and decision.fault_id == applied_rule.fault_id
+                        ]
+                        if len(activation_ids) != 1 or activation_ids[0] is None:
+                            raise FaultApplicationError(
+                                "post-commit fault has no unique activation identity"
+                            )
+                        if effect.newly_applied:
+                            post_commit_state_event_id = _event_id()
+                            self._append_state_evidence(
+                                run.run_id,
+                                post_commit_state_event_id,
+                                effect,
+                                request_event_id=request_event_id,
+                                logical_call_id=logical_call_id,
+                                causation_event_id=result_causation_event_id,
+                            )
+                        else:
+                            post_commit_state_event_id = self._state_evidence_for_effect(
+                                run.run_id, effect
+                            )
+                        marker = self._repository.create_post_commit_acknowledgement(
+                            run_id=run.run_id,
+                            attempt_id=attempt_id,
+                            logical_call_id=logical_call_id,
+                            attempt_number=attempt_number,
+                            call_ordinal=effective_call_ordinal,
+                            tool_id=tool_id,
+                            contract_version=contract_version,
+                            idempotency_key_digest=idempotency_key_digest,
+                            request_digest=request_digest,
+                            arguments_digest=arguments_digest,
+                            effect_id=effect.effect_id,
+                            lease_attempt=lease.attempt,
+                            request_event_id=request_event_id,
+                            state_evidence_event_id=post_commit_state_event_id,
+                            policy_decision_event_id=policy_decision_event_id,
+                            approval_id=effective_approval_id,
+                            fault_id=applied_rule.fault_id,
+                            activation_id=activation_ids[0],
+                            timeout_duration_ms=cast(int, applied_rule.parameters["duration_ms"]),
+                            matched_event_id=_event_id(),
+                            applied_event_id=_event_id(),
+                            result_event_id=_event_id(),
+                            observed_event_id=_event_id(),
+                        )
+                        return cast(
+                            ToolExecutionResult,
+                            _PendingPostCommit(
+                                marker,
+                                post_commit,
+                                effect,
+                                policy_decision_event_id,
+                                effective_approval_id,
+                                started,
+                            ),
+                        )
+                    self._record_fault_selection(
+                        run.run_id, request_event_id, logical_call_id, post_commit
+                    )
                 if definition.capability == "read" and output is not None and tool_error is None:
                     try:
                         self._repository.lock_current_lease(lease)
@@ -923,22 +1047,14 @@ class ToolGateway:
                 state_evidence_event_id: str | None = None
                 if effect is not None and effect.newly_applied:
                     state_evidence_event_id = _event_id()
-                    self._append_event(
+                    self._append_state_evidence(
                         run.run_id,
                         state_evidence_event_id,
-                        "state.evidence_recorded",
-                        {
-                            "evidence_id": effect.effect_id,
-                            "evidence_kind": "business_effect",
-                            "fact_type": effect.effect_kind,
-                            "subject": {
-                                "type": effect.subject_type,
-                                "id": effect.subject_id,
-                            },
-                            "related_event_ids": [request_event_id, result_event_id],
-                        },
-                        correlation_id=logical_call_id,
+                        effect,
+                        request_event_id=request_event_id,
+                        logical_call_id=logical_call_id,
                         causation_event_id=result_event_id,
+                        result_event_id=result_event_id,
                     )
                 return ToolExecutionResult(
                     tool_id=tool_id,
@@ -982,6 +1098,310 @@ class ToolGateway:
                 "tool evidence could not be persisted",
             )
 
+    def _execute_durable_post_commit(
+        self,
+        lease: LeaseIdentity,
+        *,
+        tool_id: str,
+        contract_version: str,
+        arguments: dict[str, object],
+        logical_call_id: str,
+        attempt_id: str,
+        attempt_number: int,
+        call_ordinal: int,
+        step_id: str | None,
+        causation_event_id: str | None,
+        approval_id: str | None,
+    ) -> ToolExecutionResult:
+        """Own the two local transactions required by a real post-commit boundary."""
+        bind = self._session.bind
+        if not isinstance(bind, Engine) or self._fault_engine is None:
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "infrastructure_error",
+                "post-commit acknowledgement requires an Engine-bound gateway",
+            )
+        if self._session.in_transaction():
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "infrastructure_error",
+                "post-commit acknowledgement requires a transaction-free caller session",
+            )
+        request_digest = digest_payload_v0(
+            {"tool_id": tool_id, "contract_version": contract_version, "arguments": arguments}
+        )
+        arguments_digest = digest_payload_v0(arguments)
+        idempotency_key_digest = digest_payload_v0(cast(str, arguments["idempotency_key"]))
+        lock_connection = bind.connect()
+        try:
+            lock_connection.execute(
+                text("SELECT pg_advisory_lock(hashtextextended(:run_id, 15015))"),
+                {"run_id": lease.run_id},
+            )
+            lock_connection.commit()
+        except SQLAlchemyError:
+            lock_connection.close()
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "infrastructure_error",
+                "post-commit serialization could not be established",
+            )
+        try:
+            first: object
+            with Session(bind) as effect_session, effect_session.begin():
+                durable = ToolGateway(
+                    effect_session,
+                    registry=self._registry,
+                    producer_component=self._producer_component,
+                    producer_instance_id=self._producer_instance_id,
+                    fault_engine=self._fault_engine,
+                    _durable_phase=True,
+                )
+                durable_run = durable._repository.lock_current_lease(lease)
+                if durable_run.status != "running":
+                    return self._rejected(
+                        tool_id,
+                        contract_version,
+                        "run_not_ready",
+                        "Run is not in the running lifecycle state",
+                    )
+                marker = durable._repository.get_post_commit_acknowledgement(
+                    lease.run_id, attempt_id
+                )
+                if marker is not None:
+                    durable._validate_post_commit_marker(
+                        marker,
+                        lease=lease,
+                        attempt_id=attempt_id,
+                        tool_id=tool_id,
+                        contract_version=contract_version,
+                        arguments=arguments,
+                        logical_call_id=logical_call_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=call_ordinal,
+                        request_digest=request_digest,
+                        arguments_digest=arguments_digest,
+                        idempotency_key_digest=idempotency_key_digest,
+                    )
+                    completed = durable._completed_post_commit_result(marker)
+                    if completed is not None:
+                        return completed
+                    effect = durable._repository.get_company_effect(
+                        lease.run_id, tool_id, contract_version, idempotency_key_digest
+                    )
+                    if effect is None:
+                        raise PersistenceIntegrityError(
+                            "post-commit marker has no authoritative effect"
+                        )
+                    effect = durable._repository.verify_company_effect(
+                        effect, expected_arguments=arguments
+                    )
+                    selection = durable._select_faults(
+                        run_id=lease.run_id,
+                        request_event_id=marker.request_event_id,
+                        scenario_digest=self._fault_engine.scenario_digest,
+                        tool_id=tool_id,
+                        phase="after_commit",
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=call_ordinal,
+                        arguments=arguments,
+                        arguments_digest=arguments_digest,
+                    )
+                    if selection is None or not selection.matched_rules:
+                        raise PersistenceIntegrityError(
+                            "pending post-commit marker no longer reproduces its fault"
+                        )
+                    first = _PendingPostCommit(
+                        marker,
+                        selection,
+                        effect,
+                        marker.policy_decision_event_id,
+                        marker.approval_id,
+                        monotonic_ns(),
+                    )
+                else:
+                    first = durable.execute(
+                        lease,
+                        tool_id=tool_id,
+                        contract_version=contract_version,
+                        arguments=arguments,
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        call_ordinal=call_ordinal,
+                        step_id=step_id,
+                        causation_event_id=causation_event_id,
+                        approval_id=approval_id,
+                    )
+            if not isinstance(first, _PendingPostCommit):
+                return first
+
+            marker = first.marker
+            with Session(bind) as acknowledgement_session, acknowledgement_session.begin():
+                acknowledgement = ToolGateway(
+                    acknowledgement_session,
+                    registry=self._registry,
+                    producer_component=self._producer_component,
+                    producer_instance_id=self._producer_instance_id,
+                    fault_engine=self._fault_engine,
+                )
+                try:
+                    acknowledgement_run = acknowledgement._repository.lock_current_lease(lease)
+                except (StaleLeaseError, LeaseExpiredError):
+                    return ToolExecutionResult(
+                        tool_id,
+                        contract_version,
+                        "failed",
+                        None,
+                        ToolError(
+                            "stale_lease",
+                            "the effect committed but this worker no longer owns "
+                            "its acknowledgement",
+                        ),
+                        marker.request_event_id,
+                        None,
+                        marker.state_evidence_event_id,
+                        marker.policy_decision_event_id,
+                        marker.approval_id,
+                    )
+                if acknowledgement_run.status != "running":
+                    return ToolExecutionResult(
+                        tool_id,
+                        contract_version,
+                        "failed",
+                        None,
+                        ToolError(
+                            "run_not_ready",
+                            "the effect committed but the Run is no longer running",
+                        ),
+                        marker.request_event_id,
+                        None,
+                        marker.state_evidence_event_id,
+                        marker.policy_decision_event_id,
+                        marker.approval_id,
+                    )
+                persisted = acknowledgement._repository.get_post_commit_acknowledgement(
+                    lease.run_id, attempt_id
+                )
+                if persisted != marker:
+                    raise PersistenceIntegrityError("post-commit marker changed after commitment")
+                completed = acknowledgement._completed_post_commit_result(marker)
+                if completed is not None:
+                    return completed
+                matched_ids = acknowledgement._record_fault_selection(
+                    lease.run_id,
+                    marker.request_event_id,
+                    marker.logical_call_id,
+                    first.selection,
+                    preferred_matched_event_ids={marker.fault_id: marker.matched_event_id},
+                )
+                application = self._fault_engine.apply_post_commit(first.selection)
+                if (
+                    len(application.applied) != 1
+                    or application.applied[0].rule.fault_id != marker.fault_id
+                    or application.applied[0].activation_id != marker.activation_id
+                ):
+                    raise PersistenceIntegrityError(
+                        "post-commit application does not match its durable marker"
+                    )
+                applied = acknowledgement._record_applied_faults(
+                    lease.run_id,
+                    marker.request_event_id,
+                    marker.logical_call_id,
+                    application.applied,
+                    matched_ids,
+                    preferred_applied_event_ids={marker.fault_id: marker.applied_event_id},
+                )
+                duration_ms = max(
+                    marker.timeout_duration_ms,
+                    max(0, (monotonic_ns() - first.started_ns) // 1_000_000),
+                )
+                acknowledgement._append_event(
+                    lease.run_id,
+                    marker.result_event_id,
+                    "tool.result",
+                    {
+                        "logical_call_id": marker.logical_call_id,
+                        "request_event_id": marker.request_event_id,
+                        "attempt_id": marker.attempt_id,
+                        "attempt_number": marker.attempt_number,
+                        "tool_id": marker.tool_id,
+                        "outcome": "timed_out",
+                        "duration_ms": duration_ms,
+                        "error_code": "fault_timeout",
+                    },
+                    correlation_id=marker.logical_call_id,
+                    causation_event_id=applied[0][1],
+                )
+                acknowledgement._append_event(
+                    lease.run_id,
+                    marker.observed_event_id,
+                    "fault.observed",
+                    {
+                        "fault_id": marker.fault_id,
+                        "activation_id": marker.activation_id,
+                        "related_event_ids": [
+                            marker.request_event_id,
+                            marker.applied_event_id,
+                            marker.result_event_id,
+                        ],
+                    },
+                    correlation_id=marker.logical_call_id,
+                    causation_event_id=marker.result_event_id,
+                )
+            return ToolExecutionResult(
+                tool_id,
+                contract_version,
+                "failed",
+                None,
+                ToolError(
+                    "fault_timeout",
+                    "the mutation committed but its acknowledgement timed out and is uncertain",
+                ),
+                marker.request_event_id,
+                marker.result_event_id,
+                marker.state_evidence_event_id,
+                marker.policy_decision_event_id,
+                marker.approval_id,
+            )
+        except (StaleLeaseError, LeaseExpiredError):
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "stale_lease",
+                "caller does not hold the current unexpired Run lease",
+            )
+        except (
+            EvidenceValidationError,
+            FaultApplicationError,
+            FaultRuleValidationError,
+            PersistenceError,
+            SQLAlchemyError,
+        ):
+            return self._rejected(
+                tool_id,
+                contract_version,
+                "infrastructure_error",
+                "post-commit acknowledgement could not be persisted",
+            )
+        finally:
+            try:
+                try:
+                    lock_connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:run_id, 15015))"),
+                        {"run_id": lease.run_id},
+                    )
+                    lock_connection.commit()
+                except SQLAlchemyError:
+                    lock_connection.invalidate()
+            finally:
+                lock_connection.close()
+
     def _select_faults(
         self,
         *,
@@ -989,7 +1409,7 @@ class ToolGateway:
         request_event_id: str,
         scenario_digest: str,
         tool_id: str,
-        phase: Literal["before_tool", "after_tool"],
+        phase: Literal["before_tool", "after_commit", "after_tool"],
         logical_call_id: str,
         attempt_id: str,
         attempt_number: int,
@@ -1059,7 +1479,6 @@ class ToolGateway:
             if (
                 rule is None
                 or rule.scenario_digest != scenario_digest
-                or rule.phase == "after_commit"
                 or _ACTIVATION_ID_RE.fullmatch(activation_id) is None
                 or activation_id in matched_activations
                 or request is None
@@ -1197,12 +1616,629 @@ class ToolGateway:
                 raise PersistenceIntegrityError("fault.observed has no authoritative application")
         return history
 
+    def _append_state_evidence(
+        self,
+        run_id: str,
+        event_id: str,
+        effect: CompanyEffect,
+        *,
+        request_event_id: str,
+        logical_call_id: str,
+        causation_event_id: str,
+        result_event_id: str | None = None,
+    ) -> None:
+        related = [request_event_id]
+        if result_event_id is not None:
+            related.append(result_event_id)
+        self._append_event(
+            run_id,
+            event_id,
+            "state.evidence_recorded",
+            {
+                "evidence_id": effect.effect_id,
+                "evidence_kind": "business_effect",
+                "fact_type": effect.effect_kind,
+                "subject": {"type": effect.subject_type, "id": effect.subject_id},
+                "related_event_ids": related,
+            },
+            correlation_id=logical_call_id,
+            causation_event_id=causation_event_id,
+        )
+
+    def _state_evidence_for_effect(self, run_id: str, effect: CompanyEffect) -> str:
+        matches: list[str] = []
+        for record in self._repository.fetch_events(run_id):
+            event = record.event.to_dict()
+            if event["event_type"] != "state.evidence_recorded":
+                continue
+            payload = cast(dict[str, object], event["payload"])
+            subject = payload.get("subject")
+            if (
+                payload.get("evidence_id") == effect.effect_id
+                and payload.get("evidence_kind") == "business_effect"
+                and payload.get("fact_type") == effect.effect_kind
+                and isinstance(subject, dict)
+                and subject.get("type") == effect.subject_type
+                and subject.get("id") == effect.subject_id
+            ):
+                matches.append(cast(str, event["event_id"]))
+        if len(matches) != 1:
+            raise PersistenceIntegrityError(
+                "effect ledger does not have exactly one authoritative state-evidence event"
+            )
+        return matches[0]
+
+    def recover_post_commit_attempt(
+        self,
+        lease: LeaseIdentity,
+        *,
+        marker: PostCommitAcknowledgement,
+        tool_id: str,
+        contract_version: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        attempt_id: str,
+        attempt_number: int,
+        call_ordinal: int,
+    ) -> ToolExecutionResult | None:
+        """Validate one durable marker and return its completed acknowledgement, if any."""
+        run = self._repository.lock_current_lease(lease)
+        if run.status != "running":
+            raise PersistenceIntegrityError("post-commit recovery requires a running Run")
+        arguments_snapshot = dict(arguments)
+        key = arguments_snapshot.get("idempotency_key")
+        if not isinstance(key, str):
+            raise PersistenceIntegrityError(
+                "post-commit recovery has no valid idempotency identity"
+            )
+        request_digest = digest_payload_v0(
+            {
+                "tool_id": tool_id,
+                "contract_version": contract_version,
+                "arguments": arguments_snapshot,
+            }
+        )
+        self._validate_post_commit_marker(
+            marker,
+            lease=lease,
+            attempt_id=attempt_id,
+            tool_id=tool_id,
+            contract_version=contract_version,
+            arguments=arguments_snapshot,
+            logical_call_id=logical_call_id,
+            attempt_number=attempt_number,
+            call_ordinal=call_ordinal,
+            request_digest=request_digest,
+            arguments_digest=digest_payload_v0(arguments_snapshot),
+            idempotency_key_digest=digest_payload_v0(key),
+        )
+        return self._completed_post_commit_result(marker)
+
+    def recover_committed_tool_attempt(
+        self,
+        lease: LeaseIdentity,
+        *,
+        tool_id: str,
+        contract_version: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        attempt_id: str,
+        attempt_number: int,
+    ) -> ToolExecutionResult | None:
+        """Reconstruct a markerless durable result committed before its checkpoint."""
+        run = self._repository.lock_current_lease(lease)
+        if run.status != "running":
+            raise PersistenceIntegrityError("committed mutation recovery requires a running Run")
+        definition = self._registry.resolve(tool_id, contract_version)
+        if definition is None or definition.capability != "mutation":
+            raise PersistenceIntegrityError(
+                "committed mutation recovery requires a registered mutation tool"
+            )
+        key = arguments.get("idempotency_key")
+        if not isinstance(key, str):
+            raise PersistenceIntegrityError(
+                "committed mutation recovery has no valid idempotency identity"
+            )
+        run_id = lease.run_id
+        documents = [record.event.to_dict() for record in self._repository.fetch_events(run_id)]
+        requests = [
+            document
+            for document in documents
+            if document["event_type"] == "tool.requested"
+            and cast(dict[str, object], document["payload"]).get("attempt_id") == attempt_id
+        ]
+        results = [
+            document
+            for document in documents
+            if document["event_type"] == "tool.result"
+            and cast(dict[str, object], document["payload"]).get("attempt_id") == attempt_id
+        ]
+        if not requests and not results:
+            return None
+        if len(requests) != 1 or len(results) != 1:
+            raise PersistenceIntegrityError("durable tool attempt evidence is partial or duplicate")
+        try:
+            validate_run_event_stream_v0(documents, complete=True)
+        except EvidenceValidationError as error:
+            raise PersistenceIntegrityError(
+                "durable tool attempt evidence is incoherent"
+            ) from error
+        request = requests[0]
+        result = results[0]
+        request_payload = cast(dict[str, object], request["payload"])
+        result_payload = cast(dict[str, object], result["payload"])
+        arguments_snapshot = dict(arguments)
+        arguments_digest = digest_payload_v0(arguments_snapshot)
+        key_digest = digest_payload_v0(key)
+        request_event_id = cast(str, request["event_id"])
+        result_event_id = cast(str, result["event_id"])
+        decisions = [
+            document
+            for document in documents
+            if document["event_type"] == "policy.decision"
+            and document.get("causation_event_id") == request_event_id
+        ]
+        if len(decisions) != 1:
+            raise PersistenceIntegrityError("durable tool attempt policy evidence is ambiguous")
+        decision = decisions[0]
+        scenario_record = self._repository.get_scenario_revision(
+            run.scenario.id, run.scenario.revision
+        )
+        if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
+            raise PersistenceIntegrityError("durable tool attempt Scenario is corrupt")
+        policy = self._resolve_frozen_policy(scenario_record.scenario.to_dict())
+        decision_payload = cast(dict[str, object], decision["payload"])
+        if not (
+            request["run_id"] == run_id
+            and request.get("correlation_id") == logical_call_id
+            and request_payload.get("logical_call_id") == logical_call_id
+            and request_payload.get("attempt_number") == attempt_number
+            and request_payload.get("tool_id") == tool_id
+            and request_payload.get("arguments_digest") == arguments_digest
+            and request_payload.get("idempotency_key_digest") == key_digest
+            and result["run_id"] == run_id
+            and result.get("correlation_id") == logical_call_id
+            and result_payload.get("logical_call_id") == logical_call_id
+            and result_payload.get("request_event_id") == request_event_id
+            and result_payload.get("attempt_number") == attempt_number
+            and result_payload.get("tool_id") == tool_id
+            and type(result_payload.get("duration_ms")) is int
+            and decision["run_id"] == run_id
+            and decision.get("correlation_id") == logical_call_id
+            and decision_payload.get("logical_call_id") == logical_call_id
+            and decision_payload.get("policy")
+            == {"id": policy.id, "revision": policy.revision, "digest": policy.digest}
+            and cast(int, request["sequence"])
+            < cast(int, decision["sequence"])
+            < cast(int, result["sequence"])
+        ):
+            raise PersistenceIntegrityError("durable tool attempt binding is corrupt")
+
+        output: dict[str, object] | None = None
+        state_evidence_event_id: str | None = None
+        response_digest = result_payload.get("response_digest")
+        if response_digest is not None:
+            effect = self._repository.get_company_effect(
+                run_id, tool_id, contract_version, key_digest
+            )
+            if effect is None:
+                raise PersistenceIntegrityError("successful durable mutation has no effect")
+            effect = self._repository.verify_company_effect(
+                effect, expected_arguments=arguments_snapshot
+            )
+            if (
+                effect.logical_call_id != logical_call_id
+                or effect.first_attempt_id != attempt_id
+                or effect.lease_attempt > lease.attempt
+            ):
+                raise PersistenceIntegrityError("durable mutation effect provenance is corrupt")
+            candidates: list[tuple[dict[str, object], bool]] = []
+            replay = dict(effect.result)
+            replay["application"] = "already_applied"
+            candidates.append((replay, False))
+            applied = dict(effect.result)
+            applied["application"] = "newly_applied"
+            candidates.append((applied, True))
+            matches = [
+                (candidate, newly_applied)
+                for candidate, newly_applied in candidates
+                if digest_payload_v0(candidate) == response_digest
+            ]
+            if len(matches) != 1:
+                raise PersistenceIntegrityError("durable mutation response digest is corrupt")
+            output, newly_applied = matches[0]
+            state_matches = [
+                document
+                for document in documents
+                if document["event_type"] == "state.evidence_recorded"
+                and cast(dict[str, object], document["payload"]).get("evidence_id")
+                == effect.effect_id
+            ]
+            if newly_applied:
+                if len(state_matches) != 1:
+                    raise PersistenceIntegrityError(
+                        "new durable mutation has no unique state evidence"
+                    )
+                state = state_matches[0]
+                state_payload = cast(dict[str, object], state["payload"])
+                if not (
+                    state.get("causation_event_id") == result_event_id
+                    and state_payload.get("evidence_kind") == "business_effect"
+                    and state_payload.get("fact_type") == effect.effect_kind
+                    and state_payload.get("subject")
+                    == {"type": effect.subject_type, "id": effect.subject_id}
+                    and state_payload.get("related_event_ids")
+                    == [request_event_id, result_event_id]
+                    and cast(int, result["sequence"]) < cast(int, state["sequence"])
+                ):
+                    raise PersistenceIntegrityError("durable mutation state evidence is corrupt")
+                state_evidence_event_id = cast(str, state["event_id"])
+            elif state_matches:
+                state_evidence_event_id = None
+
+        error_code = result_payload.get("error_code")
+        recovered_error: ToolError | None = None
+        if isinstance(error_code, str):
+            recovered_error = ToolError(
+                cast(ToolErrorCode, error_code), "tool execution did not succeed"
+            )
+        evidence_outcome = cast(
+            Literal["succeeded", "failed", "timed_out"], result_payload["outcome"]
+        )
+        if (evidence_outcome == "succeeded") != (output is not None and recovered_error is None):
+            raise PersistenceIntegrityError("durable tool result outcome is inconsistent")
+        outcome: Literal["succeeded", "failed", "denied"] = (
+            "succeeded"
+            if evidence_outcome == "succeeded"
+            else "denied"
+            if error_code
+            in {
+                "policy_denied",
+                "approval_required",
+                "approval_not_found",
+                "approval_pending",
+                "approval_denied",
+                "approval_mismatch",
+            }
+            else "failed"
+        )
+
+        approval_id: str | None = None
+        if decision_payload.get("decision") == "require_approval":
+            approval_id = approval_identity(
+                run_id=run_id,
+                scenario_id=run.scenario.id,
+                scenario_revision=run.scenario.revision,
+                scenario_digest=run.scenario.digest,
+                policy_id=policy.id,
+                policy_revision=policy.revision,
+                policy_digest=policy.digest,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                request_digest=digest_payload_v0(
+                    {
+                        "tool_id": tool_id,
+                        "contract_version": contract_version,
+                        "arguments": arguments_snapshot,
+                    }
+                ),
+                idempotency_key_digest=key_digest,
+            )
+            approval = self._repository.get_approval_request_for_authorization(
+                approval_id,
+                run=run,
+                policy=policy,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                request_digest=digest_payload_v0(
+                    {
+                        "tool_id": tool_id,
+                        "contract_version": contract_version,
+                        "arguments": arguments_snapshot,
+                    }
+                ),
+                idempotency_key_digest=key_digest,
+                arguments=arguments_snapshot,
+            )
+            if approval is None and error_code not in {"approval_mismatch", "approval_not_found"}:
+                raise PersistenceIntegrityError("durable approval-required result is unbound")
+
+        return ToolExecutionResult(
+            tool_id,
+            contract_version,
+            outcome,
+            None if output is None else cast(Mapping[str, object], _freeze_json(output)),
+            recovered_error,
+            request_event_id,
+            result_event_id,
+            state_evidence_event_id,
+            cast(str, decision["event_id"]),
+            approval_id,
+        )
+
+    def _validate_post_commit_marker(
+        self,
+        marker: PostCommitAcknowledgement,
+        *,
+        lease: LeaseIdentity,
+        attempt_id: str,
+        tool_id: str,
+        contract_version: str,
+        arguments: Mapping[str, object],
+        logical_call_id: str,
+        attempt_number: int,
+        call_ordinal: int,
+        request_digest: str,
+        arguments_digest: str,
+        idempotency_key_digest: str,
+    ) -> None:
+        planned_event_ids = (
+            marker.matched_event_id,
+            marker.applied_event_id,
+            marker.result_event_id,
+            marker.observed_event_id,
+        )
+        if (
+            marker.run_id != lease.run_id
+            or marker.attempt_id != attempt_id
+            or marker.logical_call_id != logical_call_id
+            or marker.attempt_number != attempt_number
+            or marker.call_ordinal != call_ordinal
+            or marker.tool_id != tool_id
+            or marker.contract_version != contract_version
+            or marker.idempotency_key_digest != idempotency_key_digest
+            or marker.request_digest != request_digest
+            or marker.arguments_digest != arguments_digest
+            or marker.lease_attempt > lease.attempt
+            or len(set(planned_event_ids)) != len(planned_event_ids)
+        ):
+            raise PersistenceIntegrityError("post-commit marker does not bind this exact request")
+        assert self._fault_engine is not None
+        rules = [rule for rule in self._fault_engine.rules if rule.fault_id == marker.fault_id]
+        if len(rules) != 1:
+            raise PersistenceIntegrityError("post-commit marker fault binding is missing")
+        rule = rules[0]
+        if (
+            rule.kind != "ambiguous_post_commit_timeout"
+            or rule.phase != "after_commit"
+            or rule.tool_id != marker.tool_id
+            or rule.parameters.get("duration_ms") != marker.timeout_duration_ms
+            or (rule.call_ordinal is not None and rule.call_ordinal != marker.call_ordinal)
+            or any(arguments.get(key) != value for key, value in rule.argument_equals.items())
+            or not self._fault_engine.authenticates_activation(
+                rule,
+                run_id=marker.run_id,
+                logical_call_id=marker.logical_call_id,
+                physical_attempt_id=marker.attempt_id,
+                attempt_number=marker.attempt_number,
+                arguments_digest=marker.arguments_digest,
+                activation_id=marker.activation_id,
+                call_ordinal=marker.call_ordinal,
+            )
+        ):
+            raise PersistenceIntegrityError("post-commit marker fault activation is corrupt")
+        effect = self._repository.get_company_effect(
+            marker.run_id, marker.tool_id, marker.contract_version, marker.idempotency_key_digest
+        )
+        if effect is None or effect.effect_id != marker.effect_id:
+            raise PersistenceIntegrityError("post-commit marker effect binding is corrupt")
+        effect = self._repository.verify_company_effect(effect, expected_arguments=arguments)
+        if (
+            effect.logical_call_id != marker.logical_call_id
+            or effect.first_attempt_id != marker.attempt_id
+            or effect.lease_attempt != marker.lease_attempt
+        ):
+            raise PersistenceIntegrityError("post-commit marker effect provenance is corrupt")
+        event_documents = [
+            record.event.to_dict() for record in self._repository.fetch_events(marker.run_id)
+        ]
+        try:
+            validate_run_event_stream_v0(event_documents, complete=True)
+        except EvidenceValidationError as error:
+            raise PersistenceIntegrityError("post-commit Run evidence is incoherent") from error
+        records = {document["event_id"]: document for document in event_documents}
+        request = records.get(marker.request_event_id)
+        state = records.get(marker.state_evidence_event_id)
+        decision = records.get(marker.policy_decision_event_id)
+        if request is None or state is None or decision is None:
+            raise PersistenceIntegrityError("post-commit marker evidence binding is missing")
+        request_payload = cast(dict[str, object], request["payload"])
+        state_payload = cast(dict[str, object], state["payload"])
+        decision_payload = cast(dict[str, object], decision["payload"])
+        run = self._repository.get_run(marker.run_id)
+        if run is None:
+            raise PersistenceIntegrityError("post-commit marker Run binding is missing")
+        scenario_record = self._repository.get_scenario_revision(
+            run.scenario.id, run.scenario.revision
+        )
+        if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
+            raise PersistenceIntegrityError("post-commit marker Scenario binding is corrupt")
+        scenario = scenario_record.scenario.to_dict()
+        if (
+            self._fault_engine.scenario_id != run.scenario.id
+            or self._fault_engine.scenario_revision != run.scenario.revision
+            or self._fault_engine.scenario_digest != run.scenario.digest
+        ):
+            raise PersistenceIntegrityError(
+                "post-commit marker fault engine does not match its Run Scenario"
+            )
+        policy = self._resolve_frozen_policy(scenario)
+        expected_state_cause = marker.policy_decision_event_id
+        expected_decision = "allow"
+        if marker.approval_id is not None:
+            expected_decision = "require_approval"
+            approval = self._repository.get_approval_request_for_authorization(
+                marker.approval_id,
+                run=run,
+                policy=policy,
+                tool_id=marker.tool_id,
+                contract_version=marker.contract_version,
+                request_digest=marker.request_digest,
+                idempotency_key_digest=marker.idempotency_key_digest,
+                arguments=arguments,
+            )
+            if (
+                approval is None
+                or approval.status != "approved"
+                or approval.resolution_event_id is None
+            ):
+                raise PersistenceIntegrityError(
+                    "post-commit marker approval binding is not authoritatively approved"
+                )
+            expected_state_cause = approval.resolution_event_id
+        if not (
+            request["event_type"] == "tool.requested"
+            and request["run_id"] == marker.run_id
+            and request.get("correlation_id") == marker.logical_call_id
+            and request_payload.get("logical_call_id") == marker.logical_call_id
+            and request_payload.get("attempt_id") == marker.attempt_id
+            and request_payload.get("attempt_number") == marker.attempt_number
+            and request_payload.get("tool_id") == marker.tool_id
+            and request_payload.get("arguments_digest") == marker.arguments_digest
+            and request_payload.get("idempotency_key_digest") == marker.idempotency_key_digest
+            and decision["event_type"] == "policy.decision"
+            and decision["run_id"] == marker.run_id
+            and decision.get("correlation_id") == marker.logical_call_id
+            and decision.get("causation_event_id") == marker.request_event_id
+            and decision_payload.get("policy")
+            == {"id": policy.id, "revision": policy.revision, "digest": policy.digest}
+            and decision_payload.get("decision") == expected_decision
+            and decision_payload.get("logical_call_id") == marker.logical_call_id
+            and state["event_type"] == "state.evidence_recorded"
+            and state["run_id"] == marker.run_id
+            and state.get("correlation_id") == marker.logical_call_id
+            and state.get("causation_event_id") == expected_state_cause
+            and state_payload.get("evidence_id") == marker.effect_id
+            and state_payload.get("evidence_kind") == "business_effect"
+            and state_payload.get("fact_type") == effect.effect_kind
+            and state_payload.get("subject")
+            == {"type": effect.subject_type, "id": effect.subject_id}
+            and state_payload.get("related_event_ids") == [marker.request_event_id]
+            and cast(int, request["sequence"])
+            < cast(int, decision["sequence"])
+            < cast(int, state["sequence"])
+        ):
+            raise PersistenceIntegrityError("post-commit marker evidence binding is corrupt")
+
+    def _completed_post_commit_result(
+        self, marker: PostCommitAcknowledgement
+    ) -> ToolExecutionResult | None:
+        documents = [
+            record.event.to_dict() for record in self._repository.fetch_events(marker.run_id)
+        ]
+        try:
+            validate_run_event_stream_v0(documents, complete=True)
+        except EvidenceValidationError as error:
+            raise PersistenceIntegrityError("post-commit Run evidence is incoherent") from error
+        by_id = {cast(str, document["event_id"]): document for document in documents}
+        ids = (
+            marker.matched_event_id,
+            marker.applied_event_id,
+            marker.result_event_id,
+            marker.observed_event_id,
+        )
+        present = [event_id in by_id for event_id in ids]
+        if not any(present):
+            return None
+        if not all(present):
+            raise PersistenceIntegrityError("post-commit acknowledgement evidence is partial")
+        matched, applied, result, observed = (by_id[event_id] for event_id in ids)
+        state = by_id.get(marker.state_evidence_event_id)
+        if state is None:
+            raise PersistenceIntegrityError("post-commit state evidence is missing")
+        matched_payload = cast(dict[str, object], matched["payload"])
+        applied_payload = cast(dict[str, object], applied["payload"])
+        result_payload = cast(dict[str, object], result["payload"])
+        observed_payload = cast(dict[str, object], observed["payload"])
+        if not (
+            matched["event_type"] == "fault.matched"
+            and matched["run_id"] == marker.run_id
+            and matched.get("correlation_id") == marker.logical_call_id
+            and matched.get("causation_event_id") == marker.request_event_id
+            and matched_payload
+            == {
+                "fault_id": marker.fault_id,
+                "activation_id": marker.activation_id,
+                "related_event_ids": [marker.request_event_id],
+            }
+            and applied["event_type"] == "fault.applied"
+            and applied["run_id"] == marker.run_id
+            and applied.get("correlation_id") == marker.logical_call_id
+            and applied.get("causation_event_id") == marker.matched_event_id
+            and applied_payload.get("fault_id") == marker.fault_id
+            and applied_payload.get("activation_id") == marker.activation_id
+            and set(cast(list[str], applied_payload.get("related_event_ids")))
+            == {marker.request_event_id, marker.matched_event_id}
+            and result["event_type"] == "tool.result"
+            and result["run_id"] == marker.run_id
+            and result.get("correlation_id") == marker.logical_call_id
+            and result.get("causation_event_id") == marker.applied_event_id
+            and result_payload.get("logical_call_id") == marker.logical_call_id
+            and result_payload.get("request_event_id") == marker.request_event_id
+            and result_payload.get("attempt_id") == marker.attempt_id
+            and result_payload.get("attempt_number") == marker.attempt_number
+            and result_payload.get("tool_id") == marker.tool_id
+            and result_payload.get("outcome") == "timed_out"
+            and result_payload.get("error_code") == "fault_timeout"
+            and type(result_payload.get("duration_ms")) is int
+            and cast(int, result_payload["duration_ms"]) >= marker.timeout_duration_ms
+            and observed["event_type"] == "fault.observed"
+            and observed["run_id"] == marker.run_id
+            and observed.get("correlation_id") == marker.logical_call_id
+            and observed.get("causation_event_id") == marker.result_event_id
+            and observed_payload.get("fault_id") == marker.fault_id
+            and observed_payload.get("activation_id") == marker.activation_id
+            and set(cast(list[str], observed_payload.get("related_event_ids")))
+            == {
+                marker.request_event_id,
+                marker.applied_event_id,
+                marker.result_event_id,
+            }
+            and cast(int, state["sequence"]) < cast(int, matched["sequence"])
+            and cast(int, matched["sequence"])
+            < cast(int, applied["sequence"])
+            < cast(int, result["sequence"])
+            < cast(int, observed["sequence"])
+        ):
+            raise PersistenceIntegrityError("post-commit acknowledgement evidence is corrupt")
+        return ToolExecutionResult(
+            marker.tool_id,
+            marker.contract_version,
+            "failed",
+            None,
+            ToolError(
+                "fault_timeout",
+                "the mutation committed but its acknowledgement timed out and is uncertain",
+            ),
+            marker.request_event_id,
+            marker.result_event_id,
+            marker.state_evidence_event_id,
+            marker.policy_decision_event_id,
+            marker.approval_id,
+        )
+
+    def _resolve_frozen_policy(self, scenario: Mapping[str, object]) -> RevisionReference:
+        policy_document = cast(dict[str, object], scenario["policy"])
+        policy = RevisionReference(
+            cast(str, policy_document["id"]),
+            cast(str, policy_document["revision"]),
+            cast(str, policy_document["digest"]),
+        )
+        policy_record = self._repository.get_policy_revision(policy.id, policy.revision)
+        if policy_record is None or policy_record.policy.digest != policy.digest:
+            raise PersistenceIntegrityError(
+                "frozen Scenario Policy reference does not resolve authoritatively"
+            )
+        return policy
+
     def _record_fault_selection(
         self,
         run_id: str,
         request_event_id: str,
         logical_call_id: str,
         selection: FaultSelection | None,
+        *,
+        preferred_matched_event_ids: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
         if selection is None:
             return {}
@@ -1224,7 +2260,7 @@ class ToolGateway:
             ]
             if len(activation_ids) != 1 or activation_ids[0] is None:
                 raise FaultApplicationError("matched fault has no unique activation identity")
-            event_id = _event_id()
+            event_id = (preferred_matched_event_ids or {}).get(rule.fault_id) or _event_id()
             self._append_event(
                 run_id,
                 event_id,
@@ -1247,13 +2283,15 @@ class ToolGateway:
         logical_call_id: str,
         applied: tuple[AppliedFault, ...],
         matched_event_ids: Mapping[str, str],
+        *,
+        preferred_applied_event_ids: Mapping[str, str] | None = None,
     ) -> list[tuple[AppliedFault, str]]:
         records: list[tuple[AppliedFault, str]] = []
         for item in applied:
             matched_event_id = matched_event_ids.get(item.rule.fault_id)
             if matched_event_id is None:
                 raise FaultApplicationError("applied fault has no matched evidence")
-            event_id = _event_id()
+            event_id = (preferred_applied_event_ids or {}).get(item.rule.fault_id) or _event_id()
             self._append_event(
                 run_id,
                 event_id,
