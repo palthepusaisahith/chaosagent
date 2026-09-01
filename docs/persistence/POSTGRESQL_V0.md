@@ -215,3 +215,11 @@ the effect ledger's original logical call, physical attempt, and lease
 generation and resolves the persisted frozen Policy revision. Downgrade to
 `0007` intentionally drops markers while preserving effects and events. See
 [POST_COMMIT_AMBIGUITY_V0.md](../faults/POST_COMMIT_AMBIGUITY_V0.md).
+
+Migration `0009_run_fault_seed` adds the nullable, bind-once `runs.fault_seed`
+used to authenticate deterministic Issue #13 activation identities during later
+evaluation. Repository binding requires the current DB-time-valid lease; the
+database permits only `NULL → value` and rejects every subsequent change. No
+seed is fabricated for older Runs. Downgrade removes the column and trigger, so
+an old faulted Run without another trustworthy source cannot later be evaluated
+as though its activation were authenticated.

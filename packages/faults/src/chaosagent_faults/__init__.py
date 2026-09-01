@@ -10,6 +10,11 @@ from .application import (
     FaultSelection,
     FaultSleeper,
 )
+from .history import (
+    AuthenticatedFaultHistory,
+    FaultHistoryValidationError,
+    authenticate_fault_history_v0,
+)
 from .matcher import (
     FAULT_MATCHER_V0_ALGORITHM,
     CompiledFaultPlan,
@@ -26,6 +31,7 @@ from .matcher import (
 
 __all__ = [
     "AppliedFault",
+    "AuthenticatedFaultHistory",
     "BlockingFaultSleeper",
     "FAULT_MATCHER_V0_ALGORITHM",
     "CompiledFaultPlan",
@@ -36,12 +42,14 @@ __all__ = [
     "FaultApplicationResult",
     "FaultEngine",
     "FaultFailureCode",
+    "FaultHistoryValidationError",
     "FaultKind",
     "FaultMatchContext",
     "FaultPhase",
     "FaultRuleValidationError",
     "FaultSelection",
     "FaultSleeper",
+    "authenticate_fault_history_v0",
     "compile_fault_plan_v0",
     "match_fault_plan_v0",
 ]

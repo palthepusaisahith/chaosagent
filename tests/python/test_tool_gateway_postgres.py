@@ -52,7 +52,7 @@ from chaosagent_tool_gateway import (
     ToolRegistry,
     default_tool_registry,
 )
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
@@ -1470,6 +1470,19 @@ def test_migration_0008_downgrades_populated_marker_and_reupgrades(
                 {"run_id": run_id},
             )
             == 1
+        )
+    command.upgrade(configuration, "head")
+    with gateway_engine.connect() as connection:
+        assert "fault_seed" in {
+            column["name"]
+            for column in inspect(gateway_engine).get_columns("runs", schema="public")
+        }
+        assert (
+            connection.scalar(
+                text("SELECT fault_seed FROM public.runs WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            is None
         )
     command.check(configuration)
 

@@ -17,6 +17,7 @@ from .runtime import (
     execute_run,
     execution_checkpoint_schema_v0,
     validate_execution_checkpoint,
+    validate_final_execution_snapshot,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "execute_run",
     "execution_checkpoint_schema_v0",
     "validate_execution_checkpoint",
+    "validate_final_execution_snapshot",
 ]

@@ -27,8 +27,10 @@ from chaosagent_faults import (
     AppliedFault,
     FaultApplicationError,
     FaultEngine,
+    FaultHistoryValidationError,
     FaultRuleValidationError,
     FaultSelection,
+    authenticate_fault_history_v0,
 )
 from chaosagent_persistence import (
     BusinessRuleViolationError,
@@ -542,6 +544,8 @@ class ToolGateway:
                     raise PersistenceIntegrityError(
                         "fault engine does not match the authoritative Run Scenario"
                     )
+                if self._fault_engine is not None:
+                    run = self._repository.bind_run_fault_seed(lease, self._fault_engine.run_seed)
                 scenario = scenario_record.scenario.to_dict()
                 agent = cast(dict[str, object], scenario["agent"])
                 if tool_id not in cast(list[str], agent["allowed_tools"]):
@@ -1449,172 +1453,25 @@ class ToolGateway:
     ) -> dict[str, int]:
         """Authenticate complete committed fault chains before counting them."""
         assert self._fault_engine is not None
-        if self._fault_engine.scenario_digest != scenario_digest:
-            raise PersistenceIntegrityError("fault history has the wrong Scenario digest")
         records = self._repository.fetch_events(run_id)
-        events = tuple(record.event for record in records)
-        documents = [event.to_dict() for event in events]
-        if events:
+        documents = [record.event.to_dict() for record in records]
+        if documents:
             try:
                 validate_run_event_stream_v0(documents, complete=True)
             except EvidenceValidationError as error:
                 raise PersistenceIntegrityError("Run Event history is incoherent") from error
-        by_id = {cast(str, item["event_id"]): item for item in documents}
-        rules = {rule.fault_id: rule for rule in self._fault_engine.rules}
-        history = {fault_id: 0 for fault_id in rules}
-        matched_activations: dict[str, str] = {}
-        applied_activations: set[str] = set()
-
-        for document in documents:
-            if document["event_type"] != "fault.matched":
-                continue
-            payload = cast(dict[str, object], document["payload"])
-            related = cast(list[str], payload["related_event_ids"])
-            if current_request_event_id in related:
-                continue
-            fault_id = cast(str, payload["fault_id"])
-            activation_id = cast(str, payload["activation_id"])
-            rule = rules.get(fault_id)
-            request = by_id.get(related[0]) if len(related) == 1 else None
-            if (
-                rule is None
-                or rule.scenario_digest != scenario_digest
-                or _ACTIVATION_ID_RE.fullmatch(activation_id) is None
-                or activation_id in matched_activations
-                or request is None
-                or request["event_type"] != "tool.requested"
-                or document.get("causation_event_id") != request["event_id"]
-                or document["correlation_id"] != request["correlation_id"]
-                or document["producer"] != request["producer"]
-                or cast(dict[str, object], document["producer"])["component"]
-                != self._producer_component
-            ):
-                raise PersistenceIntegrityError("fault.matched history is incoherent")
-            request_payload = cast(dict[str, object], request["payload"])
-            if (
-                request["run_id"] != run_id
-                or request["correlation_id"] != request_payload["logical_call_id"]
-                or request_payload["tool_id"] != rule.tool_id
-                or not self._fault_engine.authenticates_activation(
-                    rule,
-                    run_id=run_id,
-                    logical_call_id=cast(str, request_payload["logical_call_id"]),
-                    physical_attempt_id=cast(str, request_payload["attempt_id"]),
-                    attempt_number=cast(int, request_payload["attempt_number"]),
-                    arguments_digest=cast(str, request_payload["arguments_digest"]),
-                    activation_id=activation_id,
-                )
-                or cast(int, request["sequence"]) >= cast(int, document["sequence"])
-            ):
-                raise PersistenceIntegrityError("fault.matched request binding is incoherent")
-            matched_activations[activation_id] = cast(str, document["event_id"])
-
-        for document in documents:
-            if document["event_type"] != "fault.applied":
-                continue
-            payload = cast(dict[str, object], document["payload"])
-            related = cast(list[str], payload["related_event_ids"])
-            if current_request_event_id in related:
-                continue
-            fault_id = cast(str, payload["fault_id"])
-            activation_id = cast(str, payload["activation_id"])
-            rule = rules.get(fault_id)
-            matched_id = matched_activations.get(activation_id)
-            matched = by_id.get(matched_id) if matched_id is not None else None
-            request_ids = [
-                item
-                for item in related
-                if (candidate := by_id.get(item)) is not None
-                and candidate["event_type"] == "tool.requested"
-            ]
-            if (
-                rule is None
-                or matched is None
-                or activation_id in applied_activations
-                or matched_id not in related
-                or len(request_ids) != 1
-                or set(related) != {request_ids[0], matched_id}
-                or document.get("causation_event_id") != matched_id
-                or document["correlation_id"] != matched["correlation_id"]
-                or document["producer"] != matched["producer"]
-            ):
-                raise PersistenceIntegrityError("fault.applied history is incoherent")
-            matched_payload = cast(dict[str, object], matched["payload"])
-            if (
-                matched_payload["fault_id"] != fault_id
-                or matched_payload["activation_id"] != activation_id
-                or set(cast(list[str], matched_payload["related_event_ids"])) != {request_ids[0]}
-                or cast(int, matched["sequence"]) >= cast(int, document["sequence"])
-            ):
-                raise PersistenceIntegrityError("fault application identity is incoherent")
-            request = by_id[request_ids[0]]
-            result_candidates = [
-                item
-                for item in documents
-                if item["event_type"] == "tool.result"
-                and cast(dict[str, object], item["payload"])["request_event_id"]
-                == request["event_id"]
-            ]
-            observed_candidates = [
-                item
-                for item in documents
-                if item["event_type"] == "fault.observed"
-                and cast(dict[str, object], item["payload"])["activation_id"] == activation_id
-            ]
-            if len(result_candidates) != 1 or len(observed_candidates) != 1:
-                raise PersistenceIntegrityError("fault application has no unique observed result")
-            result = result_candidates[0]
-            observed = observed_candidates[0]
-            result_payload = cast(dict[str, object], result["payload"])
-            observed_payload = cast(dict[str, object], observed["payload"])
-            request_payload = cast(dict[str, object], request["payload"])
-            request_applications = [
-                item
-                for item in documents
-                if item["event_type"] == "fault.applied"
-                and request_ids[0]
-                in cast(list[str], cast(dict[str, object], item["payload"])["related_event_ids"])
-            ]
-            last_application = max(
-                request_applications, key=lambda item: cast(int, item["sequence"])
+        try:
+            authenticated = authenticate_fault_history_v0(
+                documents,
+                self._fault_engine,
+                run_id=run_id,
+                scenario_digest=scenario_digest,
+                producer_component=self._producer_component,
+                ignore_request_event_id=current_request_event_id,
             )
-            if (
-                result_payload["logical_call_id"] != request_payload["logical_call_id"]
-                or result_payload["attempt_id"] != request_payload["attempt_id"]
-                or result_payload["attempt_number"] != request_payload["attempt_number"]
-                or result_payload["tool_id"] != request_payload["tool_id"]
-                or observed_payload["fault_id"] != fault_id
-                or set(cast(list[str], observed_payload["related_event_ids"]))
-                != {
-                    cast(str, request["event_id"]),
-                    cast(str, document["event_id"]),
-                    cast(str, result["event_id"]),
-                }
-                or observed.get("causation_event_id") != result["event_id"]
-                or observed["correlation_id"] != request["correlation_id"]
-                or observed["producer"] != request["producer"]
-                or result.get("causation_event_id") != last_application["event_id"]
-                or result["correlation_id"] != request["correlation_id"]
-                or result["producer"] != request["producer"]
-                or not (
-                    cast(int, document["sequence"])
-                    < cast(int, result["sequence"])
-                    < cast(int, observed["sequence"])
-                )
-            ):
-                raise PersistenceIntegrityError("fault observation history is incoherent")
-            applied_activations.add(activation_id)
-            history[fault_id] += 1
-
-        for document in documents:
-            if document["event_type"] != "fault.observed":
-                continue
-            payload = cast(dict[str, object], document["payload"])
-            if current_request_event_id in cast(list[str], payload["related_event_ids"]):
-                continue
-            if cast(str, payload["activation_id"]) not in applied_activations:
-                raise PersistenceIntegrityError("fault.observed has no authoritative application")
-        return history
+        except FaultHistoryValidationError as error:
+            raise PersistenceIntegrityError("Run fault history is incoherent") from error
+        return dict(authenticated.counts)
 
     def _append_state_evidence(
         self,

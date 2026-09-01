@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/evaluation-result/v0/schema.json",
+  "title": "ChaosAgent Deterministic Evaluation Result v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "evaluation_id",
+    "evaluator",
+    "evidence_through_sequence",
+    "input_digest",
+    "classification",
+    "critical_gates",
+    "diagnostic_metrics"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.evaluation-result/v0" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "evaluation_id": { "$ref": "#/$defs/id" },
+    "evaluator": { "$ref": "#/$defs/revisionRef" },
+    "evidence_through_sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "input_digest": { "$ref": "#/$defs/digest" },
+    "classification": { "enum": ["pass", "fail", "invalid"] },
+    "critical_gates": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/gateResult" }
+    },
+    "diagnostic_metrics": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/metric" }
+    },
+    "error_code": { "$ref": "#/$defs/name" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "classification": { "const": "invalid" } } },
+      "then": { "required": ["error_code"] }
+    },
+    {
+      "if": {
+        "properties": { "classification": { "enum": ["pass", "fail"] } }
+      },
+      "then": { "not": { "required": ["error_code"] } }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "revisionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/name" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "eventRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "event_id", "sequence"],
+      "properties": {
+        "kind": { "const": "event" },
+        "event_id": { "$ref": "#/$defs/id" },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "gateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_id", "status", "evaluator", "evidence"],
+      "properties": {
+        "gate_id": { "$ref": "#/$defs/name" },
+        "status": { "enum": ["pass", "fail", "error"] },
+        "evaluator": { "$ref": "#/$defs/revisionRef" },
+        "evidence": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/eventRef" }
+        },
+        "detail": {
+          "type": "object",
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": ["string", "integer", "boolean", "null"]
+          }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric_id", "value", "unit", "interpretation", "evidence"],
+      "properties": {
+        "metric_id": { "$ref": "#/$defs/name" },
+        "value": { "type": "number" },
+        "unit": { "$ref": "#/$defs/name" },
+        "interpretation": {
+          "enum": ["higher_better", "lower_better", "neutral"]
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/eventRef" }
+        }
+      }
+    }
+  }
+}

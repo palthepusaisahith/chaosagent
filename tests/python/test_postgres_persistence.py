@@ -150,6 +150,42 @@ def _seed_run(session: Session, run_id: str) -> None:
     )
 
 
+def _seed_isolated_run(session: Session, run_id: str) -> None:
+    repository = PersistenceRepository(session)
+    fixture_document = _fixture().to_dict()
+    fixture_document["fixture_id"] = _unique("fault-seed-fixture")
+    fixture = loads_fixture(json.dumps(fixture_document))
+    policy_document = _policy().to_dict()
+    policy_document["policy_id"] = _unique("fault-seed-policy")
+    policy = loads_policy(json.dumps(policy_document))
+    scenario_document = _scenario().to_dict()
+    scenario_document["scenario_id"] = _unique("fault-seed-scenario")
+    scenario_document["fixture"] = {
+        "id": fixture_document["fixture_id"],
+        "revision": fixture_document["revision"],
+        "digest": fixture.digest,
+    }
+    scenario_document["policy"] = {
+        "id": policy_document["policy_id"],
+        "revision": policy_document["revision"],
+        "digest": policy.digest,
+    }
+    scenario = loads_scenario(json.dumps(scenario_document))
+    agent = RevisionReference(_unique("fault-seed-agent"), "1", "sha256:" + "c" * 64)
+    repository.insert_fixture_revision(fixture, created_by="fault-seed-test")
+    repository.insert_policy_revision(policy, created_by="fault-seed-test")
+    repository.insert_scenario_revision(scenario, created_by="fault-seed-test")
+    repository.insert_agent_configuration_reference(agent, created_by="fault-seed-test")
+    repository.create_run(
+        run_id,
+        scenario_id=cast(str, scenario_document["scenario_id"]),
+        scenario_revision=cast(str, scenario_document["revision"]),
+        agent_configuration_id=agent.id,
+        agent_configuration_revision=agent.revision,
+        created_by="fault-seed-test",
+    )
+
+
 def _lifecycle_evidence(sequence: int) -> LifecycleEvidence:
     return LifecycleEvidence(
         event_id=_unique(f"lifecycle-event-{sequence}"),
@@ -522,6 +558,75 @@ def test_policy_approval_migration_round_trips_to_issue_9(migrated_engine: Engin
     tables = set(inspect(migrated_engine).get_table_names(schema="public"))
     assert {"policy_revisions", "approval_requests", "approval_resolutions"}.issubset(tables)
     command.check(configuration)
+
+
+def test_fault_seed_migration_round_trip_is_honest(migrated_engine: Engine) -> None:
+    run_id = _unique("fault-seed-migration")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+        repository = PersistenceRepository(session)
+        claimed = repository.claim_next_run(
+            "fault-seed-migration-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+        assert repository.bind_run_fault_seed(claimed.lease, 1616).fault_seed == 1616
+
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0008_post_commit_ack")
+    columns = {
+        column["name"] for column in inspect(migrated_engine).get_columns("runs", schema="public")
+    }
+    assert "fault_seed" not in columns
+    with migrated_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT to_regprocedure('public.chaosagent_freeze_run_fault_seed()')")
+            )
+            is None
+        )
+    command.upgrade(configuration, "head")
+    with migrated_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT fault_seed FROM public.runs WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            is None
+        )
+    command.check(configuration)
+
+
+def test_run_fault_seed_binds_once_and_database_rejects_rewrite(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("fault-seed-binding")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+        repository = PersistenceRepository(session)
+        claimed = repository.claim_next_run(
+            "fault-seed-worker",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=run_id,
+        )
+        assert claimed is not None
+        first = repository.bind_run_fault_seed(claimed.lease, 2026)
+        repeated = repository.bind_run_fault_seed(claimed.lease, 2026)
+        assert first.fault_seed == repeated.fault_seed == 2026
+        with pytest.raises(PersistenceIntegrityError, match="differs"):
+            repository.bind_run_fault_seed(claimed.lease, 2027)
+
+    with migrated_engine.connect() as connection:
+        transaction = connection.begin()
+        with pytest.raises(DBAPIError, match="immutable"):
+            connection.execute(
+                text("UPDATE public.runs SET fault_seed = 2027 WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+        transaction.rollback()
 
 
 def test_insert_fetch_fixture_revision_conflict_and_database_immutability(

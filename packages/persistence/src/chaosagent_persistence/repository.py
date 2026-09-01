@@ -194,6 +194,7 @@ class RunRecord:
     scenario: RevisionReference
     agent_configuration: RevisionReference
     fixture: RevisionReference | None
+    fault_seed: int | None
     status: RunStatus
     lifecycle_version: int
     lease_owner: str | None
@@ -830,6 +831,27 @@ class PersistenceRepository:
             raise LeaseExpiredError(f"run {lease.run_id!r} lease has expired")
         return self._run_record(model)
 
+    def bind_run_fault_seed(self, lease: LeaseIdentity, run_seed: int) -> RunRecord:
+        """Bind the deterministic fault seed once under the current Run lease.
+
+        The database trigger permits only NULL-to-value binding. Subsequent
+        callers must present the exact same seed, so recovery can authenticate
+        Issue #13 activation identities without trusting process memory.
+        """
+        if isinstance(run_seed, bool) or not isinstance(run_seed, int):
+            raise ValueError("run_seed must be an exact integer")
+        if not 0 <= run_seed <= 9_007_199_254_740_991:
+            raise ValueError("run_seed must be a nonnegative JSON-safe integer")
+        self.lock_current_lease(lease)
+        model = self._fresh_run(lease.run_id)
+        if model.fault_seed is None:
+            with self._session.begin_nested():
+                model.fault_seed = run_seed
+                self._session.flush()
+        elif model.fault_seed != run_seed:
+            raise PersistenceIntegrityError("fault engine seed differs from the frozen Run seed")
+        return self._run_record(model)
+
     def initialize_run_company_state(self, run_id: str) -> SyntheticCompanyState:
         """Materialize one deterministic Run-local copy before its first claim."""
         _require_identifier(run_id, "run_id")
@@ -976,6 +998,17 @@ class PersistenceRepository:
             populate_existing=True,
         )
         return None if model is None else self._company_effect_record(model, newly_applied=False)
+
+    def list_company_effects(self, run_id: str) -> tuple[CompanyEffect, ...]:
+        """Read all immutable effects for one Run in stable effect-ID order."""
+        _require_identifier(run_id, "run_id")
+        models = self._session.scalars(
+            select(CompanyEffectModel)
+            .where(CompanyEffectModel.run_id == run_id)
+            .order_by(CompanyEffectModel.effect_id)
+            .execution_options(populate_existing=True)
+        )
+        return tuple(self._company_effect_record(model, newly_applied=False) for model in models)
 
     def get_post_commit_acknowledgement(
         self, run_id: str, attempt_id: str
@@ -1949,6 +1982,17 @@ class PersistenceRepository:
         model = self._session.get(ApprovalRequestModel, approval_id)
         return None if model is None else self._approval_record(model)
 
+    def list_approval_requests(self, run_id: str) -> tuple[ApprovalRequestRecord, ...]:
+        """Return every Run approval after full durable-row/evidence revalidation."""
+        _require_identifier(run_id, "run_id")
+        models = self._session.scalars(
+            select(ApprovalRequestModel)
+            .where(ApprovalRequestModel.run_id == run_id)
+            .order_by(ApprovalRequestModel.approval_id)
+            .execution_options(populate_existing=True)
+        )
+        return tuple(self._approval_record(model) for model in models)
+
     def get_approval_request_for_authorization(
         self,
         approval_id: str,
@@ -2264,6 +2308,22 @@ class PersistenceRepository:
                 raise ValueError("through_sequence must be positive")
             query = query.where(RunEventModel.sequence <= through_sequence)
         return tuple(self._event_record(model) for model in self._session.scalars(query))
+
+    def latest_event_projection(self, run_id: str) -> tuple[str, int] | None:
+        """Read only the constraint-protected identity/sequence projection.
+
+        Evaluator error handling uses this after a corrupt immutable document
+        fails the normal contract loader; it never treats the projection as
+        semantic evidence.
+        """
+        _require_identifier(run_id, "run_id")
+        row = self._session.execute(
+            select(RunEventModel.event_id, RunEventModel.sequence)
+            .where(RunEventModel.run_id == run_id)
+            .order_by(RunEventModel.sequence.desc())
+            .limit(1)
+        ).one_or_none()
+        return None if row is None else (row[0], row[1])
 
     def store_final_report(self, report: RunReport) -> RunReportRecord:
         document = report.to_dict()
@@ -3100,6 +3160,7 @@ class PersistenceRepository:
                 model.agent_configuration_digest,
             ),
             fixture=fixture,
+            fault_seed=model.fault_seed,
             status=parse_run_status(model.status),
             lifecycle_version=model.lifecycle_version,
             lease_owner=model.lease_owner,

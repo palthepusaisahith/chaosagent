@@ -109,6 +109,11 @@ class FaultEngine:
         return self._plan.scenario_revision
 
     @property
+    def run_seed(self) -> int:
+        """Return the frozen seed needed to authenticate durable activations."""
+        return self._run_seed
+
+    @property
     def rules(self) -> tuple[CompiledFaultRule, ...]:
         """Return the validated immutable rules used to authenticate history."""
         # Selection validates the plan as well, but history must fail closed before

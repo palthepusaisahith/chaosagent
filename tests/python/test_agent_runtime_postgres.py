@@ -10,6 +10,7 @@ from typing import cast
 from uuid import uuid4
 
 import chaosagent_agent_runtime.runtime as runtime_module
+import chaosagent_evaluators.service as evaluator_service
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -25,6 +26,7 @@ from chaosagent_agent_runtime import (
     ScriptedAgentAdapter,
     execute_run,
 )
+from chaosagent_evaluators import execute_evaluation, load_ground_truth_v0
 from chaosagent_evidence import EvidenceValidationError, digest_payload_v0
 from chaosagent_faults import FaultEngine, compile_fault_plan_v0
 from chaosagent_fixtures import load_fixture
@@ -37,6 +39,8 @@ from chaosagent_persistence import (
     PersistenceIntegrityError,
     PersistenceRepository,
     RevisionReference,
+    RunRecord,
+    RunStatus,
     StaleLeaseError,
     create_postgres_engine,
 )
@@ -61,6 +65,12 @@ ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_PATH = ROOT / "benchmarks/shipment-refund/scenarios/refund-ambiguous-timeout.v0.json"
 FIXTURE_PATH = ROOT / "benchmarks/shipment-refund/fixtures/failed-shipment.v0.json"
 POLICY_PATH = ROOT / "benchmarks/shipment-refund/policies/refund-policy.v0.json"
+GROUND_TRUTH_PATH = (
+    ROOT / "benchmarks/shipment-refund/ground-truth/refund-once-and-close-ticket.v0.json"
+)
+EVALUATED_SCENARIO_PATH = (
+    ROOT / "benchmarks/shipment-refund/scenarios/refund-ambiguous-timeout.evaluated.v0.json"
+)
 ALEMBIC_INI = ROOT / "packages/persistence/alembic.ini"
 AGENT = RevisionReference("scripted-agent", "1", "sha256:" + "d" * 64)
 
@@ -107,13 +117,14 @@ def _create_run(
     worker: str = "worker-runtime",
     agent_configuration: AgentConfiguration | None = None,
     faults: list[dict[str, object]] | None = None,
+    scenario_path: Path = SCENARIO_PATH,
 ) -> ClaimedRun:
     run_id = _unique("run")
     scenario_document = cast(
-        dict[str, object], json.loads(SCENARIO_PATH.read_text(encoding="utf-8"))
+        dict[str, object], json.loads(scenario_path.read_text(encoding="utf-8"))
     )
     scenario_document["scenario_id"] = _unique("scenario")
-    scenario_document["revision"] = "1"
+    scenario_revision = cast(str, scenario_document["revision"])
     scenario_document["faults"] = [] if faults is None else faults
     if budgets is not None:
         scenario_document["budgets"] = budgets
@@ -134,7 +145,7 @@ def _create_run(
         repository.create_run(
             run_id,
             scenario_id=cast(str, scenario_document["scenario_id"]),
-            scenario_revision="1",
+            scenario_revision=scenario_revision,
             agent_configuration_id=agent_reference.id,
             agent_configuration_revision=agent_reference.revision,
             created_by="runtime-test",
@@ -149,6 +160,47 @@ def _create_run(
 
 def _adapter(*outputs: object) -> ScriptedAgentAdapter:
     return ScriptedAgentAdapter(AGENT.id, AGENT.revision, outputs)
+
+
+def _evaluation_ready_ambiguity_run(engine: Engine) -> ClaimedRun:
+    faults: list[dict[str, object]] = [
+        {
+            "id": "refund-ack-lost",
+            "kind": "ambiguous_post_commit_timeout",
+            "match": {"tool_id": "payments.refund", "phase": "after_commit"},
+            "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+            "parameters": {"duration_ms": 1},
+        }
+    ]
+    claimed = _create_run(engine, faults=faults, scenario_path=EVALUATED_SCENARIO_PATH)
+    with Session(engine) as session:
+        scenario_record = PersistenceRepository(session).get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        fault_engine = FaultEngine(compile_fault_plan_v0(scenario_record.scenario), run_seed=1616)
+    refund = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 5000,
+        "reason": "Failed shipment",
+        "idempotency_key": "evaluation-refund",
+    }
+    ticket: dict[str, object] = {
+        "ticket_id": "TKT-204",
+        "status": "closed",
+        "note": "Refund completed after shipment failure.",
+        "idempotency_key": "evaluation-ticket",
+    }
+    outputs = (
+        _call("refund-first", "payments.refund", PAYMENTS_REFUND_V0, refund),
+        _call("refund-replay", "payments.refund", PAYMENTS_REFUND_V0, refund),
+        _call("close-ticket", "support.update_ticket", SUPPORT_UPDATE_TICKET_V0, ticket),
+        AgentOutput("Refund confirmed exactly once.", final=True, usage=_usage()),
+    )
+    result = execute_run(engine, claimed.lease, _adapter(*outputs), fault_engine=fault_engine)
+    assert result.status == "evaluation_ready"
+    return claimed
 
 
 def _rewrite_checkpoint(
@@ -695,6 +747,183 @@ def test_scripted_runtime_retries_ambiguous_refund_and_observes_already_applied(
         assert state is not None and len(state.refunds) == 1
         assert sum(event["event_type"] == "state.evidence_recorded" for event in events) == 1
         assert sum(event["event_type"] == "fault.applied" for event in events) == 1
+
+
+def test_issue16_evaluates_ambiguous_refund_and_completes_atomically(
+    runtime_engine: Engine,
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    outcome = execute_evaluation(
+        runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+    )
+    assert outcome.status == "completed"
+    assert outcome.result is not None
+    result = outcome.result.to_dict()
+    assert result["classification"] == "pass"
+    gates = {
+        gate["gate_id"]: gate for gate in cast(list[dict[str, object]], result["critical_gates"])
+    }
+    assert gates["required_refund_state"]["status"] == "pass"
+    assert gates["no_duplicate_refund_effect"]["status"] == "pass"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+        report = repository.get_final_report(claimed.run.run_id)
+    assert run is not None and run.status == "completed" and run.fault_seed == 1616
+    assert report is None
+    assert [event["event_type"] for event in events[-3:]] == [
+        "evaluation.started",
+        "evaluation.result_recorded",
+        "run.lifecycle",
+    ]
+    evaluation_result = cast(dict[str, object], events[-2]["payload"])
+    assert evaluation_result["outcome"] == "completed"
+    assert events[-1]["causation_event_id"] == events[-2]["event_id"]
+
+
+def test_issue16_invalid_ground_truth_binding_records_error_not_success(
+    runtime_engine: Engine,
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    outcome = execute_evaluation(runtime_engine, claimed.lease, ())
+    assert outcome.status == "invalid"
+    assert outcome.result is not None
+    assert outcome.result.to_dict()["classification"] == "invalid"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+    assert run is not None and run.status == "completed"
+    payload = cast(dict[str, object], events[-2]["payload"])
+    assert events[-2]["event_type"] == "evaluation.result_recorded"
+    assert payload["outcome"] == "error"
+    assert payload["error_code"] == "ground_truth_binding_invalid"
+
+
+def test_issue16_requires_evaluating_state_and_current_lease(runtime_engine: Engine) -> None:
+    provisioning = _create_run(runtime_engine)
+    not_ready = execute_evaluation(
+        runtime_engine,
+        provisioning.lease,
+        (load_ground_truth_v0(GROUND_TRUTH_PATH),),
+    )
+    assert not_ready.status == "run_not_ready"
+
+    evaluating = _evaluation_ready_ambiguity_run(runtime_engine)
+    stale = LeaseIdentity(
+        evaluating.lease.run_id,
+        evaluating.lease.worker_id,
+        "lease-token-stale",
+        evaluating.lease.attempt,
+    )
+    rejected = execute_evaluation(runtime_engine, stale, (load_ground_truth_v0(GROUND_TRUTH_PATH),))
+    assert rejected.status == "stale_lease"
+    with Session(runtime_engine) as session:
+        run = PersistenceRepository(session).get_run(evaluating.run.run_id)
+    assert run is not None and run.status == "evaluating"
+
+
+def test_issue16_competing_evaluators_have_one_authoritative_path(
+    runtime_engine: Engine,
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    barrier = Barrier(2)
+
+    def evaluate() -> str:
+        barrier.wait()
+        return execute_evaluation(
+            runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+        ).status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(evaluate) for _ in range(2)]
+        statuses = sorted(future.result() for future in futures)
+    assert statuses == ["completed", "stale_lease"]
+    with Session(runtime_engine) as session:
+        events = [
+            item.event.to_dict()
+            for item in PersistenceRepository(session).fetch_events(claimed.run.run_id)
+        ]
+    assert sum(event["event_type"] == "evaluation.started" for event in events) == 1
+    assert sum(event["event_type"] == "evaluation.result_recorded" for event in events) == 1
+
+
+def test_issue16_result_persistence_failure_rolls_back_evaluation_prefix(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    original = evaluator_service._event
+
+    def fail_result(*args: object, **kwargs: object) -> None:
+        if args[3] == "evaluation.result_recorded":
+            raise PersistenceIntegrityError("injected evaluator event failure")
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(evaluator_service, "_event", fail_result)
+    outcome = execute_evaluation(
+        runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+    )
+    assert outcome.status == "internal_error"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+    assert run is not None and run.status == "infra_error"
+    assert not any(cast(str, event["event_type"]).startswith("evaluation.") for event in events)
+
+
+def test_issue16_start_persistence_failure_rolls_back_and_terminalizes(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    original = evaluator_service._event
+
+    def fail_start(*args: object, **kwargs: object) -> None:
+        if args[3] == "evaluation.started":
+            raise PersistenceIntegrityError("injected evaluator start failure")
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(evaluator_service, "_event", fail_start)
+    outcome = execute_evaluation(
+        runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+    )
+    assert outcome.status == "internal_error"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+    assert run is not None and run.status == "infra_error"
+    assert not any(cast(str, event["event_type"]).startswith("evaluation.") for event in events)
+
+
+def test_issue16_completion_failure_rolls_back_result_before_infra_terminalization(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    original = PersistenceRepository.transition_owned_run
+
+    def fail_completion(
+        self: PersistenceRepository,
+        lease: LeaseIdentity,
+        target_status: RunStatus,
+        **kwargs: object,
+    ) -> RunRecord:
+        if target_status == "completed":
+            raise PersistenceIntegrityError("injected completion failure")
+        return original(self, lease, target_status, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(PersistenceRepository, "transition_owned_run", fail_completion)
+    outcome = execute_evaluation(
+        runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+    )
+    assert outcome.status == "internal_error"
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        run = repository.get_run(claimed.run.run_id)
+        events = [item.event.to_dict() for item in repository.fetch_events(claimed.run.run_id)]
+    assert run is not None and run.status == "infra_error"
+    assert not any(cast(str, event["event_type"]).startswith("evaluation.") for event in events)
 
 
 def test_runtime_recovers_completed_ambiguity_after_checkpoint_crash_and_reclaim(

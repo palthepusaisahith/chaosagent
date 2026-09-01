@@ -244,6 +244,70 @@ def validate_execution_checkpoint(document: object) -> None:
         raise AgentOutputValidationError(f"invalid execution checkpoint at {path}: {error.message}")
 
 
+def validate_final_execution_snapshot(
+    record: ExecutionCheckpointRecord,
+    run: RunRecord,
+    scenario: dict[str, object],
+    evidence: Sequence[RunEventRecord],
+) -> dict[str, object]:
+    """Reuse runtime integrity checks for a read-only evaluator handoff.
+
+    The adapter identity and provider/model evidence are recovered from the frozen
+    checkpoint/event pair; no provider is invoked and no runtime state is changed.
+    """
+
+    documents = [item.event.to_dict() for item in evidence]
+    completed_steps = [
+        document
+        for document in documents
+        if document["event_type"] == "agent.step"
+        and cast(dict[str, object], document["payload"]).get("phase") == "completed"
+    ]
+    if not completed_steps:
+        raise PersistenceIntegrityError("final checkpoint has no completed agent evidence")
+    first_payload = cast(dict[str, object], completed_steps[0]["payload"])
+    model = first_payload.get("model")
+    if not isinstance(model, dict):
+        raise PersistenceIntegrityError("completed agent evidence has no model identity")
+    adapter_value = record.document.get("adapter")
+    if not isinstance(adapter_value, Mapping):
+        raise PersistenceIntegrityError("final checkpoint adapter identity is malformed")
+    adapter_ref = cast(Mapping[str, object], adapter_value)
+    adapter_id = adapter_ref.get("id")
+    adapter_version = adapter_ref.get("version")
+    provider = model.get("provider")
+    requested_model = model.get("requested_model")
+    identities = (adapter_id, adapter_version, provider, requested_model)
+    if not all(isinstance(item, str) for item in identities):
+        raise PersistenceIntegrityError("final execution identity is malformed")
+
+    class _SnapshotAdapter:
+        def __init__(self) -> None:
+            self.adapter_id = cast(str, adapter_id)
+            self.adapter_version = cast(str, adapter_version)
+            self.provider_name = cast(str, provider)
+            self.requested_model = cast(str, requested_model)
+
+        def invoke(self, context: AgentContext) -> AgentOutput:
+            raise AssertionError("evaluation snapshot validation never invokes a provider")
+
+    adapter = _SnapshotAdapter()
+    checkpoint = _checkpoint_document(record, run, adapter)
+    registry = default_tool_registry()
+    _validate_checkpoint_semantics(checkpoint, scenario, registry, run)
+    boundary = cast(int, checkpoint["last_event_sequence"])
+    prefix = [item for item in evidence if cast(int, item.event.to_dict()["sequence"]) <= boundary]
+    if not prefix or prefix[-1].event.to_dict()["sequence"] != boundary:
+        raise PersistenceIntegrityError(
+            "checkpoint last_event_sequence does not identify committed Run evidence"
+        )
+    _validate_checkpoint_evidence(checkpoint, prefix, scenario, registry, run, adapter)
+    _validate_evidence_after_checkpoint(checkpoint, evidence[len(prefix) :])
+    if checkpoint.get("status") != "final" or run.status != "evaluating":
+        raise PersistenceIntegrityError("evaluation requires a final checkpoint in evaluating")
+    return cast(dict[str, object], _thaw(checkpoint))
+
+
 def execute_run(
     engine: Engine,
     lease: LeaseIdentity,
@@ -469,6 +533,16 @@ def _load_state(
         scenario_record = repository.get_scenario_revision(run.scenario.id, run.scenario.revision)
         if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
             raise PersistenceIntegrityError("Run Scenario binding does not resolve")
+        if fault_engine is not None:
+            if (
+                fault_engine.scenario_id != run.scenario.id
+                or fault_engine.scenario_revision != run.scenario.revision
+                or fault_engine.scenario_digest != run.scenario.digest
+            ):
+                raise PersistenceIntegrityError(
+                    "fault engine does not match the frozen Run Scenario"
+                )
+            run = repository.bind_run_fault_seed(lease, fault_engine.run_seed)
         if not repository.has_run_company_state(run.run_id):
             raise PersistenceIntegrityError("Run-local synthetic state is not initialized")
         if adapter.adapter_id != run.agent_configuration.id:

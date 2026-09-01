@@ -238,6 +238,10 @@ class RunModel(Base):
         CheckConstraint("lifecycle_version >= 0", name="lifecycle_version_nonnegative"),
         CheckConstraint("attempt >= 0", name="attempt_nonnegative"),
         CheckConstraint(
+            "fault_seed IS NULL OR fault_seed BETWEEN 0 AND 9007199254740991",
+            name="fault_seed_json_safe",
+        ),
+        CheckConstraint(
             "(fixture_id IS NULL AND fixture_revision IS NULL AND fixture_digest IS NULL) OR "
             "(fixture_id IS NOT NULL AND fixture_revision IS NOT NULL "
             "AND fixture_digest IS NOT NULL)",
@@ -303,6 +307,7 @@ class RunModel(Base):
     fixture_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     fixture_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fixture_digest: Mapped[str | None] = mapped_column(String(71), nullable=True)
+    fault_seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[RunStatus] = mapped_column(String(32), nullable=False, server_default="queued")
     lifecycle_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
