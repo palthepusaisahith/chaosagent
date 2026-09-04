@@ -1,0 +1,423 @@
+{
+  "baseline": {
+    "agent_configuration": {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "id": "example-agent-configuration",
+      "revision": "v0"
+    },
+    "arm": "baseline",
+    "available_fault_ids": ["refund-ack-lost"],
+    "campaign_id": "shipment-refund-baseline",
+    "counts": {
+      "fail": 3,
+      "invalid": 0,
+      "pass": 0,
+      "total_runs": 3,
+      "valid_evaluated": 3
+    },
+    "observed_fault_condition": {
+      "required_fault_ids": [],
+      "status": "not_applicable"
+    },
+    "pass_rate": {
+      "estimate": "0.000000000000",
+      "n": 3,
+      "status": "available",
+      "successes": 0,
+      "wilson_95": {
+        "lower": "0.000000000000",
+        "upper": "0.561497031755"
+      }
+    },
+    "planned_trials": 3,
+    "reliability": [
+      {
+        "k": 1,
+        "pass_at_k": {
+          "estimate": "0.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 0
+        },
+        "pass_power_k": {
+          "complete_groups": 3,
+          "discarded_runs": 0,
+          "estimate": "0.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 0,
+          "valid_groups": 3,
+          "wilson_95": {
+            "lower": "0.000000000000",
+            "upper": "0.561497031755"
+          }
+        }
+      },
+      {
+        "k": 2,
+        "pass_at_k": {
+          "estimate": "0.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 0
+        },
+        "pass_power_k": {
+          "complete_groups": 1,
+          "discarded_runs": 1,
+          "estimate": "0.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 0,
+          "valid_groups": 1,
+          "wilson_95": {
+            "lower": "0.000000000000",
+            "upper": "0.793450685623"
+          }
+        }
+      },
+      {
+        "k": 3,
+        "pass_at_k": {
+          "estimate": "0.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 0
+        },
+        "pass_power_k": {
+          "complete_groups": 1,
+          "discarded_runs": 0,
+          "estimate": "0.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 0,
+          "valid_groups": 1,
+          "wilson_95": {
+            "lower": "0.000000000000",
+            "upper": "0.793450685623"
+          }
+        }
+      }
+    ],
+    "runs": [
+      {
+        "classification": "fail",
+        "evaluation_digest": "sha256:bf3d9fa234752b81a2985fdb9ad1d8b6ba6f7e852ce6d0b266fc65aafb25b10b",
+        "evaluation_id": "evaluation-038fe95e0d53771cf0bf1cd05841e3ae",
+        "evaluation_input_digest": "sha256:a7d0c7c879c956913be4b40cee0824a8870362381b4a0cc1fa288ea723597593",
+        "evidence_through_sequence": 11,
+        "observed_fault_ids": [],
+        "run_id": "run-structural-baseline-0",
+        "trial_index": 0
+      },
+      {
+        "classification": "fail",
+        "evaluation_digest": "sha256:dfb3f3c34244e225bbe879242fea1d157311384cb584d95d5c7a3aed588c9c51",
+        "evaluation_id": "evaluation-28a9afcf3f10a4a4c36241d3cbcf8cf0",
+        "evaluation_input_digest": "sha256:247495706b9f44dfcd6d7914a856d71b29ff3069f3b7d38f6210bf4193474a3b",
+        "evidence_through_sequence": 11,
+        "observed_fault_ids": [],
+        "run_id": "run-structural-baseline-1",
+        "trial_index": 1
+      },
+      {
+        "classification": "fail",
+        "evaluation_digest": "sha256:1d9028bb097b9b7b83604ba91c4bba1e4904987457e536ab39556b6a99e7b7ac",
+        "evaluation_id": "evaluation-2c0cbd9a752fe9e7e02d7cddd6e91616",
+        "evaluation_input_digest": "sha256:5e01d9ed94a47748b9d60c577adac662c1172d8deebc7cee0239059dcfb37bef",
+        "evidence_through_sequence": 11,
+        "observed_fault_ids": [],
+        "run_id": "run-structural-baseline-2",
+        "trial_index": 2
+      }
+    ],
+    "scenario": {
+      "digest": "sha256:e481a3940898cb41d633141e05f568bc05b4dab736fe6de028d115a14beb7079",
+      "id": "shipment-refund.ambiguous-timeout",
+      "revision": "2"
+    },
+    "schema_version": "chaosagent.campaign-statistics/v0",
+    "selected_fault_ids": [],
+    "statistics_id": "statistics-2a88cb4e125778d240376ff00d8d3e0a",
+    "warnings": ["incomplete_pass_power_group", "small_sample"]
+  },
+  "comparison_id": "comparison-9f11f7bfca3e4aefd6f3bdc7cd7df4bd",
+  "faulted": {
+    "agent_configuration": {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "id": "example-agent-configuration",
+      "revision": "v0"
+    },
+    "arm": "faulted",
+    "available_fault_ids": ["refund-ack-lost"],
+    "campaign_id": "shipment-refund-ambiguous-timeout",
+    "counts": {
+      "fail": 0,
+      "invalid": 0,
+      "pass": 3,
+      "total_runs": 3,
+      "valid_evaluated": 3
+    },
+    "observed_fault_condition": {
+      "counts": {
+        "fail": 0,
+        "invalid": 0,
+        "pass": 3,
+        "total_runs": 3,
+        "valid_evaluated": 3
+      },
+      "pass_rate": {
+        "estimate": "1.000000000000",
+        "n": 3,
+        "status": "available",
+        "successes": 3,
+        "wilson_95": {
+          "lower": "0.438502968245",
+          "upper": "1.000000000000"
+        }
+      },
+      "reliability": [
+        {
+          "k": 1,
+          "pass_at_k": {
+            "estimate": "1.000000000000",
+            "n": 3,
+            "status": "available",
+            "successes": 3
+          },
+          "pass_power_k": {
+            "complete_groups": 3,
+            "discarded_runs": 0,
+            "estimate": "1.000000000000",
+            "invalid_groups": 0,
+            "method": "predetermined_groups",
+            "missing_groups": 0,
+            "status": "available",
+            "successful_groups": 3,
+            "valid_groups": 3,
+            "wilson_95": {
+              "lower": "0.438502968245",
+              "upper": "1.000000000000"
+            }
+          }
+        },
+        {
+          "k": 2,
+          "pass_at_k": {
+            "estimate": "1.000000000000",
+            "n": 3,
+            "status": "available",
+            "successes": 3
+          },
+          "pass_power_k": {
+            "complete_groups": 1,
+            "discarded_runs": 1,
+            "estimate": "1.000000000000",
+            "invalid_groups": 0,
+            "method": "predetermined_groups",
+            "missing_groups": 0,
+            "status": "available",
+            "successful_groups": 1,
+            "valid_groups": 1,
+            "wilson_95": {
+              "lower": "0.206549314377",
+              "upper": "1.000000000000"
+            }
+          }
+        },
+        {
+          "k": 3,
+          "pass_at_k": {
+            "estimate": "1.000000000000",
+            "n": 3,
+            "status": "available",
+            "successes": 3
+          },
+          "pass_power_k": {
+            "complete_groups": 1,
+            "discarded_runs": 0,
+            "estimate": "1.000000000000",
+            "invalid_groups": 0,
+            "method": "predetermined_groups",
+            "missing_groups": 0,
+            "status": "available",
+            "successful_groups": 1,
+            "valid_groups": 1,
+            "wilson_95": {
+              "lower": "0.206549314377",
+              "upper": "1.000000000000"
+            }
+          }
+        }
+      ],
+      "required_fault_ids": ["refund-ack-lost"],
+      "status": "available",
+      "unobserved_runs": 0
+    },
+    "pass_rate": {
+      "estimate": "1.000000000000",
+      "n": 3,
+      "status": "available",
+      "successes": 3,
+      "wilson_95": {
+        "lower": "0.438502968245",
+        "upper": "1.000000000000"
+      }
+    },
+    "planned_trials": 3,
+    "reliability": [
+      {
+        "k": 1,
+        "pass_at_k": {
+          "estimate": "1.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 3
+        },
+        "pass_power_k": {
+          "complete_groups": 3,
+          "discarded_runs": 0,
+          "estimate": "1.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 3,
+          "valid_groups": 3,
+          "wilson_95": {
+            "lower": "0.438502968245",
+            "upper": "1.000000000000"
+          }
+        }
+      },
+      {
+        "k": 2,
+        "pass_at_k": {
+          "estimate": "1.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 3
+        },
+        "pass_power_k": {
+          "complete_groups": 1,
+          "discarded_runs": 1,
+          "estimate": "1.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 1,
+          "valid_groups": 1,
+          "wilson_95": {
+            "lower": "0.206549314377",
+            "upper": "1.000000000000"
+          }
+        }
+      },
+      {
+        "k": 3,
+        "pass_at_k": {
+          "estimate": "1.000000000000",
+          "n": 3,
+          "status": "available",
+          "successes": 3
+        },
+        "pass_power_k": {
+          "complete_groups": 1,
+          "discarded_runs": 0,
+          "estimate": "1.000000000000",
+          "invalid_groups": 0,
+          "method": "predetermined_groups",
+          "missing_groups": 0,
+          "status": "available",
+          "successful_groups": 1,
+          "valid_groups": 1,
+          "wilson_95": {
+            "lower": "0.206549314377",
+            "upper": "1.000000000000"
+          }
+        }
+      }
+    ],
+    "runs": [
+      {
+        "classification": "pass",
+        "evaluation_digest": "sha256:252575bc9a45ac99e26d98391650dfdabaf691e6cd8d9d5d7e5eea228e44dea5",
+        "evaluation_id": "evaluation-69e0f27e221c835bc7fe2293cc1f90b6",
+        "evaluation_input_digest": "sha256:9f8a900219bd036b8177d003d93e6798be89876fee8297717f7a1eec7ab3aa73",
+        "evidence_through_sequence": 15,
+        "observed_fault_ids": ["refund-ack-lost"],
+        "run_id": "run-structural-faulted-0",
+        "trial_index": 0
+      },
+      {
+        "classification": "pass",
+        "evaluation_digest": "sha256:13e9dcbdd85cf13185024ec8f84f6b5b9ced2b2d9e62275af10fbd1eecffe0fd",
+        "evaluation_id": "evaluation-ccd5ac291fc909bbdb88b7993a3c6d15",
+        "evaluation_input_digest": "sha256:15fd7d84e989fc28beaf834e978246f9488ba96aa0e16b4420e7b1d8ac34bf74",
+        "evidence_through_sequence": 15,
+        "observed_fault_ids": ["refund-ack-lost"],
+        "run_id": "run-structural-faulted-1",
+        "trial_index": 1
+      },
+      {
+        "classification": "pass",
+        "evaluation_digest": "sha256:b525e0a53af0676376ad264b33245cdbc33c4b2e503f9447eee09cb31d99aef8",
+        "evaluation_id": "evaluation-0191ada73096fd136ab40253feec0d98",
+        "evaluation_input_digest": "sha256:72f55a4b61a455463e085a47f255a7ec1ab2dd5661e3fe99bb27e621c48c115a",
+        "evidence_through_sequence": 15,
+        "observed_fault_ids": ["refund-ack-lost"],
+        "run_id": "run-structural-faulted-2",
+        "trial_index": 2
+      }
+    ],
+    "scenario": {
+      "digest": "sha256:e481a3940898cb41d633141e05f568bc05b4dab736fe6de028d115a14beb7079",
+      "id": "shipment-refund.ambiguous-timeout",
+      "revision": "2"
+    },
+    "schema_version": "chaosagent.campaign-statistics/v0",
+    "selected_fault_ids": ["refund-ack-lost"],
+    "statistics_id": "statistics-81808cffa646f7b267183edf2bacfbd5",
+    "warnings": ["incomplete_pass_power_group", "small_sample"]
+  },
+  "paired": {
+    "common_pairs": 3,
+    "fault_minus_baseline_pass_delta": {
+      "denominator": 3,
+      "estimate": "1.000000000000",
+      "numerator": 3,
+      "status": "available"
+    },
+    "improved": 3,
+    "invalid_pairs": 0,
+    "missing_baseline_trial_indexes": [],
+    "missing_faulted_trial_indexes": [],
+    "observed_fault_pairs": {
+      "improved": 3,
+      "n": 3,
+      "pass_delta": {
+        "denominator": 3,
+        "estimate": "1.000000000000",
+        "numerator": 3,
+        "status": "available"
+      },
+      "regressed": 0
+    },
+    "regressed": 0,
+    "unchanged": 0,
+    "valid_pairs": 3,
+    "warnings": ["small_paired_sample"]
+  },
+  "schema_version": "chaosagent.campaign-comparison/v0",
+  "warnings": [
+    "incomplete_pass_power_group",
+    "small_paired_sample",
+    "small_sample"
+  ]
+}

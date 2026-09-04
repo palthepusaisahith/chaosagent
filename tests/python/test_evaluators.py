@@ -1,28 +1,47 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Any, Literal, cast
 
 import pytest
+import rfc8785
 from chaosagent_evaluators import (
     EVALUATOR_REVISION,
     ApprovalFact,
+    CampaignCohort,
+    CampaignTrial,
+    CampaignValidationError,
     EffectFact,
     EvaluationInput,
+    EvaluationResult,
     EvaluatorValidationError,
     GroundTruth,
+    aggregate_campaign_v0,
+    authenticated_campaign_trial,
+    campaign_cohort_v0,
+    campaign_comparison_schema_v0,
+    campaign_statistics_schema_v0,
+    compare_campaigns_v0,
     evaluate_critical_gates,
     evaluation_result_schema_v0,
     ground_truth_schema_v0,
     load_ground_truth_v0,
+    loads_campaign_comparison_v0,
+    loads_campaign_statistics_v0,
     loads_evaluation_result,
     loads_evaluation_result_v0,
     loads_ground_truth,
     loads_ground_truth_v0,
+)
+from chaosagent_evaluators.campaigns import (
+    _count_warnings,
+    _mint_campaign_trial,
+    _wilson,
 )
 from chaosagent_evidence import digest_payload_v0, loads_run_event
 from chaosagent_faults import (
@@ -1451,3 +1470,830 @@ def test_malformed_evaluator_input_is_invalid_not_fail() -> None:
     result = evaluate_critical_gates(replace(value, execution=execution)).to_dict()
     assert result["classification"] == "invalid"
     assert _gate(result, "budgets_satisfied")["status"] == "error"
+
+
+_AGENT_REFERENCE = {
+    "id": "example-agent-configuration",
+    "revision": "v0",
+    "digest": "sha256:" + "a" * 64,
+}
+
+
+def _authenticated_campaign_trial(index: int = 0) -> CampaignTrial:
+    value = _input()
+    return _mint_campaign_trial(
+        value,
+        evaluate_critical_gates(value),
+        campaign_id="campaign-test-source",
+        arm="baseline",
+        trial_index=index,
+        planned_trials=index + 1,
+        selected_fault_ids=(),
+        agent_configuration=_AGENT_REFERENCE,
+    )
+
+
+def _campaign_trial(
+    base: CampaignTrial,
+    *,
+    index: int,
+    classification: str,
+    observed: bool = True,
+    run_id: str | None = None,
+) -> CampaignTrial:
+    """Build a distinct trial by rerunning Issue #16 over coherent evaluator input."""
+    identifier = run_id or f"run-campaign-{classification}-{index}"
+    value = _input()
+    approval = value.approvals[0]
+    approval_id = approval_identity(
+        run_id=identifier,
+        scenario_id=approval.scenario_id,
+        scenario_revision=approval.scenario_revision,
+        scenario_digest=approval.scenario_digest,
+        policy_id=approval.policy_id,
+        policy_revision=approval.policy_revision,
+        policy_digest=approval.policy_digest,
+        tool_id=approval.tool_id,
+        contract_version=approval.contract_version,
+        request_digest=approval.request_digest,
+        idempotency_key_digest=approval.idempotency_key_digest,
+    )
+    events = [copy.deepcopy(event) for event in value.events]
+    rule = next(
+        item
+        for item in compile_fault_plan_v0(value.scenario).rules
+        if item.fault_id == "refund-ack-lost"
+    )
+    activation_id = expected_fault_activation_id_v0(
+        rule,
+        run_seed=RUN_SEED,
+        run_id=identifier,
+        logical_call_id="logical-refund",
+        physical_attempt_id="attempt-refund-1",
+        attempt_number=1,
+        call_ordinal=1,
+        arguments_digest=digest_payload_v0(_refund_arguments()),
+    )
+    assert activation_id is not None
+    for event in events:
+        event["run_id"] = identifier
+        if event["correlation_id"] == value.run_id:
+            event["correlation_id"] = identifier
+        elif event["correlation_id"] == approval.approval_id:
+            event["correlation_id"] = approval_id
+        payload = cast(dict[str, object], event["payload"])
+        if "approval_id" in payload:
+            payload["approval_id"] = approval_id
+        if "activation_id" in payload:
+            payload["activation_id"] = activation_id
+        event["payload_digest"] = digest_payload_v0(payload)
+    if not observed:
+        events = [
+            event
+            for event in events
+            if not cast(str, event["event_type"]).startswith("fault.")
+            and event["event_id"] != "result-refund-timeout"
+        ]
+    rebound_events = _renumber_events(events)
+    execution = copy.deepcopy(value.execution)
+    if classification == "fail":
+        execution["final_answer"] = "No supported success claim is available."
+    elif classification == "invalid":
+        execution["cost_complete"] = False
+    elif classification != "pass":
+        raise AssertionError(f"unsupported test classification {classification!r}")
+    rebound = replace(
+        value,
+        run_id=identifier,
+        evidence_through_sequence=len(rebound_events),
+        events=rebound_events,
+        effects=tuple(replace(effect, run_id=identifier) for effect in value.effects),
+        execution=execution,
+        approvals=(replace(approval, approval_id=approval_id, run_id=identifier),),
+    )
+    trial = _mint_campaign_trial(
+        rebound,
+        evaluate_critical_gates(rebound),
+        campaign_id=base.campaign_id,
+        arm=base.arm,
+        trial_index=index,
+        planned_trials=max(base.planned_trials, index + 1),
+        selected_fault_ids=base.selected_fault_ids,
+        agent_configuration=base.agent_configuration,
+    )
+    assert trial.evaluation.to_dict()["classification"] == classification, (
+        trial.evaluation.to_dict()
+    )
+    return trial
+
+
+def _cohort(
+    arm: Literal["baseline", "faulted"],
+    trials: list[CampaignTrial],
+    *,
+    campaign_id: str | None = None,
+    selected: tuple[str, ...] | None = None,
+    planned_trials: int | None = None,
+) -> CampaignCohort:
+    base = _authenticated_campaign_trial()
+    identity = campaign_id or f"campaign-{arm}"
+    selected_ids = (
+        (() if arm == "baseline" else base.available_fault_ids) if selected is None else selected
+    )
+    planned = (
+        max((trial.trial_index for trial in trials), default=-1) + 1
+        if planned_trials is None
+        else planned_trials
+    )
+    rebound = [
+        _mint_campaign_trial(
+            trial.evaluation_input,
+            trial.evaluation,
+            campaign_id=identity,
+            arm=arm,
+            trial_index=trial.trial_index,
+            planned_trials=planned,
+            selected_fault_ids=selected_ids,
+            agent_configuration=trial.agent_configuration,
+        )
+        for trial in trials
+    ]
+    return campaign_cohort_v0(
+        campaign_id=identity,
+        arm=arm,
+        scenario=base.scenario,
+        agent_configuration=base.agent_configuration,
+        available_fault_ids=base.available_fault_ids,
+        selected_fault_ids=selected_ids,
+        planned_trials=planned,
+        trials=rebound,
+    )
+
+
+@pytest.mark.parametrize(
+    ("classifications", "expected"),
+    [
+        (("pass", "pass", "pass"), (3, 3, 0, 0)),
+        (("fail", "fail", "fail"), (3, 0, 3, 0)),
+        (("pass", "fail", "invalid"), (2, 1, 1, 1)),
+        (("invalid", "invalid"), (0, 0, 0, 2)),
+        ((), (0, 0, 0, 0)),
+    ],
+)
+def test_campaign_counts_and_empty_denominator(
+    classifications: tuple[str, ...], expected: tuple[int, int, int, int]
+) -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=index, classification=classification)
+        for index, classification in enumerate(classifications)
+    ]
+    document = aggregate_campaign_v0(_cohort("baseline", trials), k_values=(1,)).to_dict()
+    counts = cast(dict[str, int], document["counts"])
+    assert (
+        counts["valid_evaluated"],
+        counts["pass"],
+        counts["fail"],
+        counts["invalid"],
+    ) == expected
+    rate = cast(dict[str, object], document["pass_rate"])
+    if expected[0] == 0:
+        assert rate == {
+            "status": "unavailable",
+            "n": 0,
+            "successes": 0,
+            "reason": "zero_denominator",
+        }
+
+
+def test_wilson_95_hard_coded_boundary_vectors() -> None:
+    base = _authenticated_campaign_trial()
+    one = aggregate_campaign_v0(
+        _cohort("baseline", [_campaign_trial(base, index=0, classification="pass")])
+    ).to_dict()
+    interval = cast(dict[str, object], cast(dict[str, object], one["pass_rate"])["wilson_95"])
+    assert interval == {"lower": "0.206549314377", "upper": "1.000000000000"}
+
+    mixed = [
+        _campaign_trial(base, index=index, classification="pass" if index < 5 else "fail")
+        for index in range(10)
+    ]
+    document = aggregate_campaign_v0(_cohort("baseline", mixed)).to_dict()
+    interval = cast(dict[str, object], cast(dict[str, object], document["pass_rate"])["wilson_95"])
+    assert interval == {"lower": "0.236593090513", "upper": "0.763406909487"}
+
+
+def test_wilson_additional_independent_boundaries_and_small_sample_cutoff() -> None:
+    assert _wilson(0, 1) == ("0.000000000000", "0.793450685623")
+    assert _wilson(3, 3) == ("0.438502968245", "1.000000000000")
+    assert "small_sample" in _count_warnings(
+        {"total_runs": 29, "valid_evaluated": 29, "pass": 29, "fail": 0, "invalid": 0}
+    )
+    assert "small_sample" not in _count_warnings(
+        {"total_runs": 30, "valid_evaluated": 30, "pass": 30, "fail": 0, "invalid": 0}
+    )
+
+
+def test_pass_at_k_uses_exact_finite_sample_estimator() -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=index, classification="pass" if index < 2 else "fail")
+        for index in range(4)
+    ]
+    result = aggregate_campaign_v0(_cohort("baseline", trials), k_values=(1, 2, 4, 5)).to_dict()
+    rows = {
+        cast(int, row["k"]): row for row in cast(list[dict[str, object]], result["reliability"])
+    }
+    assert cast(dict[str, object], rows[1]["pass_at_k"])["estimate"] == "0.500000000000"
+    assert cast(dict[str, object], rows[2]["pass_at_k"])["estimate"] == "0.833333333333"
+    assert cast(dict[str, object], rows[4]["pass_at_k"])["estimate"] == "1.000000000000"
+    assert cast(dict[str, object], rows[5]["pass_at_k"])["status"] == "insufficient_samples"
+
+
+def test_pass_power_k_uses_predetermined_groups_not_p_hat_power() -> None:
+    base = _authenticated_campaign_trial()
+    outcomes = ("pass", "pass", "pass", "fail", "pass")
+    trials = [
+        _campaign_trial(base, index=index, classification=classification)
+        for index, classification in enumerate(outcomes)
+    ]
+    result = aggregate_campaign_v0(_cohort("baseline", trials), k_values=(1, 2, 5)).to_dict()
+    rows = {
+        cast(int, row["k"]): row for row in cast(list[dict[str, object]], result["reliability"])
+    }
+    assert cast(dict[str, object], rows[1]["pass_power_k"])["estimate"] == "0.800000000000"
+    assert cast(dict[str, object], rows[2]["pass_power_k"])["estimate"] == "0.500000000000"
+    assert cast(dict[str, object], rows[2]["pass_power_k"])["wilson_95"] == {
+        "lower": "0.094531205734",
+        "upper": "0.905468794266",
+    }
+    assert cast(dict[str, object], rows[5]["pass_power_k"])["estimate"] == "0.000000000000"
+    assert "incomplete_pass_power_group" in cast(list[str], result["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("indexes", "outcomes", "planned", "successful", "missing", "invalid", "discarded"),
+    [
+        ((0, 1, 2, 3), ("pass", "pass", "pass", "fail"), 4, 1, 0, 0, 0),
+        ((0, 2, 3), ("pass", "pass", "fail"), 4, 0, 1, 0, 0),
+        ((0, 1, 3), ("pass", "pass", "pass"), 4, 1, 1, 0, 0),
+        ((2, 3), ("pass", "pass"), 4, 1, 1, 0, 0),
+        ((0, 1, 2, 3), ("pass", "invalid", "pass", "pass"), 4, 1, 0, 1, 0),
+        ((0, 2, 5), ("pass", "pass", "pass"), 6, 0, 3, 0, 0),
+        ((0, 1, 2, 3, 4), ("pass",) * 5, 5, 2, 0, 0, 1),
+    ],
+)
+def test_pass_power_uses_frozen_index_groups_without_compaction(
+    indexes: tuple[int, ...],
+    outcomes: tuple[str, ...],
+    planned: int,
+    successful: int,
+    missing: int,
+    invalid: int,
+    discarded: int,
+) -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=index, classification=outcome)
+        for index, outcome in zip(indexes, outcomes, strict=True)
+    ]
+    document = aggregate_campaign_v0(
+        _cohort("baseline", list(reversed(trials)), planned_trials=planned),
+        k_values=(2,),
+    ).to_dict()
+    power = cast(
+        dict[str, object],
+        cast(list[dict[str, object]], document["reliability"])[0]["pass_power_k"],
+    )
+    assert power["successful_groups"] == successful
+    assert power["missing_groups"] == missing
+    assert power["invalid_groups"] == invalid
+    assert power["discarded_runs"] == discarded
+
+
+def test_pass_power_k_one_and_larger_than_plan_are_explicit() -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=0, classification="pass"),
+        _campaign_trial(base, index=2, classification="fail"),
+    ]
+    rows = cast(
+        list[dict[str, object]],
+        aggregate_campaign_v0(
+            _cohort("baseline", trials, planned_trials=3), k_values=(1, 4)
+        ).to_dict()["reliability"],
+    )
+    one = cast(dict[str, object], rows[0]["pass_power_k"])
+    assert (one["complete_groups"], one["missing_groups"], one["successful_groups"]) == (
+        3,
+        1,
+        1,
+    )
+    large = cast(dict[str, object], rows[1]["pass_power_k"])
+    assert large["status"] == "unavailable"
+    assert large["complete_groups"] == 0
+    assert large["discarded_runs"] == 3
+
+
+@pytest.mark.parametrize("values", [(), (0,), (-1,), (1, 1), (1001,), (True,)])
+def test_invalid_k_fails_closed(values: tuple[object, ...]) -> None:
+    with pytest.raises(CampaignValidationError, match="k_values"):
+        aggregate_campaign_v0(
+            _cohort("baseline", [_authenticated_campaign_trial()]),
+            k_values=cast(Any, values),
+        )
+
+
+def test_heterogeneous_public_inputs_fail_with_campaign_validation_error() -> None:
+    base = _authenticated_campaign_trial()
+    with pytest.raises(CampaignValidationError, match="available_fault_ids"):
+        campaign_cohort_v0(
+            campaign_id="campaign-malformed",
+            arm="baseline",
+            scenario=base.scenario,
+            agent_configuration=base.agent_configuration,
+            available_fault_ids=cast(Any, ("refund-ack-lost", 1)),
+            selected_fault_ids=(),
+            planned_trials=0,
+            trials=(),
+        )
+    with pytest.raises(CampaignValidationError, match="k_values"):
+        aggregate_campaign_v0(_cohort("baseline", []), k_values=cast(Any, (1, "two")))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("available_fault_ids", None),
+        ("available_fault_ids", "refund-ack-lost"),
+        ("selected_fault_ids", None),
+        ("selected_fault_ids", 7),
+        ("trials", None),
+        ("trials", "not-a-trial-sequence"),
+    ],
+)
+def test_non_iterable_campaign_inputs_are_sanitized(field: str, value: object) -> None:
+    base = _authenticated_campaign_trial()
+    arguments: dict[str, object] = {
+        "campaign_id": "campaign-malformed-container",
+        "arm": "baseline",
+        "scenario": base.scenario,
+        "agent_configuration": base.agent_configuration,
+        "available_fault_ids": base.available_fault_ids,
+        "selected_fault_ids": (),
+        "planned_trials": 0,
+        "trials": (),
+    }
+    arguments[field] = value
+    with pytest.raises(CampaignValidationError, match=field):
+        campaign_cohort_v0(**cast(Any, arguments))
+
+
+@pytest.mark.parametrize("value", [None, "1", 1])
+def test_non_iterable_k_values_are_sanitized(value: object) -> None:
+    with pytest.raises(CampaignValidationError, match="k_values"):
+        aggregate_campaign_v0(_cohort("baseline", []), k_values=cast(Any, value))
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [loads_campaign_statistics_v0, loads_campaign_comparison_v0],
+    ids=["statistics", "comparison"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [1, 1.5, None, [], {}, object()],
+    ids=["int", "float", "none", "list", "dict", "object"],
+)
+def test_campaign_loaders_sanitize_non_json_input(
+    loader: Callable[[str | bytes], object], value: object
+) -> None:
+    with pytest.raises(CampaignValidationError, match="text or bytes"):
+        loader(cast(Any, value))
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [loads_campaign_statistics_v0, loads_campaign_comparison_v0],
+    ids=["statistics", "comparison"],
+)
+def test_campaign_loaders_sanitize_deeply_nested_json(
+    loader: Callable[[str | bytes], object],
+) -> None:
+    with pytest.raises(CampaignValidationError, match="malformed Campaign JSON"):
+        loader("[" * 10_000 + "]" * 10_000)
+
+
+class _HostileRevisionMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        raise RuntimeError("hostile mapping access")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("hostile mapping iteration")
+
+    def __len__(self) -> int:
+        return 3
+
+
+class _HostileCopyValue:
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        raise RuntimeError("hostile deepcopy")
+
+
+@pytest.mark.parametrize("field", ["scenario", "agent_configuration"])
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        _HostileRevisionMapping(),
+        {
+            "id": _HostileCopyValue(),
+            "revision": "1",
+            "digest": "sha256:" + "0" * 64,
+        },
+    ],
+    ids=["iteration", "deepcopy"],
+)
+def test_campaign_revision_references_sanitize_hostile_mappings(
+    field: str, hostile: Mapping[str, object]
+) -> None:
+    base = _authenticated_campaign_trial()
+    arguments: dict[str, object] = {
+        "campaign_id": "campaign-hostile-reference",
+        "arm": "baseline",
+        "scenario": base.scenario,
+        "agent_configuration": base.agent_configuration,
+        "available_fault_ids": base.available_fault_ids,
+        "selected_fault_ids": (),
+        "planned_trials": 0,
+        "trials": (),
+    }
+    arguments[field] = hostile
+    with pytest.raises(CampaignValidationError, match=field):
+        campaign_cohort_v0(**cast(Any, arguments))
+
+
+def test_observed_fault_conditioning_uses_authenticated_fault_gate() -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=0, classification="pass", observed=True),
+        _campaign_trial(base, index=1, classification="fail", observed=False),
+    ]
+    document = aggregate_campaign_v0(_cohort("faulted", trials), k_values=(1,)).to_dict()
+    observed = cast(dict[str, object], document["observed_fault_condition"])
+    assert observed["status"] == "available"
+    assert observed["unobserved_runs"] == 1
+    assert cast(dict[str, int], observed["counts"]) == {
+        "total_runs": 1,
+        "valid_evaluated": 1,
+        "pass": 1,
+        "fail": 0,
+        "invalid": 0,
+    }
+
+
+def test_declared_but_unobserved_fault_has_no_conditioned_denominator() -> None:
+    base = _authenticated_campaign_trial()
+    trial = _campaign_trial(base, index=0, classification="fail", observed=False)
+    document = aggregate_campaign_v0(_cohort("faulted", [trial])).to_dict()
+    observed = cast(dict[str, object], document["observed_fault_condition"])
+    assert observed["status"] == "empty"
+    assert cast(dict[str, object], observed["pass_rate"])["status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("baseline_outcomes", "faulted_outcomes", "improved", "regressed", "delta"),
+    [
+        (("fail", "fail"), ("pass", "fail"), 1, 0, "0.500000000000"),
+        (("pass", "pass"), ("fail", "pass"), 0, 1, "-0.500000000000"),
+    ],
+)
+def test_paired_improvement_and_regression(
+    baseline_outcomes: tuple[str, ...],
+    faulted_outcomes: tuple[str, ...],
+    improved: int,
+    regressed: int,
+    delta: str,
+) -> None:
+    base = _authenticated_campaign_trial()
+    baseline = [
+        _campaign_trial(base, index=index, classification=value, run_id=f"run-baseline-{index}")
+        for index, value in enumerate(baseline_outcomes)
+    ]
+    faulted = [
+        _campaign_trial(base, index=index, classification=value, run_id=f"run-faulted-{index}")
+        for index, value in enumerate(faulted_outcomes)
+    ]
+    document = compare_campaigns_v0(
+        _cohort("baseline", baseline), _cohort("faulted", faulted)
+    ).to_dict()
+    paired = cast(dict[str, object], document["paired"])
+    assert paired["improved"] == improved
+    assert paired["regressed"] == regressed
+    assert cast(dict[str, object], paired["fault_minus_baseline_pass_delta"])["estimate"] == delta
+
+
+def test_pairing_reports_missing_invalid_and_rejects_duplicates_or_incompatibility() -> None:
+    base = _authenticated_campaign_trial()
+    baseline = _cohort(
+        "baseline",
+        [
+            _campaign_trial(base, index=0, classification="pass", run_id="run-b-0"),
+            _campaign_trial(base, index=1, classification="invalid", run_id="run-b-1"),
+        ],
+        planned_trials=3,
+    )
+    faulted = _cohort(
+        "faulted",
+        [
+            _campaign_trial(base, index=1, classification="pass", run_id="run-f-1"),
+            _campaign_trial(base, index=2, classification="pass", run_id="run-f-2"),
+        ],
+        planned_trials=3,
+    )
+    paired = cast(dict[str, object], compare_campaigns_v0(baseline, faulted).to_dict()["paired"])
+    assert paired["invalid_pairs"] == 1
+    assert paired["missing_baseline_trial_indexes"] == [2]
+    assert paired["missing_faulted_trial_indexes"] == [0]
+
+    duplicate = _campaign_trial(base, index=0, classification="pass", run_id="run-b-0")
+    with pytest.raises(CampaignValidationError, match="substituted"):
+        compare_campaigns_v0(baseline, _cohort("faulted", [duplicate], planned_trials=3))
+
+    wrong_scenario = dict(base.scenario)
+    wrong_scenario["revision"] = "v999"
+    incompatible = campaign_cohort_v0(
+        campaign_id="campaign-incompatible",
+        arm="faulted",
+        scenario=wrong_scenario,
+        agent_configuration=base.agent_configuration,
+        available_fault_ids=base.available_fault_ids,
+        selected_fault_ids=base.available_fault_ids,
+        planned_trials=0,
+        trials=[],
+    )
+    with pytest.raises(CampaignValidationError, match="Scenario"):
+        compare_campaigns_v0(baseline, incompatible)
+
+
+def test_duplicate_run_or_trial_membership_fails_closed() -> None:
+    base = _authenticated_campaign_trial()
+    first = _campaign_trial(base, index=0, classification="pass", run_id="run-duplicate")
+    duplicate_run = _campaign_trial(base, index=1, classification="pass", run_id="run-duplicate")
+    duplicate_index = _campaign_trial(base, index=0, classification="pass", run_id="run-different")
+    with pytest.raises(CampaignValidationError, match="duplicate run_id"):
+        _cohort("baseline", [first, duplicate_run])
+    with pytest.raises(CampaignValidationError, match="duplicate trial_index"):
+        _cohort("baseline", [first, duplicate_index])
+
+
+def test_authenticated_trial_reruns_issue16_and_rejects_caller_labels() -> None:
+    trial = _authenticated_campaign_trial()
+    assert trial.evaluation.to_dict()["classification"] == "pass"
+    with pytest.raises(TypeError):
+        CampaignTrial()
+
+    forged = object.__new__(EvaluationResult)
+    object.__setattr__(forged, "canonical_bytes", trial.evaluation.canonical_bytes)
+    object.__setattr__(forged, "digest", "sha256:" + "0" * 64)
+    object.__setattr__(trial, "evaluation", forged)
+    with pytest.raises(CampaignValidationError, match="binding"):
+        aggregate_campaign_v0(_cohort("baseline", [trial]))
+
+    observed = _authenticated_campaign_trial()
+    observed_cohort = _cohort("faulted", [observed])
+    object.__setattr__(observed_cohort.trials[0], "observed_fault_ids", ())
+    with pytest.raises(CampaignValidationError, match="authority"):
+        aggregate_campaign_v0(observed_cohort)
+
+    mutated_input = _authenticated_campaign_trial()
+    mutated_input.evaluation_input.execution["final_answer"] = "Caller-mutated claim."
+    with pytest.raises(CampaignValidationError, match="binding"):
+        aggregate_campaign_v0(_cohort("baseline", [mutated_input]))
+
+
+def test_public_trial_authentication_rejects_coherent_caller_input() -> None:
+    with pytest.raises(CampaignValidationError, match="not authoritative"):
+        authenticated_campaign_trial(
+            cast(Any, None),
+            cast(Any, object()),
+            cast(Any, _input()),
+            ground_truths=(load_ground_truth_v0(GROUND_TRUTH_PATH),),
+        )
+
+
+def test_campaign_membership_is_sealed_against_substitution_copy_and_rewrite() -> None:
+    source = _authenticated_campaign_trial()
+    trial_b = _cohort(
+        "baseline",
+        [_campaign_trial(source, index=0, classification="pass", run_id="run-campaign-b")],
+        campaign_id="campaign-b",
+    ).trials[0]
+    with pytest.raises(CampaignValidationError, match="different Campaign"):
+        campaign_cohort_v0(
+            campaign_id="campaign-a",
+            arm="baseline",
+            scenario=trial_b.scenario,
+            agent_configuration=trial_b.agent_configuration,
+            available_fault_ids=trial_b.available_fault_ids,
+            selected_fault_ids=(),
+            planned_trials=1,
+            trials=(trial_b,),
+        )
+    copied = copy.copy(trial_b)
+    with pytest.raises(CampaignValidationError, match="authority"):
+        aggregate_campaign_v0(
+            CampaignCohort(
+                "campaign-b",
+                "baseline",
+                trial_b.scenario,
+                trial_b.agent_configuration,
+                trial_b.available_fault_ids,
+                (),
+                1,
+                (copied,),
+            )
+        )
+    cohort = _cohort(
+        "baseline",
+        [_campaign_trial(source, index=0, classification="pass", run_id="run-sealed")],
+        campaign_id="campaign-sealed",
+    )
+    sealed = cohort.trials[0]
+    object.__setattr__(sealed, "trial_index", 1)
+    with pytest.raises(CampaignValidationError, match="authority"):
+        aggregate_campaign_v0(cohort)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("run_id", "run-substituted"),
+        ("campaign_id", "campaign-substituted"),
+        ("arm", "faulted"),
+        ("planned_trials", 2),
+        ("selected_fault_ids", ("refund-ack-lost",)),
+        ("scenario", {"id": "other", "revision": "1", "digest": "sha256:" + "1" * 64}),
+        (
+            "agent_configuration",
+            {"id": "other-agent", "revision": "1", "digest": "sha256:" + "2" * 64},
+        ),
+    ],
+)
+def test_trial_provenance_rejects_cross_binding_mutation(field: str, replacement: object) -> None:
+    cohort = _cohort("baseline", [_authenticated_campaign_trial()])
+    object.__setattr__(cohort.trials[0], field, replacement)
+    with pytest.raises(CampaignValidationError, match="authority"):
+        aggregate_campaign_v0(cohort)
+
+
+def test_campaign_schemas_are_strict_versioned_bundled_resources() -> None:
+    statistics = campaign_statistics_schema_v0()
+    comparison = campaign_comparison_schema_v0()
+    assert cast(
+        dict[str, object], cast(dict[str, object], statistics["properties"])["schema_version"]
+    ) == {"const": "chaosagent.campaign-statistics/v0"}
+    assert cast(
+        dict[str, object], cast(dict[str, object], comparison["properties"])["schema_version"]
+    ) == {"const": "chaosagent.campaign-comparison/v0"}
+    assert statistics["additionalProperties"] is False
+    assert comparison["additionalProperties"] is False
+
+
+def test_campaign_contracts_reject_corruption_unknown_fields_and_nonfinite_json() -> None:
+    result = aggregate_campaign_v0(_cohort("baseline", [_authenticated_campaign_trial()]))
+    document = result.to_dict()
+    document["unknown"] = True
+    with pytest.raises(CampaignValidationError):
+        loads_campaign_statistics_v0(json.dumps(document))
+    document = result.to_dict()
+    cast(dict[str, int], document["counts"])["pass"] = 0
+    with pytest.raises(CampaignValidationError, match="counts"):
+        loads_campaign_statistics_v0(json.dumps(document))
+    with pytest.raises(CampaignValidationError, match="malformed"):
+        loads_campaign_statistics_v0('{"value": NaN}')
+    document = result.to_dict()
+    cast(list[dict[str, object]], document["runs"])[0]["observed_fault_ids"] = ["unknown-fault"]
+    with pytest.raises(CampaignValidationError, match="fault catalog"):
+        loads_campaign_statistics_v0(json.dumps(document))
+
+
+def test_campaign_canonical_digest_ordering_and_defensive_loading() -> None:
+    base = _authenticated_campaign_trial()
+    trials = [
+        _campaign_trial(base, index=2, classification="pass"),
+        _campaign_trial(base, index=0, classification="fail"),
+        _campaign_trial(base, index=1, classification="pass"),
+    ]
+    first = aggregate_campaign_v0(_cohort("baseline", trials), k_values=(2, 1))
+    second = aggregate_campaign_v0(_cohort("baseline", list(reversed(trials))), k_values=(1, 2))
+    assert first.canonical_bytes == second.canonical_bytes
+    assert first.digest == second.digest
+    changed = first.to_dict()
+    cast(list[dict[str, object]], changed["runs"])[0]["classification"] = "invalid"
+    assert first.to_dict() != changed
+
+
+def test_comparison_loader_rejects_forged_delta_and_is_deterministic() -> None:
+    base = _authenticated_campaign_trial()
+    baseline = _cohort(
+        "baseline", [_campaign_trial(base, index=0, classification="fail", run_id="run-b")]
+    )
+    faulted = _cohort(
+        "faulted", [_campaign_trial(base, index=0, classification="pass", run_id="run-f")]
+    )
+    result = compare_campaigns_v0(baseline, faulted, k_values=(1,))
+    assert loads_campaign_comparison_v0(result.canonical_bytes).digest == result.digest
+    document = result.to_dict()
+    delta = cast(
+        dict[str, object],
+        cast(dict[str, object], document["paired"])["fault_minus_baseline_pass_delta"],
+    )
+    delta["estimate"] = "0.000000000000"
+    with pytest.raises(CampaignValidationError, match="paired comparison"):
+        loads_campaign_comparison_v0(json.dumps(document))
+
+
+def test_comparison_loader_rejects_equal_campaign_ids_after_identity_recomputation() -> None:
+    base = _authenticated_campaign_trial()
+    result = compare_campaigns_v0(
+        _cohort(
+            "baseline",
+            [_campaign_trial(base, index=0, classification="fail", run_id="run-equal-b")],
+        ),
+        _cohort(
+            "faulted",
+            [_campaign_trial(base, index=0, classification="pass", run_id="run-equal-f")],
+        ),
+    )
+    document = result.to_dict()
+    baseline = cast(dict[str, object], document["baseline"])
+    faulted = cast(dict[str, object], document["faulted"])
+    faulted["campaign_id"] = baseline["campaign_id"]
+    statistics_material = {
+        key: faulted[key]
+        for key in (
+            "campaign_id",
+            "arm",
+            "scenario",
+            "agent_configuration",
+            "available_fault_ids",
+            "selected_fault_ids",
+            "planned_trials",
+            "runs",
+        )
+    }
+    faulted["statistics_id"] = (
+        "statistics-"
+        + hashlib.sha256(rfc8785.dumps(cast(Any, statistics_material))).hexdigest()[:32]
+    )
+    comparison_material = {
+        "baseline_digest": "sha256:"
+        + hashlib.sha256(rfc8785.dumps(cast(Any, baseline))).hexdigest(),
+        "faulted_digest": "sha256:" + hashlib.sha256(rfc8785.dumps(cast(Any, faulted))).hexdigest(),
+        "paired": document["paired"],
+    }
+    document["comparison_id"] = (
+        "comparison-"
+        + hashlib.sha256(rfc8785.dumps(cast(Any, comparison_material))).hexdigest()[:32]
+    )
+    with pytest.raises(CampaignValidationError, match="Campaign IDs must differ"):
+        loads_campaign_comparison_v0(json.dumps(document))
+
+
+def test_small_sample_warning_does_not_change_counts() -> None:
+    result = aggregate_campaign_v0(_cohort("baseline", [_authenticated_campaign_trial()])).to_dict()
+    assert "small_sample" in cast(list[str], result["warnings"])
+    assert cast(dict[str, int], result["counts"])["pass"] == 1
+
+
+def test_campaign_comparison_structural_golden() -> None:
+    base = _authenticated_campaign_trial()
+    baseline = [
+        _campaign_trial(
+            base,
+            index=index,
+            classification="fail",
+            observed=False,
+            run_id=f"run-structural-baseline-{index}",
+        )
+        for index in range(3)
+    ]
+    faulted = [
+        _campaign_trial(
+            base,
+            index=index,
+            classification="pass",
+            observed=True,
+            run_id=f"run-structural-faulted-{index}",
+        )
+        for index in range(3)
+    ]
+    generated = compare_campaigns_v0(
+        _cohort("baseline", baseline, campaign_id="shipment-refund-baseline"),
+        _cohort("faulted", faulted, campaign_id="shipment-refund-ambiguous-timeout"),
+        k_values=(1, 2, 3),
+    )
+    path = ROOT / "benchmarks/shipment-refund/campaigns/v0/comparison.structural.json"
+    stored = loads_campaign_comparison_v0(path.read_bytes())
+    assert generated.canonical_bytes == stored.canonical_bytes
+    assert generated.digest == stored.digest

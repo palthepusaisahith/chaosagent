@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event, get_ident
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 import chaosagent_agent_runtime.runtime as runtime_module
@@ -26,7 +27,16 @@ from chaosagent_agent_runtime import (
     ScriptedAgentAdapter,
     execute_run,
 )
-from chaosagent_evaluators import execute_evaluation, load_ground_truth_v0
+from chaosagent_evaluators import (
+    CampaignPlan,
+    CampaignValidationError,
+    aggregate_campaign_v0,
+    authenticated_campaign_plan,
+    authenticated_campaign_trial,
+    campaign_cohort_v0,
+    execute_evaluation,
+    load_ground_truth_v0,
+)
 from chaosagent_evidence import EvidenceValidationError, digest_payload_v0
 from chaosagent_faults import FaultEngine, compile_fault_plan_v0
 from chaosagent_fixtures import load_fixture
@@ -118,6 +128,7 @@ def _create_run(
     agent_configuration: AgentConfiguration | None = None,
     faults: list[dict[str, object]] | None = None,
     scenario_path: Path = SCENARIO_PATH,
+    before_claim: Callable[[PersistenceRepository, str], None] | None = None,
 ) -> ClaimedRun:
     run_id = _unique("run")
     scenario_document = cast(
@@ -151,6 +162,8 @@ def _create_run(
             created_by="runtime-test",
         )
         repository.initialize_run_company_state(run_id)
+        if before_claim is not None:
+            before_claim(repository, run_id)
         claimed = repository.claim_next_run(
             worker, lease_duration_seconds=600, evidence=_evidence("claim"), run_id=run_id
         )
@@ -162,7 +175,11 @@ def _adapter(*outputs: object) -> ScriptedAgentAdapter:
     return ScriptedAgentAdapter(AGENT.id, AGENT.revision, outputs)
 
 
-def _evaluation_ready_ambiguity_run(engine: Engine) -> ClaimedRun:
+def _evaluation_ready_ambiguity_run(
+    engine: Engine,
+    *,
+    before_claim: Callable[[PersistenceRepository, str], None] | None = None,
+) -> ClaimedRun:
     faults: list[dict[str, object]] = [
         {
             "id": "refund-ack-lost",
@@ -172,7 +189,12 @@ def _evaluation_ready_ambiguity_run(engine: Engine) -> ClaimedRun:
             "parameters": {"duration_ms": 1},
         }
     ]
-    claimed = _create_run(engine, faults=faults, scenario_path=EVALUATED_SCENARIO_PATH)
+    claimed = _create_run(
+        engine,
+        faults=faults,
+        scenario_path=EVALUATED_SCENARIO_PATH,
+        before_claim=before_claim,
+    )
     with Session(engine) as session:
         scenario_record = PersistenceRepository(session).get_scenario_revision(
             claimed.run.scenario.id, claimed.run.scenario.revision
@@ -780,6 +802,163 @@ def test_issue16_evaluates_ambiguous_refund_and_completes_atomically(
     evaluation_result = cast(dict[str, object], events[-2]["payload"])
     assert evaluation_result["outcome"] == "completed"
     assert events[-1]["causation_event_id"] == events[-2]["event_id"]
+
+
+def test_issue17_mints_campaign_truth_only_from_recorded_issue16_result(
+    runtime_engine: Engine,
+) -> None:
+    plans: list[CampaignPlan] = []
+
+    def bind_plan(repository: PersistenceRepository, run_id: str) -> None:
+        plans.append(
+            authenticated_campaign_plan(
+                repository,
+                campaign_id="campaign-authoritative-faulted",
+                arm="faulted",
+                selected_fault_ids=("refund-ack-lost",),
+                assignments={0: run_id},
+            )
+        )
+        with pytest.raises(CampaignValidationError, match="durable authority"):
+            authenticated_campaign_plan(
+                repository,
+                campaign_id="campaign-substituted",
+                arm="baseline",
+                selected_fault_ids=(),
+                assignments={0: run_id},
+            )
+
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine, before_claim=bind_plan)
+    plan = plans[0]
+    truth = load_ground_truth_v0(GROUND_TRUTH_PATH)
+    outcome = execute_evaluation(runtime_engine, claimed.lease, (truth,))
+    assert outcome.status == "completed"
+    with Session(runtime_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        reconstructed_plan = authenticated_campaign_plan(
+            repository,
+            campaign_id="campaign-authoritative-faulted",
+            arm="faulted",
+            selected_fault_ids=("refund-ack-lost",),
+            assignments={0: claimed.run.run_id},
+        )
+        trial = authenticated_campaign_trial(
+            repository,
+            reconstructed_plan,
+            claimed.run.run_id,
+            ground_truths=(truth,),
+        )
+        cohort = campaign_cohort_v0(
+            campaign_id="campaign-authoritative-faulted",
+            arm="faulted",
+            scenario=trial.scenario,
+            agent_configuration=trial.agent_configuration,
+            available_fault_ids=trial.available_fault_ids,
+            selected_fault_ids=trial.selected_fault_ids,
+            planned_trials=1,
+            trials=(trial,),
+        )
+        document = aggregate_campaign_v0(cohort).to_dict()
+        with pytest.raises(CampaignValidationError, match="provenance"):
+            authenticated_campaign_trial(
+                repository,
+                plan,
+                claimed.run.run_id,
+                ground_truths=(),
+            )
+        forged_plan = copy.copy(plan)
+        object.__setattr__(forged_plan, "assignments", ((0, "run-substituted"),))
+        with pytest.raises(CampaignValidationError, match="plan authority"):
+            authenticated_campaign_trial(
+                repository,
+                forged_plan,
+                claimed.run.run_id,
+                ground_truths=(truth,),
+            )
+    assert document["counts"] == {
+        "total_runs": 1,
+        "valid_evaluated": 1,
+        "pass": 1,
+        "fail": 0,
+        "invalid": 0,
+    }
+    assert outcome.result is not None
+    run_rows = cast(list[dict[str, object]], document["runs"])
+    assert run_rows[0]["evaluation_id"] == outcome.result.to_dict()["evaluation_id"]
+    with Session(runtime_engine) as session:
+        persisted = PersistenceRepository(session).get_run(claimed.run.run_id)
+        assert persisted is not None
+        assert persisted.fault_plan_digest == plan.fault_plan_digest
+    with runtime_engine.begin() as connection:
+        with pytest.raises(DBAPIError):
+            connection.execute(
+                text("UPDATE public.runs SET fault_plan_digest = :digest WHERE run_id = :run_id"),
+                {"digest": "sha256:" + "f" * 64, "run_id": claimed.run.run_id},
+            )
+
+
+@pytest.mark.parametrize(
+    ("arm", "selected", "engine_selected"),
+    [
+        ("baseline", (), ("refund-ack-lost",)),
+        ("faulted", ("refund-ack-lost",), ()),
+    ],
+)
+def test_campaign_fault_assignment_must_match_runtime_plan(
+    runtime_engine: Engine,
+    arm: Literal["baseline", "faulted"],
+    selected: tuple[str, ...],
+    engine_selected: tuple[str, ...],
+) -> None:
+    plans: list[CampaignPlan] = []
+
+    def bind_plan(repository: PersistenceRepository, run_id: str) -> None:
+        plans.append(
+            authenticated_campaign_plan(
+                repository,
+                campaign_id=f"campaign-runtime-binding-{arm}",
+                arm=arm,
+                selected_fault_ids=selected,
+                assignments={0: run_id},
+            )
+        )
+
+    faults: list[dict[str, object]] = [
+        {
+            "id": "refund-ack-lost",
+            "kind": "ambiguous_post_commit_timeout",
+            "match": {"tool_id": "payments.refund", "phase": "after_commit"},
+            "activation": {"probability_ppm": 1_000_000, "max_occurrences": 1},
+            "parameters": {"duration_ms": 1},
+        }
+    ]
+    claimed = _create_run(
+        runtime_engine,
+        faults=faults,
+        scenario_path=EVALUATED_SCENARIO_PATH,
+        before_claim=bind_plan,
+    )
+    with Session(runtime_engine) as session:
+        repository = PersistenceRepository(session)
+        scenario_record = repository.get_scenario_revision(
+            claimed.run.scenario.id, claimed.run.scenario.revision
+        )
+        assert scenario_record is not None
+        engine = FaultEngine(
+            compile_fault_plan_v0(scenario_record.scenario, selected_fault_ids=engine_selected),
+            run_seed=1616,
+        )
+    result = execute_run(
+        runtime_engine,
+        claimed.lease,
+        _adapter(AgentOutput("done", final=True, usage=_usage())),
+        fault_engine=engine,
+    )
+    assert result.status == "run_not_ready"
+    assert result.error_code == "internal_error"
+    with Session(runtime_engine) as session:
+        run = PersistenceRepository(session).get_run(claimed.run.run_id)
+        assert run is not None and run.fault_plan_digest is None
 
 
 def test_issue16_invalid_ground_truth_binding_records_error_not_success(

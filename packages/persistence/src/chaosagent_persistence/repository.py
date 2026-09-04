@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Literal, NoReturn, cast
 
+import rfc8785
 from chaosagent_agent_configurations import (
     AgentConfiguration,
     AgentConfigurationValidationError,
@@ -49,6 +50,8 @@ from .models import (
     AgentConfigurationRevisionModel,
     ApprovalRequestModel,
     ApprovalResolutionModel,
+    CampaignPlanModel,
+    CampaignTrialMembershipModel,
     CompanyCustomerModel,
     CompanyEffectModel,
     CompanyOrderModel,
@@ -70,6 +73,7 @@ from .models import (
 _IDENTIFIER_RE = re.compile(IDENTIFIER_CHECK)
 _REVISION_RE = re.compile(REVISION_CHECK)
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CATALOG_ID_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 
 
 class PersistenceError(RuntimeError):
@@ -152,6 +156,10 @@ class CheckpointConflictError(PersistenceConflictError):
     """Raised when a stale executor attempts to replace a newer checkpoint."""
 
 
+class CampaignMembershipConflictError(PersistenceConflictError):
+    """Raised when a Run or Campaign index already has another assignment."""
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionReference:
     id: str
@@ -195,6 +203,7 @@ class RunRecord:
     agent_configuration: RevisionReference
     fixture: RevisionReference | None
     fault_seed: int | None
+    fault_plan_digest: str | None
     status: RunStatus
     lifecycle_version: int
     lease_owner: str | None
@@ -204,6 +213,32 @@ class RunRecord:
     attempt: int
     created_at: datetime
     created_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignPlanRecord:
+    campaign_id: str
+    arm: Literal["baseline", "faulted"]
+    planned_trials: int
+    scenario: RevisionReference
+    agent_configuration: RevisionReference
+    selected_fault_ids: tuple[str, ...]
+    fault_plan_digest: str
+    assignments: tuple[tuple[int, str], ...]
+    canonical_digest: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignTrialMembershipRecord:
+    run_id: str
+    campaign_id: str
+    campaign_plan_digest: str
+    trial_index: int
+    scenario: RevisionReference
+    agent_configuration: RevisionReference
+    membership_digest: str
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,6 +835,232 @@ class PersistenceRepository:
     def get_run(self, run_id: str) -> RunRecord | None:
         model = self._session.get(RunModel, run_id)
         return None if model is None else self._run_record(model)
+
+    def create_campaign_plan(
+        self,
+        *,
+        campaign_id: str,
+        arm: Literal["baseline", "faulted"],
+        selected_fault_ids: tuple[str, ...],
+        fault_plan_digest: str,
+        assignments: tuple[tuple[int, str], ...],
+    ) -> CampaignPlanRecord:
+        """Atomically freeze one Campaign plan while every assigned Run is queued.
+
+        Run rows are locked in stable Run-ID order. The locks, plan, and all
+        memberships remain in the caller-owned transaction.
+        """
+        _require_identifier(campaign_id, "campaign_id")
+        _require_digest(fault_plan_digest)
+        if not isinstance(arm, str) or arm not in {"baseline", "faulted"}:
+            raise ValueError("arm must be baseline or faulted")
+        if not assignments or tuple(index for index, _ in assignments) != tuple(
+            range(len(assignments))
+        ):
+            raise ValueError("Campaign assignments must be contiguous from zero")
+        run_ids = tuple(run_id for _, run_id in assignments)
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("Campaign assignments contain duplicate Runs")
+        for run_id in run_ids:
+            _require_identifier(run_id, "run_id")
+        if (
+            any(not isinstance(item, str) for item in selected_fault_ids)
+            or tuple(sorted(selected_fault_ids)) != selected_fault_ids
+            or len(set(selected_fault_ids)) != len(selected_fault_ids)
+            or any(_CATALOG_ID_RE.fullmatch(item) is None for item in selected_fault_ids)
+        ):
+            raise ValueError("selected fault IDs must be unique and canonically ordered")
+        if (arm == "baseline" and selected_fault_ids) or (
+            arm == "faulted" and not selected_fault_ids
+        ):
+            raise ValueError("Campaign arm contradicts selected faults")
+
+        locked = tuple(
+            self._session.scalars(
+                select(RunModel)
+                .where(RunModel.run_id.in_(sorted(run_ids)))
+                .order_by(RunModel.run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        if len(locked) != len(run_ids) or any(model.status != "queued" for model in locked):
+            raise CampaignMembershipConflictError(
+                "Campaign membership requires existing queued Runs"
+            )
+        by_id = {model.run_id: model for model in locked}
+        first = by_id[run_ids[0]]
+        if any(
+            (
+                model.scenario_id,
+                model.scenario_revision,
+                model.scenario_digest,
+                model.agent_configuration_id,
+                model.agent_configuration_revision,
+                model.agent_configuration_digest,
+            )
+            != (
+                first.scenario_id,
+                first.scenario_revision,
+                first.scenario_digest,
+                first.agent_configuration_id,
+                first.agent_configuration_revision,
+                first.agent_configuration_digest,
+            )
+            for model in locked
+        ):
+            raise CampaignMembershipConflictError("Campaign Runs use incompatible frozen revisions")
+        scenario = RevisionReference(
+            first.scenario_id, first.scenario_revision, first.scenario_digest
+        )
+        agent = RevisionReference(
+            first.agent_configuration_id,
+            first.agent_configuration_revision,
+            first.agent_configuration_digest,
+        )
+        document: dict[str, object] = {
+            "schema_version": "chaosagent.campaign-plan/v0",
+            "campaign_id": campaign_id,
+            "arm": arm,
+            "planned_trials": len(assignments),
+            "scenario": {
+                "id": scenario.id,
+                "revision": scenario.revision,
+                "digest": scenario.digest,
+            },
+            "agent_configuration": {
+                "id": agent.id,
+                "revision": agent.revision,
+                "digest": agent.digest,
+            },
+            "selected_fault_ids": list(selected_fault_ids),
+            "fault_plan_digest": fault_plan_digest,
+            "assignments": [
+                {"trial_index": index, "run_id": run_id} for index, run_id in assignments
+            ],
+        }
+        canonical = rfc8785.dumps(cast(object, document))  # type: ignore[arg-type]
+        plan_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        existing = self._session.get(CampaignPlanModel, campaign_id)
+        if existing is not None:
+            return self._same_campaign_plan_or_conflict(existing, canonical, plan_digest)
+        plan = CampaignPlanModel(
+            campaign_id=campaign_id,
+            arm=arm,
+            planned_trials=len(assignments),
+            scenario_id=scenario.id,
+            scenario_revision=scenario.revision,
+            scenario_digest=scenario.digest,
+            agent_configuration_id=agent.id,
+            agent_configuration_revision=agent.revision,
+            agent_configuration_digest=agent.digest,
+            selected_fault_ids=list(selected_fault_ids),
+            fault_plan_digest=fault_plan_digest,
+            schema_version="chaosagent.campaign-plan/v0",
+            canonical_document=document,
+            canonical_digest=plan_digest,
+        )
+        memberships = []
+        for index, run_id in assignments:
+            membership_document = {
+                "campaign_plan_digest": plan_digest,
+                "run_id": run_id,
+                "trial_index": index,
+            }
+            membership_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    rfc8785.dumps(cast(object, membership_document))  # type: ignore[arg-type]
+                ).hexdigest()
+            )
+            memberships.append(
+                CampaignTrialMembershipModel(
+                    run_id=run_id,
+                    campaign_id=campaign_id,
+                    campaign_plan_digest=plan_digest,
+                    trial_index=index,
+                    scenario_id=scenario.id,
+                    scenario_revision=scenario.revision,
+                    scenario_digest=scenario.digest,
+                    agent_configuration_id=agent.id,
+                    agent_configuration_revision=agent.revision,
+                    agent_configuration_digest=agent.digest,
+                    membership_digest=membership_digest,
+                )
+            )
+        try:
+            with self._session.begin_nested():
+                self._session.add(plan)
+                self._session.add_all(memberships)
+                self._session.flush()
+        except IntegrityError as error:
+            constraint = _constraint_name(error)
+            if constraint in {
+                "pk_campaign_plans",
+                "pk_campaign_trial_memberships",
+                "uq_campaign_memberships_campaign_index",
+            }:
+                concurrent = self._session.get(
+                    CampaignPlanModel, campaign_id, populate_existing=True
+                )
+                if concurrent is not None:
+                    return self._same_campaign_plan_or_conflict(concurrent, canonical, plan_digest)
+                raise CampaignMembershipConflictError(
+                    "Run or Campaign index already has another membership"
+                ) from error
+            _raise_integrity(error, "Campaign plan insert")
+        return self._campaign_plan_record(plan)
+
+    def get_campaign_plan(self, campaign_id: str) -> CampaignPlanRecord | None:
+        model = self._session.scalar(
+            select(CampaignPlanModel)
+            .where(CampaignPlanModel.campaign_id == campaign_id)
+            .execution_options(populate_existing=True)
+        )
+        return None if model is None else self._campaign_plan_record(model)
+
+    def get_campaign_membership(self, run_id: str) -> CampaignTrialMembershipRecord | None:
+        model = self._session.scalar(
+            select(CampaignTrialMembershipModel)
+            .where(CampaignTrialMembershipModel.run_id == run_id)
+            .execution_options(populate_existing=True)
+        )
+        return None if model is None else self._campaign_membership_record(model)
+
+    def bind_run_fault_plan(
+        self,
+        lease: LeaseIdentity,
+        *,
+        selected_fault_ids: tuple[str, ...],
+        fault_plan_digest: str | None,
+    ) -> RunRecord:
+        """Bind the actual runtime fault plan and enforce Campaign assignment."""
+        run = self.lock_current_lease(lease)
+        membership = self.get_campaign_membership(run.run_id)
+        effective_digest = fault_plan_digest
+        if membership is not None:
+            plan = self.get_campaign_plan(membership.campaign_id)
+            if plan is None or plan.canonical_digest != membership.campaign_plan_digest:
+                raise PersistenceIntegrityError("Campaign membership plan binding is corrupt")
+            if selected_fault_ids != plan.selected_fault_ids:
+                raise PersistenceIntegrityError("fault engine differs from Campaign assignment")
+            if selected_fault_ids and fault_plan_digest != plan.fault_plan_digest:
+                raise PersistenceIntegrityError(
+                    "fault plan digest differs from Campaign assignment"
+                )
+            effective_digest = plan.fault_plan_digest
+        if effective_digest is None:
+            return run
+        _require_digest(effective_digest)
+        model = self._session.get(RunModel, run.run_id)
+        if model is None:
+            raise ReferenceNotFoundError("Run does not exist")
+        if model.fault_plan_digest is None:
+            model.fault_plan_digest = effective_digest
+            self._session.flush()
+        elif model.fault_plan_digest != effective_digest:
+            raise PersistenceIntegrityError("Run fault plan binding is immutable")
+        return self._run_record(model)
 
     def lock_current_lease(self, lease: LeaseIdentity) -> RunRecord:
         """Lock a Run and prove the caller holds its current unexpired lease.
@@ -3138,6 +3399,131 @@ class PersistenceRepository:
             model.created_by,
         )
 
+    def _same_campaign_plan_or_conflict(
+        self, model: CampaignPlanModel, canonical: bytes, digest: str
+    ) -> CampaignPlanRecord:
+        record = self._campaign_plan_record(model)
+        try:
+            stored = rfc8785.dumps(cast(object, deepcopy(model.canonical_document)))  # type: ignore[arg-type]
+        except (TypeError, rfc8785.CanonicalizationError) as error:
+            raise PersistenceIntegrityError("stored Campaign plan is malformed") from error
+        if record.canonical_digest != digest or stored != canonical:
+            raise CampaignMembershipConflictError(
+                "Campaign identity already has a different immutable plan"
+            )
+        return record
+
+    def _campaign_plan_record(self, model: CampaignPlanModel) -> CampaignPlanRecord:
+        try:
+            document = deepcopy(model.canonical_document)
+            canonical = rfc8785.dumps(cast(object, document))  # type: ignore[arg-type]
+            digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+            scenario = cast(dict[str, object], document["scenario"])
+            agent = cast(dict[str, object], document["agent_configuration"])
+            assignments_document = cast(list[dict[str, object]], document["assignments"])
+            assignments = tuple(
+                (cast(int, item["trial_index"]), cast(str, item["run_id"]))
+                for item in assignments_document
+            )
+            selected = tuple(cast(list[str], document["selected_fault_ids"]))
+        except (KeyError, TypeError, ValueError, rfc8785.CanonicalizationError) as error:
+            raise PersistenceIntegrityError("stored Campaign plan is malformed") from error
+        if (
+            digest != model.canonical_digest
+            or document.get("schema_version") != "chaosagent.campaign-plan/v0"
+            or document.get("campaign_id") != model.campaign_id
+            or document.get("arm") != model.arm
+            or document.get("planned_trials") != model.planned_trials
+            or document.get("fault_plan_digest") != model.fault_plan_digest
+            or list(selected) != model.selected_fault_ids
+            or scenario
+            != {
+                "id": model.scenario_id,
+                "revision": model.scenario_revision,
+                "digest": model.scenario_digest,
+            }
+            or agent
+            != {
+                "id": model.agent_configuration_id,
+                "revision": model.agent_configuration_revision,
+                "digest": model.agent_configuration_digest,
+            }
+            or len(assignments) != model.planned_trials
+            or tuple(index for index, _ in assignments) != tuple(range(model.planned_trials))
+            or len({run_id for _, run_id in assignments}) != len(assignments)
+        ):
+            raise PersistenceIntegrityError("stored Campaign plan projections are inconsistent")
+        membership_models = tuple(
+            self._session.scalars(
+                select(CampaignTrialMembershipModel)
+                .where(CampaignTrialMembershipModel.campaign_id == model.campaign_id)
+                .order_by(CampaignTrialMembershipModel.trial_index)
+            )
+        )
+        membership_assignments = tuple(
+            (membership.trial_index, membership.run_id) for membership in membership_models
+        )
+        if membership_assignments != assignments or any(
+            membership.campaign_plan_digest != model.canonical_digest
+            or membership.scenario_id != model.scenario_id
+            or membership.scenario_revision != model.scenario_revision
+            or membership.scenario_digest != model.scenario_digest
+            or membership.agent_configuration_id != model.agent_configuration_id
+            or membership.agent_configuration_revision != model.agent_configuration_revision
+            or membership.agent_configuration_digest != model.agent_configuration_digest
+            for membership in membership_models
+        ):
+            raise PersistenceIntegrityError("stored Campaign memberships contradict their plan")
+        for membership in membership_models:
+            self._campaign_membership_record(membership)
+        return CampaignPlanRecord(
+            model.campaign_id,
+            cast(Literal["baseline", "faulted"], model.arm),
+            model.planned_trials,
+            RevisionReference(model.scenario_id, model.scenario_revision, model.scenario_digest),
+            RevisionReference(
+                model.agent_configuration_id,
+                model.agent_configuration_revision,
+                model.agent_configuration_digest,
+            ),
+            selected,
+            model.fault_plan_digest,
+            assignments,
+            model.canonical_digest,
+            model.created_at,
+        )
+
+    @staticmethod
+    def _campaign_membership_record(
+        model: CampaignTrialMembershipModel,
+    ) -> CampaignTrialMembershipRecord:
+        material = {
+            "campaign_plan_digest": model.campaign_plan_digest,
+            "run_id": model.run_id,
+            "trial_index": model.trial_index,
+        }
+        try:
+            canonical = rfc8785.dumps(cast(object, material))  # type: ignore[arg-type]
+        except (TypeError, rfc8785.CanonicalizationError) as error:
+            raise PersistenceIntegrityError("stored Campaign membership is malformed") from error
+        digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        if digest != model.membership_digest:
+            raise PersistenceIntegrityError("stored Campaign membership digest is corrupt")
+        return CampaignTrialMembershipRecord(
+            model.run_id,
+            model.campaign_id,
+            model.campaign_plan_digest,
+            model.trial_index,
+            RevisionReference(model.scenario_id, model.scenario_revision, model.scenario_digest),
+            RevisionReference(
+                model.agent_configuration_id,
+                model.agent_configuration_revision,
+                model.agent_configuration_digest,
+            ),
+            model.membership_digest,
+            model.created_at,
+        )
+
     @staticmethod
     def _run_record(model: RunModel) -> RunRecord:
         fixture = None
@@ -3161,6 +3547,7 @@ class PersistenceRepository:
             ),
             fixture=fixture,
             fault_seed=model.fault_seed,
+            fault_plan_digest=model.fault_plan_digest,
             status=parse_run_status(model.status),
             lifecycle_version=model.lifecycle_version,
             lease_owner=model.lease_owner,

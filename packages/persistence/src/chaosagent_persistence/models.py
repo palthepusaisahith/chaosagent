@@ -242,6 +242,10 @@ class RunModel(Base):
             name="fault_seed_json_safe",
         ),
         CheckConstraint(
+            "fault_plan_digest IS NULL OR fault_plan_digest ~ '" + DIGEST_CHECK + "'",
+            name="fault_plan_digest_format",
+        ),
+        CheckConstraint(
             "(fixture_id IS NULL AND fixture_revision IS NULL AND fixture_digest IS NULL) OR "
             "(fixture_id IS NOT NULL AND fixture_revision IS NOT NULL "
             "AND fixture_digest IS NOT NULL)",
@@ -278,6 +282,16 @@ class RunModel(Base):
             name="uq_run_frozen_references",
         ),
         UniqueConstraint(
+            "run_id",
+            "scenario_id",
+            "scenario_revision",
+            "scenario_digest",
+            "agent_configuration_id",
+            "agent_configuration_revision",
+            "agent_configuration_digest",
+            name="uq_runs_campaign_binding",
+        ),
+        UniqueConstraint(
             "run_id", "fixture_id", "fixture_revision", "fixture_digest", name="uq_run_fixture"
         ),
         UniqueConstraint(
@@ -308,6 +322,7 @@ class RunModel(Base):
     fixture_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fixture_digest: Mapped[str | None] = mapped_column(String(71), nullable=True)
     fault_seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    fault_plan_digest: Mapped[str | None] = mapped_column(String(71), nullable=True)
     status: Mapped[RunStatus] = mapped_column(String(32), nullable=False, server_default="queued")
     lifecycle_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -321,6 +336,173 @@ class RunModel(Base):
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
+class CampaignPlanModel(Base):
+    """Immutable pre-execution Campaign arm and trial-space definition."""
+
+    __tablename__ = "campaign_plans"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["scenario_id", "scenario_revision", "scenario_digest"],
+            [
+                "public.scenario_revisions.scenario_id",
+                "public.scenario_revisions.revision",
+                "public.scenario_revisions.canonical_digest",
+            ],
+            name="fk_campaign_plans_scenario_revision",
+        ),
+        ForeignKeyConstraint(
+            [
+                "agent_configuration_id",
+                "agent_configuration_revision",
+                "agent_configuration_digest",
+            ],
+            [
+                "public.agent_configuration_revisions.agent_configuration_id",
+                "public.agent_configuration_revisions.revision",
+                "public.agent_configuration_revisions.digest",
+            ],
+            name="fk_campaign_plans_agent_configuration_revision",
+        ),
+        CheckConstraint("campaign_id ~ '" + IDENTIFIER_CHECK + "'", name="campaign_id_format"),
+        CheckConstraint("arm IN ('baseline', 'faulted')", name="arm_value"),
+        CheckConstraint(
+            "planned_trials BETWEEN 1 AND 9007199254740991",
+            name="planned_trials_positive",
+        ),
+        CheckConstraint("fault_plan_digest ~ '" + DIGEST_CHECK + "'", name="fault_plan_digest"),
+        CheckConstraint("canonical_digest ~ '" + DIGEST_CHECK + "'", name="canonical_digest"),
+        CheckConstraint("jsonb_typeof(selected_fault_ids) = 'array'", name="selected_faults_array"),
+        CheckConstraint(
+            "(arm = 'baseline' AND jsonb_array_length(selected_fault_ids) = 0) OR "
+            "(arm = 'faulted' AND jsonb_array_length(selected_fault_ids) > 0)",
+            name="arm_fault_assignment",
+        ),
+        CheckConstraint("jsonb_typeof(canonical_document) = 'object'", name="document_object"),
+        CheckConstraint(
+            "(canonical_document ->> 'schema_version') IS NOT DISTINCT FROM schema_version",
+            name="document_schema_version",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'campaign_id') IS NOT DISTINCT FROM campaign_id",
+            name="document_campaign_id",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'arm') IS NOT DISTINCT FROM arm",
+            name="document_arm",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(canonical_document -> 'planned_trials') IS NOT DISTINCT FROM 'number' "
+            "AND (canonical_document ->> 'planned_trials') ~ '^[1-9][0-9]*$' "
+            "AND (canonical_document ->> 'planned_trials')::bigint "
+            "IS NOT DISTINCT FROM planned_trials",
+            name="document_planned_trials",
+        ),
+        CheckConstraint(
+            "(canonical_document ->> 'fault_plan_digest') IS NOT DISTINCT FROM fault_plan_digest",
+            name="document_fault_plan_digest",
+        ),
+        CheckConstraint(
+            "(canonical_document -> 'selected_fault_ids') IS NOT DISTINCT FROM selected_fault_ids",
+            name="document_selected_fault_ids",
+        ),
+        CheckConstraint(
+            "(canonical_document #>> '{scenario,id}') IS NOT DISTINCT FROM scenario_id AND "
+            "(canonical_document #>> '{scenario,revision}') "
+            "IS NOT DISTINCT FROM scenario_revision AND "
+            "(canonical_document #>> '{scenario,digest}') IS NOT DISTINCT FROM scenario_digest",
+            name="document_scenario",
+        ),
+        CheckConstraint(
+            "(canonical_document #>> '{agent_configuration,id}') "
+            "IS NOT DISTINCT FROM agent_configuration_id AND "
+            "(canonical_document #>> '{agent_configuration,revision}') "
+            "IS NOT DISTINCT FROM agent_configuration_revision AND "
+            "(canonical_document #>> '{agent_configuration,digest}') "
+            "IS NOT DISTINCT FROM agent_configuration_digest",
+            name="document_agent_configuration",
+        ),
+        UniqueConstraint(
+            "campaign_id", "canonical_digest", name="uq_campaign_plans_identity_digest"
+        ),
+        {"schema": "public"},
+    )
+
+    campaign_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    arm: Mapped[str] = mapped_column(String(16), nullable=False)
+    planned_trials: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scenario_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scenario_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    scenario_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    agent_configuration_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    agent_configuration_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_configuration_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    selected_fault_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    fault_plan_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_document: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    canonical_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+
+
+class CampaignTrialMembershipModel(Base):
+    """Immutable assignment of exactly one Run to one Campaign trial index."""
+
+    __tablename__ = "campaign_trial_memberships"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_id", "campaign_plan_digest"],
+            ["public.campaign_plans.campaign_id", "public.campaign_plans.canonical_digest"],
+            name="fk_campaign_memberships_plan",
+        ),
+        ForeignKeyConstraint(
+            [
+                "run_id",
+                "scenario_id",
+                "scenario_revision",
+                "scenario_digest",
+                "agent_configuration_id",
+                "agent_configuration_revision",
+                "agent_configuration_digest",
+            ],
+            [
+                "public.runs.run_id",
+                "public.runs.scenario_id",
+                "public.runs.scenario_revision",
+                "public.runs.scenario_digest",
+                "public.runs.agent_configuration_id",
+                "public.runs.agent_configuration_revision",
+                "public.runs.agent_configuration_digest",
+            ],
+            name="fk_campaign_memberships_run_binding",
+        ),
+        CheckConstraint(
+            "trial_index BETWEEN 0 AND 9007199254740991", name="trial_index_nonnegative"
+        ),
+        CheckConstraint("membership_digest ~ '" + DIGEST_CHECK + "'", name="membership_digest"),
+        UniqueConstraint(
+            "campaign_id", "trial_index", name="uq_campaign_memberships_campaign_index"
+        ),
+        {"schema": "public"},
+    )
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    campaign_plan_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    trial_index: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scenario_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    scenario_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    scenario_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    agent_configuration_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    agent_configuration_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_configuration_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    membership_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
 
 
 class ExecutionCheckpointModel(Base):

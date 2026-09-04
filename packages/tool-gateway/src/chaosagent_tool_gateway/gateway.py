@@ -536,6 +536,15 @@ class ToolGateway:
                     or scenario_record.scenario.digest != run.scenario.digest
                 ):
                     raise ReferenceNotFoundError("Run Scenario binding does not resolve")
+                run = self._repository.bind_run_fault_plan(
+                    lease,
+                    selected_fault_ids=(
+                        () if self._fault_engine is None else self._fault_engine.selected_fault_ids
+                    ),
+                    fault_plan_digest=(
+                        None if self._fault_engine is None else self._fault_engine.plan_digest
+                    ),
+                )
                 if self._fault_engine is not None and (
                     self._fault_engine.scenario_id != run.scenario.id
                     or self._fault_engine.scenario_revision != run.scenario.revision

@@ -533,6 +533,11 @@ def _load_state(
         scenario_record = repository.get_scenario_revision(run.scenario.id, run.scenario.revision)
         if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
             raise PersistenceIntegrityError("Run Scenario binding does not resolve")
+        run = repository.bind_run_fault_plan(
+            lease,
+            selected_fault_ids=(() if fault_engine is None else fault_engine.selected_fault_ids),
+            fault_plan_digest=None if fault_engine is None else fault_engine.plan_digest,
+        )
         if fault_engine is not None:
             if (
                 fault_engine.scenario_id != run.scenario.id

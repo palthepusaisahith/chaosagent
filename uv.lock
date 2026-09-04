@@ -119,6 +119,7 @@ dependencies = [
     { name = "chaosagent-persistence" },
     { name = "chaosagent-scenarios" },
     { name = "jsonschema" },
+    { name = "referencing" },
     { name = "rfc8785" },
     { name = "sqlalchemy" },
 ]
@@ -131,6 +132,7 @@ requires-dist = [
     { name = "chaosagent-persistence", editable = "packages/persistence" },
     { name = "chaosagent-scenarios", editable = "packages/scenarios" },
     { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "referencing", specifier = "==0.37.0" },
     { name = "rfc8785", specifier = "==0.1.4" },
     { name = "sqlalchemy", specifier = "==2.0.52" },
 ]
@@ -192,6 +194,7 @@ dependencies = [
     { name = "chaosagent-policies" },
     { name = "chaosagent-scenarios" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "rfc8785" },
     { name = "sqlalchemy" },
 ]
 
@@ -204,6 +207,7 @@ requires-dist = [
     { name = "chaosagent-policies", editable = "packages/policies" },
     { name = "chaosagent-scenarios", editable = "packages/scenarios" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.4" },
+    { name = "rfc8785", specifier = "==0.1.4" },
     { name = "sqlalchemy", specifier = "==2.0.52" },
 ]
 

@@ -8,12 +8,17 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from threading import Barrier, Event
 from time import monotonic
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from chaosagent_evaluators import (
+    CampaignValidationError,
+    authenticated_campaign_plan,
+    authenticated_campaign_trial,
+)
 from chaosagent_evidence import (
     RunEvent,
     RunReport,
@@ -22,6 +27,7 @@ from chaosagent_evidence import (
 )
 from chaosagent_fixtures import Fixture, load_fixture, loads_fixture
 from chaosagent_persistence import (
+    CampaignMembershipConflictError,
     ClaimedRun,
     CompanyStateInitializationError,
     DuplicateEventIDError,
@@ -148,6 +154,366 @@ def _seed_run(session: Session, run_id: str) -> None:
         agent_configuration_revision=AGENT_REFERENCE.revision,
         created_by="test-suite",
     )
+
+
+def _create_campaign_plan(
+    repository: PersistenceRepository, run_id: str, campaign_id: str
+) -> object:
+    return repository.create_campaign_plan(
+        campaign_id=campaign_id,
+        arm="baseline",
+        selected_fault_ids=(),
+        fault_plan_digest="sha256:" + "a" * 64,
+        assignments=((0, run_id),),
+    )
+
+
+def test_campaign_membership_is_durable_immutable_and_rollback_safe(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("campaign-member")
+    campaign_id = _unique("campaign")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+        plan = _create_campaign_plan(PersistenceRepository(session), run_id, campaign_id)
+        assert getattr(plan, "assignments") == ((0, run_id),)
+    with Session(migrated_engine) as session:
+        repository = PersistenceRepository(session)
+        assert repository.get_campaign_plan(campaign_id) is not None
+        membership = repository.get_campaign_membership(run_id)
+        assert membership is not None and membership.campaign_id == campaign_id
+    with migrated_engine.begin() as connection:
+        with pytest.raises(DBAPIError):
+            connection.execute(
+                text(
+                    "UPDATE public.campaign_trial_memberships "
+                    "SET trial_index = 1 WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+    with migrated_engine.begin() as connection:
+        with pytest.raises(DBAPIError):
+            connection.execute(
+                text("DELETE FROM public.campaign_trial_memberships WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+    with migrated_engine.begin() as connection:
+        with pytest.raises(DBAPIError):
+            connection.execute(
+                text(
+                    "UPDATE public.campaign_plans SET planned_trials = 2 "
+                    "WHERE campaign_id = :campaign_id"
+                ),
+                {"campaign_id": campaign_id},
+            )
+    with migrated_engine.begin() as connection:
+        with pytest.raises(DBAPIError):
+            connection.execute(
+                text("DELETE FROM public.campaign_plans WHERE campaign_id = :campaign_id"),
+                {"campaign_id": campaign_id},
+            )
+    with migrated_engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(
+                text(
+                    "ALTER TABLE public.campaign_trial_memberships "
+                    "DISABLE TRIGGER campaign_trial_memberships_immutable"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE public.campaign_trial_memberships "
+                    "SET membership_digest = :digest WHERE run_id = :run_id"
+                ),
+                {"digest": "sha256:" + "f" * 64, "run_id": run_id},
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE public.campaign_trial_memberships "
+                    "ENABLE TRIGGER campaign_trial_memberships_immutable"
+                )
+            )
+            with Session(bind=connection) as session:
+                with pytest.raises(PersistenceIntegrityError, match="membership digest"):
+                    PersistenceRepository(session).get_campaign_plan(campaign_id)
+        finally:
+            transaction.rollback()
+
+    rolled_back_run = _unique("campaign-rollback-run")
+    rolled_back_campaign = _unique("campaign-rollback")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, rolled_back_run)
+    with Session(migrated_engine) as session:
+        transaction = session.begin()
+        rolled_back_wrapper = authenticated_campaign_plan(
+            PersistenceRepository(session),
+            campaign_id=rolled_back_campaign,
+            arm="baseline",
+            selected_fault_ids=(),
+            assignments={0: rolled_back_run},
+        )
+        transaction.rollback()
+    with Session(migrated_engine) as session, session.begin():
+        repository = PersistenceRepository(session)
+        assert repository.get_campaign_plan(rolled_back_campaign) is None
+        assert repository.get_campaign_membership(rolled_back_run) is None
+        with pytest.raises(CampaignValidationError, match="committed durable authority"):
+            authenticated_campaign_trial(
+                repository,
+                rolled_back_wrapper,
+                rolled_back_run,
+                ground_truths=(),
+            )
+        assert _create_campaign_plan(repository, rolled_back_run, rolled_back_campaign) is not None
+
+
+def test_concurrent_campaign_planners_cannot_assign_one_run_twice(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("campaign-race-run")
+    campaigns = (_unique("campaign-a"), _unique("campaign-b"))
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+    barrier = Barrier(2)
+
+    def plan(campaign_id: str) -> str:
+        with Session(migrated_engine) as session, session.begin():
+            barrier.wait()
+            try:
+                _create_campaign_plan(PersistenceRepository(session), run_id, campaign_id)
+            except CampaignMembershipConflictError:
+                return "conflict"
+            return "created"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(plan, campaigns))
+    assert sorted(results) == ["conflict", "created"]
+    with Session(migrated_engine) as session:
+        membership = PersistenceRepository(session).get_campaign_membership(run_id)
+        assert membership is not None and membership.campaign_id in campaigns
+
+
+def test_concurrent_plans_cannot_reuse_one_campaign_index(
+    migrated_engine: Engine,
+) -> None:
+    run_ids = (_unique("campaign-index-a"), _unique("campaign-index-b"))
+    campaign_id = _unique("campaign-shared-index")
+    with Session(migrated_engine) as session, session.begin():
+        for run_id in run_ids:
+            _seed_isolated_run(session, run_id)
+    barrier = Barrier(2)
+
+    def plan(run_id: str) -> str:
+        with Session(migrated_engine) as session, session.begin():
+            barrier.wait()
+            try:
+                _create_campaign_plan(PersistenceRepository(session), run_id, campaign_id)
+            except CampaignMembershipConflictError:
+                return "conflict"
+            return "created"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(plan, run_ids))
+    assert sorted(results) == ["conflict", "created"]
+    with Session(migrated_engine) as session:
+        plan_record = PersistenceRepository(session).get_campaign_plan(campaign_id)
+        assert plan_record is not None
+        assert len(plan_record.assignments) == 1
+        assert plan_record.assignments[0][1] in run_ids
+
+
+def test_campaign_planning_rejects_stale_orm_state_and_claimed_run(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("campaign-stale-run")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+    stale_session = Session(migrated_engine, expire_on_commit=False)
+    try:
+        stale_repository = PersistenceRepository(stale_session)
+        stale = stale_repository.get_run(run_id)
+        assert stale is not None and stale.status == "queued"
+        with Session(migrated_engine) as claimant, claimant.begin():
+            claimed = PersistenceRepository(claimant).claim_next_run(
+                "campaign-claim-worker",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(1),
+                run_id=run_id,
+            )
+            assert claimed is not None
+        with pytest.raises(CampaignMembershipConflictError, match="queued"):
+            _create_campaign_plan(stale_repository, run_id, _unique("campaign-stale"))
+        stale_session.rollback()
+        with Session(migrated_engine) as session:
+            assert PersistenceRepository(session).get_campaign_membership(run_id) is None
+    finally:
+        stale_session.close()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "provisioning",
+        "running",
+        "evaluating",
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "infra_error",
+    ],
+)
+def test_campaign_planning_rejects_every_nonqueued_state(
+    migrated_engine: Engine, status: str
+) -> None:
+    run_id = _unique(f"campaign-{status}")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+        repository = PersistenceRepository(session)
+        if status == "cancelled":
+            repository.cancel_queued_run(
+                run_id, expected_version=0, evidence=_lifecycle_evidence(1)
+            )
+        else:
+            claimed = repository.claim_next_run(
+                "campaign-state-worker",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(1),
+                run_id=run_id,
+            )
+            assert claimed is not None
+            current = claimed.run
+            if status != "provisioning":
+                current = repository.transition_owned_run(
+                    claimed.lease,
+                    "running",
+                    expected_version=current.lifecycle_version,
+                    evidence=_lifecycle_evidence(2),
+                )
+            if status in {"evaluating", "completed"}:
+                current = repository.transition_owned_run(
+                    claimed.lease,
+                    "evaluating",
+                    expected_version=current.lifecycle_version,
+                    evidence=_lifecycle_evidence(3),
+                )
+            if status == "completed":
+                repository.transition_owned_run(
+                    claimed.lease,
+                    "completed",
+                    expected_version=current.lifecycle_version,
+                    evidence=_lifecycle_evidence(4),
+                )
+            elif status in {"failed", "timed_out", "infra_error"}:
+                repository.transition_owned_run(
+                    claimed.lease,
+                    cast(Any, status),
+                    expected_version=current.lifecycle_version,
+                    evidence=_lifecycle_evidence(3),
+                )
+    with Session(migrated_engine) as session, session.begin():
+        with pytest.raises(CampaignMembershipConflictError, match="queued"):
+            _create_campaign_plan(
+                PersistenceRepository(session), run_id, _unique("campaign-nonqueued")
+            )
+
+
+def test_campaign_planning_and_claiming_serialize_on_the_run_row(
+    migrated_engine: Engine,
+) -> None:
+    planner_first_run = _unique("campaign-planner-first")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, planner_first_run)
+    planner_session = Session(migrated_engine)
+    planner_transaction = planner_session.begin()
+    try:
+        _create_campaign_plan(
+            PersistenceRepository(planner_session),
+            planner_first_run,
+            _unique("campaign-planner-wins"),
+        )
+        with Session(migrated_engine) as claimant, claimant.begin():
+            assert (
+                PersistenceRepository(claimant).claim_next_run(
+                    "campaign-skipped-claim",
+                    lease_duration_seconds=60,
+                    evidence=_lifecycle_evidence(1),
+                    run_id=planner_first_run,
+                )
+                is None
+            )
+        planner_transaction.commit()
+    finally:
+        planner_session.close()
+    with Session(migrated_engine) as claimant, claimant.begin():
+        assert (
+            PersistenceRepository(claimant).claim_next_run(
+                "campaign-after-plan-claim",
+                lease_duration_seconds=60,
+                evidence=_lifecycle_evidence(1),
+                run_id=planner_first_run,
+            )
+            is not None
+        )
+
+    claimant_first_run = _unique("campaign-claimant-first")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, claimant_first_run)
+    claiming_session = Session(migrated_engine)
+    claiming_transaction = claiming_session.begin()
+    try:
+        claimed = PersistenceRepository(claiming_session).claim_next_run(
+            "campaign-lock-holder",
+            lease_duration_seconds=60,
+            evidence=_lifecycle_evidence(1),
+            run_id=claimant_first_run,
+        )
+        assert claimed is not None
+        entered = Event()
+        backend: dict[str, int] = {}
+
+        def blocked_plan() -> str:
+            with Session(migrated_engine) as session, session.begin():
+                backend["pid"] = cast(int, session.scalar(text("SELECT pg_backend_pid()")))
+                entered.set()
+                try:
+                    _create_campaign_plan(
+                        PersistenceRepository(session),
+                        claimant_first_run,
+                        _unique("campaign-claim-wins"),
+                    )
+                except CampaignMembershipConflictError:
+                    return "conflict"
+                return "created"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(blocked_plan)
+            assert entered.wait(timeout=5)
+            deadline = monotonic() + 5
+            waiting = False
+            while monotonic() < deadline:
+                with migrated_engine.connect() as observer:
+                    waiting = bool(
+                        observer.scalar(
+                            text(
+                                "SELECT wait_event_type = 'Lock' FROM pg_stat_activity "
+                                "WHERE pid = :pid"
+                            ),
+                            {"pid": backend["pid"]},
+                        )
+                    )
+                if waiting:
+                    break
+                Event().wait(0.05)
+            completed_while_locked = future.done()
+            claiming_transaction.commit()
+            assert waiting and not completed_while_locked
+            assert future.result(timeout=5) == "conflict"
+    finally:
+        if claiming_transaction.is_active:
+            claiming_transaction.rollback()
+        claiming_session.close()
 
 
 def _seed_isolated_run(session: Session, run_id: str) -> None:
@@ -592,6 +958,44 @@ def test_fault_seed_migration_round_trip_is_honest(migrated_engine: Engine) -> N
         assert (
             connection.scalar(
                 text("SELECT fault_seed FROM public.runs WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            is None
+        )
+    command.check(configuration)
+
+
+def test_campaign_membership_migration_downgrade_is_honest(
+    migrated_engine: Engine,
+) -> None:
+    run_id = _unique("campaign-migration-run")
+    campaign_id = _unique("campaign-migration")
+    with Session(migrated_engine) as session, session.begin():
+        _seed_isolated_run(session, run_id)
+        _create_campaign_plan(PersistenceRepository(session), run_id, campaign_id)
+    configuration = Config(str(ALEMBIC_INI))
+    command.downgrade(configuration, "0009_run_fault_seed")
+    inspector = inspect(migrated_engine)
+    assert {
+        "campaign_plans",
+        "campaign_trial_memberships",
+    }.isdisjoint(inspector.get_table_names(schema="public"))
+    columns = {column["name"] for column in inspector.get_columns("runs", schema="public")}
+    assert "fault_plan_digest" not in columns
+    with migrated_engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM public.runs WHERE run_id = :run_id"),
+                {"run_id": run_id},
+            )
+            == 1
+        )
+    command.upgrade(configuration, "head")
+    with migrated_engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM public.campaign_plans")) == 0
+        assert (
+            connection.scalar(
+                text("SELECT fault_plan_digest FROM public.runs WHERE run_id = :run_id"),
                 {"run_id": run_id},
             )
             is None

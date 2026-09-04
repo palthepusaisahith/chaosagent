@@ -10,6 +10,7 @@ dependencies = [
     "chaosagent-persistence",
     "chaosagent-scenarios",
     "jsonschema==4.26.0",
+    "referencing==0.37.0",
     "rfc8785==0.1.4",
     "sqlalchemy==2.0.52",
 ]

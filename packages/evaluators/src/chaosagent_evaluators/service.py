@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, cast
 
@@ -23,6 +23,7 @@ from chaosagent_persistence import (
     PersistenceError,
     PersistenceIntegrityError,
     PersistenceRepository,
+    RunRecord,
     StaleLeaseError,
 )
 from sqlalchemy import Engine
@@ -50,6 +51,15 @@ class EvaluationExecutionResult:
     run_id: str
     result: EvaluationResult | None = None
     error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeEvaluationSnapshot:
+    """A completed Run's evaluation reconstructed from immutable persistence."""
+
+    run: RunRecord
+    evaluation_input: EvaluationInput
+    result: EvaluationResult
 
 
 def _timestamp(value: datetime) -> str:
@@ -179,6 +189,154 @@ def _execution_document(checkpoint: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _build_evaluation_input(
+    repository: PersistenceRepository,
+    run: RunRecord,
+    ground_truths: tuple[GroundTruth, ...],
+    boundary: int,
+) -> EvaluationInput:
+    scenario_record = repository.get_scenario_revision(run.scenario.id, run.scenario.revision)
+    if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
+        raise PersistenceIntegrityError("Run Scenario binding does not resolve")
+    scenario_document = scenario_record.scenario.to_dict()
+    policy_reference = cast(dict[str, object], scenario_document["policy"])
+    policy_record = repository.get_policy_revision(
+        cast(str, policy_reference["id"]), cast(str, policy_reference["revision"])
+    )
+    if policy_record is None or policy_record.policy.digest != policy_reference["digest"]:
+        raise PersistenceIntegrityError("Run Policy binding does not resolve")
+    if run.fixture is None:
+        raise PersistenceIntegrityError("Run Fixture binding is absent")
+    fixture_record = repository.get_fixture_revision(run.fixture.id, run.fixture.revision)
+    if fixture_record is None or fixture_record.fixture.digest != run.fixture.digest:
+        raise PersistenceIntegrityError("Run Fixture binding does not resolve")
+    state = repository.get_run_company_state(run.run_id)
+    checkpoint_record = repository.get_execution_checkpoint(run.run_id)
+    records = repository.fetch_events(run.run_id, through_sequence=boundary)
+    if state is None or checkpoint_record is None or not records:
+        raise PersistenceIntegrityError("evaluation inputs are incomplete")
+    checkpoint_run = run if run.status == "evaluating" else replace(run, status="evaluating")
+    checkpoint = validate_final_execution_snapshot(
+        checkpoint_record,
+        checkpoint_run,
+        scenario_record.scenario.to_dict(),
+        records,
+    )
+    effects = tuple(
+        EffectFact(
+            item.run_id,
+            item.tool_id,
+            item.contract_version,
+            item.idempotency_key_digest,
+            item.request_digest,
+            item.effect_id,
+            item.effect_kind,
+            item.subject_type,
+            item.subject_id,
+            item.logical_call_id,
+            item.first_attempt_id,
+            cast(dict[str, object], dict(item.result)),
+        )
+        for item in repository.list_company_effects(run.run_id)
+    )
+    approvals = tuple(
+        ApprovalFact(
+            item.approval_id,
+            item.run_id,
+            item.scenario.id,
+            item.scenario.revision,
+            item.scenario.digest,
+            item.policy.id,
+            item.policy.revision,
+            item.policy.digest,
+            item.tool_id,
+            item.contract_version,
+            item.request_digest,
+            item.idempotency_key_digest,
+            item.logical_call_id,
+            item.requested_attempt_id,
+            item.decision_id,
+            item.decision_event_id,
+            item.request_event_id,
+            item.status,
+            item.resolution_event_id,
+        )
+        for item in repository.list_approval_requests(run.run_id)
+    )
+    return EvaluationInput(
+        run_id=run.run_id,
+        scenario=scenario_record.scenario,
+        ground_truths=ground_truths,
+        evidence_through_sequence=boundary,
+        events=tuple(record.event.to_dict() for record in records),
+        initial_state=_initial_state_document(fixture_record.fixture.to_dict()),
+        final_state=_state_document(state),
+        effects=effects,
+        execution=_execution_document(checkpoint),
+        run_seed=run.fault_seed,
+        approvals=approvals,
+    )
+
+
+def load_authoritative_evaluation_snapshot(
+    repository: PersistenceRepository,
+    run_id: str,
+    ground_truths: tuple[GroundTruth, ...],
+) -> AuthoritativeEvaluationSnapshot:
+    """Reconstruct and authenticate a terminal Issue #16 result from PostgreSQL."""
+    run = repository.get_run(run_id)
+    if run is None:
+        raise PersistenceIntegrityError("Campaign Run does not exist")
+    if run.status != "completed":
+        raise PersistenceIntegrityError("Campaign Run is not evaluation-complete")
+    records = repository.fetch_events(run_id)
+    if len(records) < 3:
+        raise PersistenceIntegrityError("Campaign Run lacks evaluator provenance")
+    started, recorded, completed = (item.event.to_dict() for item in records[-3:])
+    if [started["event_type"], recorded["event_type"], completed["event_type"]] != [
+        "evaluation.started",
+        "evaluation.result_recorded",
+        "run.lifecycle",
+    ]:
+        raise PersistenceIntegrityError("Campaign Run evaluator provenance is incomplete")
+    if (
+        recorded["causation_event_id"] != started["event_id"]
+        or completed["causation_event_id"] != recorded["event_id"]
+    ):
+        raise PersistenceIntegrityError("Campaign Run evaluator causation is inconsistent")
+    started_payload = cast(dict[str, object], started["payload"])
+    recorded_payload = cast(dict[str, object], recorded["payload"])
+    completed_payload = cast(dict[str, object], completed["payload"])
+    boundary = cast(int, recorded_payload["evidence_through_sequence"])
+    if (
+        started_payload.get("evaluation_id") != recorded_payload.get("evaluation_id")
+        or started_payload.get("evaluator") != recorded_payload.get("evaluator")
+        or started_payload.get("evidence_through_sequence") != boundary
+        or recorded_payload.get("evaluator") != EVALUATOR_REVISION
+        or cast(int, started["sequence"]) != boundary + 1
+        or completed_payload.get("state") != "completed"
+        or completed_payload.get("previous_state") != "evaluating"
+        or completed_payload.get("reason_code") != "evaluation_finished"
+    ):
+        raise PersistenceIntegrityError("Campaign Run evaluator identity is inconsistent")
+    evaluation_input = _build_evaluation_input(repository, run, ground_truths, boundary)
+    result = evaluate_critical_gates(evaluation_input)
+    document = result.to_dict()
+    classification = cast(str, document["classification"])
+    if (
+        document["evaluation_id"] != recorded_payload["evaluation_id"]
+        or document["evaluator"] != recorded_payload["evaluator"]
+        or document["evidence_through_sequence"] != boundary
+        or recorded_payload["outcome"] != ("error" if classification == "invalid" else "completed")
+        or (
+            classification == "invalid"
+            and recorded_payload.get("error_code") != document.get("error_code")
+        )
+    ):
+        raise PersistenceIntegrityError("Campaign Run evaluation does not match recorded evidence")
+    return AuthoritativeEvaluationSnapshot(run, evaluation_input, result)
+
+
 def _event(
     repository: PersistenceRepository,
     run_id: str,
@@ -228,86 +386,7 @@ def evaluate_leased_run(
         raise PersistenceIntegrityError("evaluation Run has no evidence boundary")
     prior_event_id, boundary = latest
     try:
-        scenario_record = repository.get_scenario_revision(run.scenario.id, run.scenario.revision)
-        if scenario_record is None or scenario_record.scenario.digest != run.scenario.digest:
-            raise PersistenceIntegrityError("Run Scenario binding does not resolve")
-        scenario_document = scenario_record.scenario.to_dict()
-        policy_reference = cast(dict[str, object], scenario_document["policy"])
-        policy_record = repository.get_policy_revision(
-            cast(str, policy_reference["id"]), cast(str, policy_reference["revision"])
-        )
-        if policy_record is None or policy_record.policy.digest != policy_reference["digest"]:
-            raise PersistenceIntegrityError("Run Policy binding does not resolve")
-        if run.fixture is None:
-            raise PersistenceIntegrityError("Run Fixture binding is absent")
-        fixture_record = repository.get_fixture_revision(run.fixture.id, run.fixture.revision)
-        if fixture_record is None or fixture_record.fixture.digest != run.fixture.digest:
-            raise PersistenceIntegrityError("Run Fixture binding does not resolve")
-        state = repository.get_run_company_state(run.run_id)
-        checkpoint_record = repository.get_execution_checkpoint(run.run_id)
-        records = repository.fetch_events(run.run_id)
-        if state is None or checkpoint_record is None or not records:
-            raise PersistenceIntegrityError("evaluation inputs are incomplete")
-        checkpoint = validate_final_execution_snapshot(
-            checkpoint_record,
-            run,
-            scenario_record.scenario.to_dict(),
-            records,
-        )
-        effects = tuple(
-            EffectFact(
-                item.run_id,
-                item.tool_id,
-                item.contract_version,
-                item.idempotency_key_digest,
-                item.request_digest,
-                item.effect_id,
-                item.effect_kind,
-                item.subject_type,
-                item.subject_id,
-                item.logical_call_id,
-                item.first_attempt_id,
-                cast(dict[str, object], dict(item.result)),
-            )
-            for item in repository.list_company_effects(run.run_id)
-        )
-        approvals = tuple(
-            ApprovalFact(
-                item.approval_id,
-                item.run_id,
-                item.scenario.id,
-                item.scenario.revision,
-                item.scenario.digest,
-                item.policy.id,
-                item.policy.revision,
-                item.policy.digest,
-                item.tool_id,
-                item.contract_version,
-                item.request_digest,
-                item.idempotency_key_digest,
-                item.logical_call_id,
-                item.requested_attempt_id,
-                item.decision_id,
-                item.decision_event_id,
-                item.request_event_id,
-                item.status,
-                item.resolution_event_id,
-            )
-            for item in repository.list_approval_requests(run.run_id)
-        )
-        evaluation_input = EvaluationInput(
-            run_id=run.run_id,
-            scenario=scenario_record.scenario,
-            ground_truths=ground_truths,
-            evidence_through_sequence=boundary,
-            events=tuple(record.event.to_dict() for record in records),
-            initial_state=_initial_state_document(fixture_record.fixture.to_dict()),
-            final_state=_state_document(state),
-            effects=effects,
-            execution=_execution_document(checkpoint),
-            run_seed=run.fault_seed,
-            approvals=approvals,
-        )
+        evaluation_input = _build_evaluation_input(repository, run, ground_truths, boundary)
         result = evaluate_critical_gates(evaluation_input)
     except (
         AgentOutputValidationError,

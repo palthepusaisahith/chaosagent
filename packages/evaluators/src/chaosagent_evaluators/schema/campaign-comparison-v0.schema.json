@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/campaign-comparison/v0/schema.json",
+  "title": "ChaosAgent Paired Campaign Comparison v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "comparison_id",
+    "baseline",
+    "faulted",
+    "paired",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.campaign-comparison/v0" },
+    "comparison_id": { "$ref": "#/$defs/id" },
+    "baseline": {
+      "$ref": "https://schemas.chaosagent.dev/campaign-statistics/v0/schema.json"
+    },
+    "faulted": {
+      "$ref": "https://schemas.chaosagent.dev/campaign-statistics/v0/schema.json"
+    },
+    "paired": { "$ref": "#/$defs/paired" },
+    "warnings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/warning" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "indexArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/count" }
+    },
+    "signedRate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "numerator", "denominator", "estimate"],
+          "properties": {
+            "status": { "const": "available" },
+            "numerator": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "denominator": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "estimate": {
+              "type": "string",
+              "pattern": "^-?(?:0|1)\\.[0-9]{12}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": { "const": "unavailable" },
+            "reason": { "const": "zero_denominator" }
+          }
+        }
+      ]
+    },
+    "observedPairs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n", "improved", "regressed", "pass_delta"],
+      "properties": {
+        "n": { "$ref": "#/$defs/count" },
+        "improved": { "$ref": "#/$defs/count" },
+        "regressed": { "$ref": "#/$defs/count" },
+        "pass_delta": { "$ref": "#/$defs/signedRate" }
+      }
+    },
+    "paired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "common_pairs",
+        "valid_pairs",
+        "invalid_pairs",
+        "improved",
+        "regressed",
+        "unchanged",
+        "missing_baseline_trial_indexes",
+        "missing_faulted_trial_indexes",
+        "fault_minus_baseline_pass_delta",
+        "observed_fault_pairs",
+        "warnings"
+      ],
+      "properties": {
+        "common_pairs": { "$ref": "#/$defs/count" },
+        "valid_pairs": { "$ref": "#/$defs/count" },
+        "invalid_pairs": { "$ref": "#/$defs/count" },
+        "improved": { "$ref": "#/$defs/count" },
+        "regressed": { "$ref": "#/$defs/count" },
+        "unchanged": { "$ref": "#/$defs/count" },
+        "missing_baseline_trial_indexes": { "$ref": "#/$defs/indexArray" },
+        "missing_faulted_trial_indexes": { "$ref": "#/$defs/indexArray" },
+        "fault_minus_baseline_pass_delta": { "$ref": "#/$defs/signedRate" },
+        "observed_fault_pairs": { "$ref": "#/$defs/observedPairs" },
+        "warnings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "invalid_pairs_excluded",
+              "missing_pairs",
+              "observed_fault_pair_set_empty",
+              "small_paired_sample"
+            ]
+          }
+        }
+      }
+    },
+    "warning": {
+      "enum": [
+        "incomplete_pass_power_group",
+        "insufficient_pass_at_k_samples",
+        "invalid_evaluations_present",
+        "invalid_pairs_excluded",
+        "invalid_pass_power_groups",
+        "missing_pass_power_groups",
+        "missing_planned_trials",
+        "missing_pairs",
+        "no_valid_evaluations",
+        "observed_fault_condition_empty",
+        "observed_fault_pair_set_empty",
+        "small_paired_sample",
+        "small_sample",
+        "unobserved_fault_trials"
+      ]
+    }
+  }
+}

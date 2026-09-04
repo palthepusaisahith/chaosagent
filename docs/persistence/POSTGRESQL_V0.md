@@ -47,10 +47,14 @@ The tables have deliberately different responsibilities:
 - `company_effects` stores the immutable Issue #9 idempotency/effect ledger for
   the two synthetic mutation tools. Its full identity, locking, evidence, and
   exactly-once scope are documented in the mutation-tool contract.
+- `campaign_plans` and `campaign_trial_memberships` store only Issue #17's
+  immutable pre-execution Campaign arm, planned index space, selected compiled
+  fault plan, and Run assignments. Run rows are locked while still queued;
+  primary/unique constraints prevent cross-process Run or index substitution.
 
-Campaigns remain outside this package. Scenario v0's trial intent does not
-become campaign persistence here, preserving the boundary established in Issue
-#3.
+Campaign orchestration, scheduling, APIs, and mutable Campaign state remain
+outside this package. The narrow membership authority does not absorb those
+later control-plane responsibilities.
 
 ## Relational columns and JSONB documents
 
@@ -195,12 +199,12 @@ cross-platform libpq runtime instead of requiring a machine-level client
 installation. The standard library and prior JSON-contract dependencies provide
 none of those capabilities, so all three are necessary runtime dependencies.
 
-## Deferred beyond Issue #12
+## Deferred beyond Issue #17
 
 - worker processes/daemons, heartbeats, and automatic recovery scheduling;
 - external side-effect fencing or reconciliation beyond the committed local
   synthetic effect ledger;
-- Campaign persistence and campaign statistics;
+- Campaign orchestration, scheduling, and API-managed Campaign creation;
 - authentication/RBAC, approval UI/notifications, expiry workflows, fault
   activations, evaluators, SSE, telemetry, exports, and deployment role
   creation;
@@ -223,3 +227,11 @@ database permits only `NULL → value` and rejects every subsequent change. No
 seed is fabricated for older Runs. Downgrade removes the column and trigger, so
 an old faulted Run without another trustworthy source cannot later be evaluated
 as though its activation were authenticated.
+
+Migration `0010_campaign_memberships` adds the two immutable Campaign authority
+tables and a bind-once `runs.fault_plan_digest`. Planning locks Run rows in
+stable order and inserts the complete plan and assignments in the caller-owned
+transaction. Rollback leaves no authority. Runtime and Gateway entry points bind
+the compiled plan used for execution; evaluator reconstruction requires it to
+match the committed Campaign assignment. Downgrade removes only this narrow
+Issue #17 state and does not fabricate assignments for existing Runs.

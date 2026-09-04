@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/campaign-statistics/v0/schema.json",
+  "title": "ChaosAgent Campaign Statistics v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "statistics_id",
+    "campaign_id",
+    "arm",
+    "scenario",
+    "agent_configuration",
+    "available_fault_ids",
+    "selected_fault_ids",
+    "planned_trials",
+    "runs",
+    "counts",
+    "pass_rate",
+    "reliability",
+    "observed_fault_condition",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.campaign-statistics/v0" },
+    "statistics_id": { "$ref": "#/$defs/id" },
+    "campaign_id": { "$ref": "#/$defs/id" },
+    "arm": { "enum": ["baseline", "faulted"] },
+    "scenario": { "$ref": "#/$defs/revisionRef" },
+    "agent_configuration": { "$ref": "#/$defs/revisionRef" },
+    "available_fault_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/catalogId" }
+    },
+    "selected_fault_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/catalogId" }
+    },
+    "planned_trials": { "$ref": "#/$defs/count" },
+    "runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "counts": { "$ref": "#/$defs/counts" },
+    "pass_rate": { "$ref": "#/$defs/binomialRate" },
+    "reliability": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/reliability" }
+    },
+    "observed_fault_condition": { "$ref": "#/$defs/observed" },
+    "warnings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/warning" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "catalogId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "decimal": { "type": "string", "pattern": "^-?(?:0|1)\\.[0-9]{12}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "revisionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/catalogId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "trial_index",
+        "evaluation_digest",
+        "evaluation_id",
+        "evaluation_input_digest",
+        "evidence_through_sequence",
+        "classification",
+        "observed_fault_ids"
+      ],
+      "properties": {
+        "run_id": { "$ref": "#/$defs/id" },
+        "trial_index": { "$ref": "#/$defs/count" },
+        "evaluation_digest": { "$ref": "#/$defs/digest" },
+        "evaluation_id": { "$ref": "#/$defs/id" },
+        "evaluation_input_digest": { "$ref": "#/$defs/digest" },
+        "evidence_through_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "classification": { "enum": ["pass", "fail", "invalid"] },
+        "observed_fault_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/catalogId" }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_runs", "valid_evaluated", "pass", "fail", "invalid"],
+      "properties": {
+        "total_runs": { "$ref": "#/$defs/count" },
+        "valid_evaluated": { "$ref": "#/$defs/count" },
+        "pass": { "$ref": "#/$defs/count" },
+        "fail": { "$ref": "#/$defs/count" },
+        "invalid": { "$ref": "#/$defs/count" }
+      }
+    },
+    "availableRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "n", "successes", "estimate", "wilson_95"],
+      "properties": {
+        "status": { "const": "available" },
+        "n": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "successes": { "$ref": "#/$defs/count" },
+        "estimate": { "$ref": "#/$defs/decimal" },
+        "wilson_95": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lower", "upper"],
+          "properties": {
+            "lower": { "$ref": "#/$defs/decimal" },
+            "upper": { "$ref": "#/$defs/decimal" }
+          }
+        }
+      }
+    },
+    "unavailableRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "n", "successes", "reason"],
+      "properties": {
+        "status": { "const": "unavailable" },
+        "n": { "const": 0 },
+        "successes": { "const": 0 },
+        "reason": { "const": "zero_denominator" }
+      }
+    },
+    "binomialRate": {
+      "oneOf": [
+        { "$ref": "#/$defs/availableRate" },
+        { "$ref": "#/$defs/unavailableRate" }
+      ]
+    },
+    "passAt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "n", "successes", "estimate"],
+          "properties": {
+            "status": { "const": "available" },
+            "n": { "$ref": "#/$defs/count" },
+            "successes": { "$ref": "#/$defs/count" },
+            "estimate": { "$ref": "#/$defs/decimal" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "n", "successes", "reason"],
+          "properties": {
+            "status": { "const": "insufficient_samples" },
+            "n": { "$ref": "#/$defs/count" },
+            "successes": { "$ref": "#/$defs/count" },
+            "reason": { "const": "k_exceeds_valid_sample" }
+          }
+        }
+      ]
+    },
+    "passPower": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "method",
+            "complete_groups",
+            "valid_groups",
+            "successful_groups",
+            "invalid_groups",
+            "missing_groups",
+            "discarded_runs",
+            "estimate",
+            "wilson_95"
+          ],
+          "properties": {
+            "status": { "const": "available" },
+            "method": { "const": "predetermined_groups" },
+            "complete_groups": { "$ref": "#/$defs/count" },
+            "valid_groups": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "successful_groups": { "$ref": "#/$defs/count" },
+            "invalid_groups": { "$ref": "#/$defs/count" },
+            "missing_groups": { "$ref": "#/$defs/count" },
+            "discarded_runs": { "$ref": "#/$defs/count" },
+            "estimate": { "$ref": "#/$defs/decimal" },
+            "wilson_95": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lower", "upper"],
+              "properties": {
+                "lower": { "$ref": "#/$defs/decimal" },
+                "upper": { "$ref": "#/$defs/decimal" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "method",
+            "complete_groups",
+            "valid_groups",
+            "successful_groups",
+            "invalid_groups",
+            "missing_groups",
+            "discarded_runs",
+            "reason"
+          ],
+          "properties": {
+            "status": { "const": "unavailable" },
+            "method": { "const": "predetermined_groups" },
+            "complete_groups": { "$ref": "#/$defs/count" },
+            "valid_groups": { "const": 0 },
+            "successful_groups": { "const": 0 },
+            "invalid_groups": { "$ref": "#/$defs/count" },
+            "missing_groups": { "$ref": "#/$defs/count" },
+            "discarded_runs": { "$ref": "#/$defs/count" },
+            "reason": { "const": "zero_valid_groups" }
+          }
+        }
+      ]
+    },
+    "reliability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["k", "pass_at_k", "pass_power_k"],
+      "properties": {
+        "k": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "pass_at_k": { "$ref": "#/$defs/passAt" },
+        "pass_power_k": { "$ref": "#/$defs/passPower" }
+      }
+    },
+    "observed": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "required_fault_ids"],
+          "properties": {
+            "status": { "const": "not_applicable" },
+            "required_fault_ids": { "maxItems": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "required_fault_ids",
+            "unobserved_runs",
+            "counts",
+            "pass_rate",
+            "reliability"
+          ],
+          "properties": {
+            "status": { "enum": ["available", "empty"] },
+            "required_fault_ids": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/catalogId" }
+            },
+            "unobserved_runs": { "$ref": "#/$defs/count" },
+            "counts": { "$ref": "#/$defs/counts" },
+            "pass_rate": { "$ref": "#/$defs/binomialRate" },
+            "reliability": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1000,
+              "items": { "$ref": "#/$defs/reliability" }
+            }
+          }
+        }
+      ]
+    },
+    "warning": {
+      "enum": [
+        "incomplete_pass_power_group",
+        "insufficient_pass_at_k_samples",
+        "invalid_evaluations_present",
+        "invalid_pass_power_groups",
+        "missing_pass_power_groups",
+        "missing_planned_trials",
+        "no_valid_evaluations",
+        "observed_fault_condition_empty",
+        "small_sample",
+        "unobserved_fault_trials"
+      ]
+    }
+  }
+}

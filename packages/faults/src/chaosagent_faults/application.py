@@ -114,6 +114,16 @@ class FaultEngine:
         return self._run_seed
 
     @property
+    def plan_digest(self) -> str:
+        """Return the authenticated compiled-plan identity used for execution."""
+        return self._plan.digest
+
+    @property
+    def selected_fault_ids(self) -> tuple[str, ...]:
+        """Return the exact ordered Scenario fault assignment in this engine."""
+        return self._plan.selected_fault_ids
+
+    @property
     def rules(self) -> tuple[CompiledFaultRule, ...]:
         """Return the validated immutable rules used to authenticate history."""
         # Selection validates the plan as well, but history must fail closed before

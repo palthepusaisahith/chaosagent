@@ -110,6 +110,18 @@ class CompiledFaultPlan:
     def __init__(self) -> None:
         raise TypeError("CompiledFaultPlan instances must be created by compile_fault_plan_v0")
 
+    @property
+    def digest(self) -> str:
+        """Return the deterministic identity of this validated compiled plan."""
+        _validate_plan(self)
+        return self._integrity_digest
+
+    @property
+    def selected_fault_ids(self) -> tuple[str, ...]:
+        """Return the exact ordered fault assignment represented by this plan."""
+        _validate_plan(self)
+        return tuple(rule.fault_id for rule in self.rules)
+
 
 @dataclass(frozen=True, slots=True)
 class FaultMatchContext:
