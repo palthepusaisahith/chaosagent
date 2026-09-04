@@ -213,7 +213,7 @@ def test_campaign_membership_is_durable_immutable_and_rollback_safe(
                 {"campaign_id": campaign_id},
             )
     with migrated_engine.connect() as connection:
-        transaction = connection.begin()
+        connection_transaction = connection.begin()
         try:
             connection.execute(
                 text(
@@ -238,14 +238,14 @@ def test_campaign_membership_is_durable_immutable_and_rollback_safe(
                 with pytest.raises(PersistenceIntegrityError, match="membership digest"):
                     PersistenceRepository(session).get_campaign_plan(campaign_id)
         finally:
-            transaction.rollback()
+            connection_transaction.rollback()
 
     rolled_back_run = _unique("campaign-rollback-run")
     rolled_back_campaign = _unique("campaign-rollback")
     with Session(migrated_engine) as session, session.begin():
         _seed_isolated_run(session, rolled_back_run)
     with Session(migrated_engine) as session:
-        transaction = session.begin()
+        session_transaction = session.begin()
         rolled_back_wrapper = authenticated_campaign_plan(
             PersistenceRepository(session),
             campaign_id=rolled_back_campaign,
@@ -253,7 +253,7 @@ def test_campaign_membership_is_durable_immutable_and_rollback_safe(
             selected_fault_ids=(),
             assignments={0: rolled_back_run},
         )
-        transaction.rollback()
+        session_transaction.rollback()
     with Session(migrated_engine) as session, session.begin():
         repository = PersistenceRepository(session)
         assert repository.get_campaign_plan(rolled_back_campaign) is None
