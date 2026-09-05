@@ -1,0 +1,355 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.chaosagent.dev/export-manifest/v0/schema.json",
+  "title": "ChaosAgent Export Manifest v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bundle_format_version",
+    "export_kind",
+    "export_id",
+    "manifest_digest",
+    "exported_at",
+    "redaction",
+    "runs",
+    "files"
+  ],
+  "properties": {
+    "schema_version": { "const": "chaosagent.export-manifest/v0" },
+    "bundle_format_version": { "const": "chaosagent.export-bundle/v0" },
+    "export_kind": { "enum": ["run", "campaign"] },
+    "export_id": { "type": "string", "pattern": "^export-[0-9a-f]{32}$" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "exported_at": { "$ref": "#/$defs/timestamp" },
+    "application": { "$ref": "#/$defs/application" },
+    "redaction": { "$ref": "#/$defs/redaction" },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "campaign": { "$ref": "#/$defs/campaign" },
+    "files": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 50000,
+      "items": { "$ref": "#/$defs/file" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "export_kind": { "const": "campaign" } } },
+      "then": { "required": ["campaign"] },
+      "else": {
+        "not": { "required": ["campaign"] },
+        "properties": { "runs": { "maxItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "catalogId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "revisionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "digest"],
+      "properties": {
+        "id": { "$ref": "#/$defs/catalogId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "repository_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "repository_dirty": { "type": "boolean" }
+      }
+    },
+    "redactionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "json_pointer", "replacement"],
+      "properties": {
+        "role": { "$ref": "#/$defs/role" },
+        "json_pointer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^/"
+        },
+        "replacement": { "const": "[REDACTED]" }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rules"],
+      "properties": {
+        "status": { "enum": ["unredacted", "redacted"] },
+        "rules": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/redactionRule" }
+        }
+      }
+    },
+    "faultPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["available", "unavailable"] },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "available" } } },
+          "then": { "required": ["digest"] },
+          "else": { "not": { "required": ["digest"] } }
+        }
+      ]
+    },
+    "evaluationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_id",
+        "digest",
+        "path",
+        "ground_truths_path",
+        "ground_truth_digests"
+      ],
+      "properties": {
+        "evaluation_id": { "$ref": "#/$defs/id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "path": { "$ref": "#/$defs/path" },
+        "ground_truths_path": { "$ref": "#/$defs/path" },
+        "ground_truth_digests": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/digest" }
+        }
+      }
+    },
+    "providerModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "requested_model"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "requested_model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "resolved_model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "provider_request_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "status",
+        "scenario",
+        "agent_configuration",
+        "agent_configuration_content",
+        "fault_seed",
+        "selected_fault_ids",
+        "fault_plan",
+        "provider_models",
+        "events_path",
+        "evaluations",
+        "report"
+      ],
+      "properties": {
+        "run_id": { "$ref": "#/$defs/id" },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "infra_error"
+          ]
+        },
+        "scenario": { "$ref": "#/$defs/revisionRef" },
+        "agent_configuration": { "$ref": "#/$defs/revisionRef" },
+        "agent_configuration_content": { "enum": ["available", "unavailable"] },
+        "fault_seed": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "selected_fault_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/catalogId" }
+        },
+        "fault_plan": { "$ref": "#/$defs/faultPlan" },
+        "provider_models": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/providerModel" }
+        },
+        "events_path": { "$ref": "#/$defs/path" },
+        "evaluations": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/evaluationRef" }
+        },
+        "report": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["available", "unavailable"] },
+            "report_id": { "$ref": "#/$defs/id" },
+            "path": { "$ref": "#/$defs/path" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "status": { "const": "available" } } },
+              "then": { "required": ["report_id", "path"] },
+              "else": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["report_id"] },
+                    { "required": ["path"] }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "campaign_id",
+        "plan_digest",
+        "plan_path",
+        "statistics",
+        "comparison"
+      ],
+      "properties": {
+        "campaign_id": { "$ref": "#/$defs/id" },
+        "plan_digest": { "$ref": "#/$defs/digest" },
+        "plan_path": { "$ref": "#/$defs/path" },
+        "statistics": { "$ref": "#/$defs/artifactStatus" },
+        "comparison": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "unavailable" } }
+        }
+      }
+    },
+    "artifactStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["available", "unavailable"] },
+        "digest": { "$ref": "#/$defs/digest" },
+        "path": { "$ref": "#/$defs/path" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "available" } } },
+          "then": { "required": ["digest", "path"] },
+          "else": {
+            "not": {
+              "anyOf": [{ "required": ["digest"] }, { "required": ["path"] }]
+            }
+          }
+        }
+      ]
+    },
+    "role": {
+      "enum": [
+        "scenario",
+        "agent_configuration",
+        "run_events",
+        "run_report",
+        "evaluation_results",
+        "ground_truths",
+        "campaign_plan",
+        "campaign_statistics"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?![A-Za-z]:)(?!\\\\)[A-Za-z0-9._:-]+(?:/[A-Za-z0-9._:-]+)*$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "role",
+        "media_type",
+        "byte_length",
+        "sha256",
+        "canonical",
+        "redacted",
+        "source_classification"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "role": { "$ref": "#/$defs/role" },
+        "media_type": { "enum": ["application/json", "application/x-ndjson"] },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 134217728
+        },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "canonical": { "type": "boolean" },
+        "redacted": { "type": "boolean" },
+        "source_classification": {
+          "enum": ["authoritative", "derived", "metadata"]
+        },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier, Event, get_ident
 from typing import Literal, cast
@@ -37,7 +39,15 @@ from chaosagent_evaluators import (
     execute_evaluation,
     load_ground_truth_v0,
 )
-from chaosagent_evidence import EvidenceValidationError, digest_payload_v0
+from chaosagent_evidence import EvidenceValidationError, digest_payload_v0, loads_run_event
+from chaosagent_exports import (
+    RedactionRule,
+    checksum_index,
+    export_campaign_bundle,
+    export_manifest_v0,
+    export_run_bundle,
+    validate_export_bundle,
+)
 from chaosagent_faults import FaultEngine, compile_fault_plan_v0
 from chaosagent_fixtures import load_fixture
 from chaosagent_persistence import (
@@ -51,6 +61,7 @@ from chaosagent_persistence import (
     RevisionReference,
     RunRecord,
     RunStatus,
+    ScenarioRevisionRecord,
     StaleLeaseError,
     create_postgres_engine,
 )
@@ -83,6 +94,23 @@ EVALUATED_SCENARIO_PATH = (
 )
 ALEMBIC_INI = ROOT / "packages/persistence/alembic.ini"
 AGENT = RevisionReference("scripted-agent", "1", "sha256:" + "d" * 64)
+
+
+def _reseal_export_payload(
+    files: dict[str, bytes], path: str, replacement: bytes
+) -> dict[str, bytes]:
+    files[path] = replacement
+    manifest = cast(dict[str, object], json.loads(files["manifest.json"]))
+    entries = cast(list[dict[str, object]], manifest["files"])
+    entry = next(item for item in entries if item["path"] == path)
+    entry["byte_length"] = len(replacement)
+    entry["sha256"] = "sha256:" + hashlib.sha256(replacement).hexdigest()
+    rebuilt = export_manifest_v0(manifest)
+    files["manifest.json"] = rebuilt.canonical_bytes
+    files["checksums.sha256"] = checksum_index(
+        {name: data for name, data in files.items() if name != "checksums.sha256"}
+    )
+    return files
 
 
 @pytest.fixture(scope="session")
@@ -802,6 +830,264 @@ def test_issue16_evaluates_ambiguous_refund_and_completes_atomically(
     evaluation_result = cast(dict[str, object], events[-2]["payload"])
     assert evaluation_result["outcome"] == "completed"
     assert events[-1]["causation_event_id"] == events[-2]["event_id"]
+
+
+def test_issue18_exports_completed_run_from_repeatable_read_snapshot(
+    runtime_engine: Engine,
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    truth = load_ground_truth_v0(GROUND_TRUTH_PATH)
+    outcome = execute_evaluation(runtime_engine, claimed.lease, (truth,))
+    assert outcome.status == "completed"
+    exported_at = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    first = export_run_bundle(
+        runtime_engine,
+        claimed.run.run_id,
+        ground_truths=(truth,),
+        exported_at=exported_at,
+    )
+    second = export_run_bundle(
+        runtime_engine,
+        claimed.run.run_id,
+        ground_truths=(truth,),
+        exported_at=exported_at,
+    )
+    assert first.files() == second.files()
+    assert validate_export_bundle(first).valid
+    redacted = export_run_bundle(
+        runtime_engine,
+        claimed.run.run_id,
+        ground_truths=(truth,),
+        redaction_rules=(RedactionRule("scenario", "/metadata/description"),),
+        exported_at=exported_at,
+    )
+    assert validate_export_bundle(redacted).valid
+    assert b"[REDACTED]" in redacted.files()["provenance/scenario.json"]
+    assert b"Executable revision" not in redacted.files()["provenance/scenario.json"]
+    redaction = cast(dict[str, object], redacted.manifest.to_dict()["redaction"])
+    assert redaction["status"] == "redacted"
+    scenario_entry = next(
+        item
+        for item in cast(list[dict[str, object]], redacted.manifest.to_dict()["files"])
+        if item["role"] == "scenario"
+    )
+    assert scenario_entry["media_type"] == "application/json"
+    assert scenario_entry["canonical"] is True
+    assert scenario_entry["source_classification"] == "derived"
+    assert (
+        export_run_bundle(
+            runtime_engine,
+            claimed.run.run_id,
+            ground_truths=(truth,),
+            exported_at=exported_at,
+        ).files()
+        == first.files()
+    )
+    for pointer in (
+        "/agent/instructions/-1",
+        "/agent/instructions/+1",
+        "/agent/instructions/01",
+        "/agent/instructions/99",
+        "/metadata/description~2",
+        "/metadata/description~",
+    ):
+        with pytest.raises(ValueError, match="redaction JSON Pointer"):
+            export_run_bundle(
+                runtime_engine,
+                claimed.run.run_id,
+                ground_truths=(truth,),
+                redaction_rules=(RedactionRule("scenario", pointer),),
+                exported_at=exported_at,
+            )
+    indexed = export_run_bundle(
+        runtime_engine,
+        claimed.run.run_id,
+        ground_truths=(truth,),
+        redaction_rules=(
+            RedactionRule("scenario", "/agent/instructions/0"),
+            RedactionRule("scenario", "/agent/instructions/1"),
+        ),
+        exported_at=exported_at,
+    )
+    assert validate_export_bundle(indexed).valid
+    indexed_scenario = cast(
+        dict[str, object], json.loads(indexed.files()["provenance/scenario.json"])
+    )
+    assert cast(dict[str, object], indexed_scenario["agent"])["instructions"] == [
+        "[REDACTED]",
+        "[REDACTED]",
+        "Create at most one refund and update the ticket with claims supported by tool results.",
+    ]
+
+    roles = {
+        cast(str, item["role"]): cast(str, item["path"])
+        for item in cast(list[dict[str, object]], first.manifest.to_dict()["files"])
+    }
+    for role in (
+        "scenario",
+        "run_events",
+        "evaluation_results",
+    ):
+        tampered = first.files()
+        tampered[roles[role]] += b" "
+        assert not validate_export_bundle(tampered).valid
+    assert "agent_configuration" not in roles and "run_report" not in roles
+    first_run = cast(list[dict[str, object]], first.manifest.to_dict()["runs"])[0]
+    assert first_run["agent_configuration_content"] == "unavailable"
+    assert cast(dict[str, object], first_run["report"])["status"] == "unavailable"
+
+    second_claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    second_outcome = execute_evaluation(runtime_engine, second_claimed.lease, (truth,))
+    assert second_outcome.status == "completed"
+    second = export_run_bundle(
+        runtime_engine,
+        second_claimed.run.run_id,
+        ground_truths=(truth,),
+        exported_at=exported_at,
+    )
+    second_event_path = cast(
+        str, cast(list[dict[str, object]], second.manifest.to_dict()["runs"])[0]["events_path"]
+    )
+    substituted = _reseal_export_payload(
+        first.files(), roles["run_events"], second.files()[second_event_path]
+    )
+    assert not validate_export_bundle(substituted).valid
+
+
+def test_issue18_exports_authoritative_campaign_and_rejects_nonterminal_run(
+    runtime_engine: Engine,
+) -> None:
+    campaign_id = f"campaign-export-{uuid4().hex}"
+
+    def bind_plan(repository: PersistenceRepository, run_id: str) -> None:
+        authenticated_campaign_plan(
+            repository,
+            campaign_id=campaign_id,
+            arm="faulted",
+            selected_fault_ids=("refund-ack-lost",),
+            assignments={0: run_id},
+        )
+
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine, before_claim=bind_plan)
+    truth = load_ground_truth_v0(GROUND_TRUTH_PATH)
+    outcome = execute_evaluation(runtime_engine, claimed.lease, (truth,))
+    assert outcome.status == "completed"
+    bundle = export_campaign_bundle(
+        runtime_engine,
+        campaign_id,
+        ground_truths=(truth,),
+        exported_at=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+    )
+    assert validate_export_bundle(bundle).valid
+    campaign_manifest = cast(dict[str, object], bundle.manifest.to_dict()["campaign"])
+    assert campaign_manifest["comparison"] == {"status": "unavailable"}
+    assert all(
+        item["role"] != "campaign_comparison"
+        for item in cast(list[dict[str, object]], bundle.manifest.to_dict()["files"])
+    )
+    with pytest.raises(ValueError, match="require unredacted Scenario"):
+        export_campaign_bundle(
+            runtime_engine,
+            campaign_id,
+            ground_truths=(truth,),
+            redaction_rules=(RedactionRule("scenario", "/metadata/description"),),
+        )
+
+    run_manifest = cast(list[dict[str, object]], bundle.manifest.to_dict()["runs"])[0]
+    events_path = cast(str, run_manifest["events_path"])
+    event_documents = [json.loads(line) for line in bundle.files()[events_path].splitlines()]
+    orphan = copy.deepcopy(
+        next(item for item in event_documents if item["event_type"] == "fault.observed")
+    )
+    orphan["event_id"] = _unique("orphan-fault-observed")
+    orphan["sequence"] = cast(int, event_documents[-1]["sequence"]) + 1
+    orphan_payload = cast(dict[str, object], orphan["payload"])
+    orphan_payload["activation_id"] = _unique("orphan-activation")
+    orphan["payload_digest"] = digest_payload_v0(orphan_payload)
+    orphan_bytes = loads_run_event(json.dumps(orphan, separators=(",", ":"))).canonical_bytes
+    corrupted_history = _reseal_export_payload(
+        bundle.files(), events_path, bundle.files()[events_path] + orphan_bytes + b"\n"
+    )
+    result = validate_export_bundle(corrupted_history)
+    assert not result.valid
+    assert "fault evidence is not authoritative" in result.errors[0]
+
+    second_campaign_id = f"campaign-export-{uuid4().hex}"
+
+    def bind_second_plan(repository: PersistenceRepository, run_id: str) -> None:
+        authenticated_campaign_plan(
+            repository,
+            campaign_id=second_campaign_id,
+            arm="faulted",
+            selected_fault_ids=("refund-ack-lost",),
+            assignments={0: run_id},
+        )
+
+    second_claimed = _evaluation_ready_ambiguity_run(runtime_engine, before_claim=bind_second_plan)
+    second_outcome = execute_evaluation(runtime_engine, second_claimed.lease, (truth,))
+    assert second_outcome.status == "completed"
+    second_bundle = export_campaign_bundle(
+        runtime_engine,
+        second_campaign_id,
+        ground_truths=(truth,),
+        exported_at=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+    )
+    substituted = _reseal_export_payload(
+        bundle.files(),
+        "campaign/statistics.json",
+        second_bundle.files()["campaign/statistics.json"],
+    )
+    assert not validate_export_bundle(substituted).valid
+
+    queued = _create_run(runtime_engine)
+    with pytest.raises(ValueError, match="terminal Run"):
+        export_run_bundle(runtime_engine, queued.run.run_id)
+
+
+def test_issue18_export_uses_one_repeatable_read_snapshot(
+    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+    truth = load_ground_truth_v0(GROUND_TRUTH_PATH)
+    assert execute_evaluation(runtime_engine, claimed.lease, (truth,)).status == "completed"
+    with Session(runtime_engine) as session, session.begin():
+        initial_events = PersistenceRepository(session).fetch_events(claimed.run.run_id)
+    original = PersistenceRepository.get_scenario_revision
+    inserted = False
+
+    def insert_after_snapshot(
+        repository: PersistenceRepository, scenario_id: str, revision: str
+    ) -> ScenarioRevisionRecord | None:
+        nonlocal inserted
+        result = original(repository, scenario_id, revision)
+        if not inserted:
+            inserted = True
+            with Session(runtime_engine) as other_session, other_session.begin():
+                other_repository = PersistenceRepository(other_session)
+                current = other_repository.fetch_events(claimed.run.run_id)
+                document = current[-1].event.to_dict()
+                document["event_id"] = _unique("snapshot-later-event")
+                document["sequence"] = cast(int, document["sequence"]) + 1
+                other_repository.append_event(
+                    loads_run_event(json.dumps(document, separators=(",", ":")))
+                )
+        return result
+
+    monkeypatch.setattr(PersistenceRepository, "get_scenario_revision", insert_after_snapshot)
+    bundle = export_run_bundle(
+        runtime_engine,
+        claimed.run.run_id,
+        ground_truths=(truth,),
+        exported_at=datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+    )
+    run = cast(list[dict[str, object]], bundle.manifest.to_dict()["runs"])[0]
+    exported_events = bundle.files()[cast(str, run["events_path"])].splitlines()
+    with Session(runtime_engine) as session, session.begin():
+        persisted_events = PersistenceRepository(session).fetch_events(claimed.run.run_id)
+    assert inserted
+    assert len(exported_events) == len(initial_events)
+    assert len(persisted_events) == len(initial_events) + 1
+    assert validate_export_bundle(bundle).valid
 
 
 def test_issue17_mints_campaign_truth_only_from_recorded_issue16_result(

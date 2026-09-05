@@ -9,6 +9,7 @@ members = [
     "chaosagent-control-plane",
     "chaosagent-evaluators",
     "chaosagent-evidence",
+    "chaosagent-exports",
     "chaosagent-faults",
     "chaosagent-fixtures",
     "chaosagent-persistence",
@@ -150,6 +151,35 @@ dependencies = [
 requires-dist = [
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "rfc8785", specifier = "==0.1.4" },
+]
+
+[[package]]
+name = "chaosagent-exports"
+version = "0.0.0"
+source = { editable = "packages/exports" }
+dependencies = [
+    { name = "chaosagent-agent-configurations" },
+    { name = "chaosagent-evaluators" },
+    { name = "chaosagent-evidence" },
+    { name = "chaosagent-faults" },
+    { name = "chaosagent-persistence" },
+    { name = "chaosagent-scenarios" },
+    { name = "jsonschema" },
+    { name = "rfc8785" },
+    { name = "sqlalchemy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "chaosagent-agent-configurations", editable = "packages/agent-configurations" },
+    { name = "chaosagent-evaluators", editable = "packages/evaluators" },
+    { name = "chaosagent-evidence", editable = "packages/evidence" },
+    { name = "chaosagent-faults", editable = "packages/faults" },
+    { name = "chaosagent-persistence", editable = "packages/persistence" },
+    { name = "chaosagent-scenarios", editable = "packages/scenarios" },
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+    { name = "sqlalchemy", specifier = "==2.0.52" },
 ]
 
 [[package]]
