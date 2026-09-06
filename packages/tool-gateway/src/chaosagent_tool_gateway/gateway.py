@@ -50,6 +50,15 @@ from chaosagent_persistence import (
     approval_identity,
 )
 from chaosagent_policies import PolicyValidationError, evaluate_policy_v0
+from chaosagent_telemetry import (
+    inject_trace_context,
+    record_fault,
+    record_tool,
+    safe_identifier,
+    span,
+    timed,
+    tool_operation_attributes,
+)
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -420,6 +429,72 @@ class ToolGateway:
         causation_event_id: object | None = None,
         approval_id: object | None = None,
     ) -> ToolExecutionResult:
+        known_tool_id = isinstance(tool_id, str) and tool_id in SCENARIO_V0_TOOL_VERSIONS
+        safe_tool_id = cast(str, tool_id) if known_tool_id else "unknown"
+        expected_version = SCENARIO_V0_TOOL_VERSIONS.get(safe_tool_id)
+        safe_version = (
+            contract_version
+            if isinstance(contract_version, str) and contract_version == expected_version
+            else "unknown"
+        )
+        capability = (
+            "read"
+            if safe_tool_id in {"orders.get", "shipping.get_status"}
+            else "mutation"
+            if safe_tool_id in {"payments.refund", "support.update_ticket"}
+            else "other"
+        )
+        attributes: dict[str, str | int] = {
+            **tool_operation_attributes(safe_tool_id),
+            "chaosagent.tool.id": safe_tool_id,
+            "chaosagent.tool.version": safe_version,
+            "chaosagent.tool.capability": capability,
+        }
+        if isinstance(lease, LeaseIdentity):
+            attributes["chaosagent.run.id"] = safe_identifier(lease.run_id)
+            if isinstance(lease.attempt, int) and not isinstance(lease.attempt, bool):
+                attributes["chaosagent.lease.attempt"] = lease.attempt
+        if safe_identifier(logical_call_id) != "invalid":
+            attributes["chaosagent.tool.logical_call_id"] = cast(str, logical_call_id)
+        if isinstance(attempt_number, int) and not isinstance(attempt_number, bool):
+            attributes["chaosagent.tool.attempt_number"] = attempt_number
+        with (
+            timed() as duration,
+            span("chaosagent.tool.execute", attributes=attributes) as tool_span,
+        ):
+            result = self._execute(
+                lease,
+                tool_id=tool_id,
+                contract_version=contract_version,
+                arguments=arguments,
+                logical_call_id=logical_call_id,
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                call_ordinal=call_ordinal,
+                step_id=step_id,
+                causation_event_id=causation_event_id,
+                approval_id=approval_id,
+            )
+            outcome = "success" if result.outcome == "succeeded" else result.outcome
+            tool_span.set_outcome(outcome)
+        record_tool(safe_tool_id, capability, outcome, duration[0])
+        return result
+
+    def _execute(
+        self,
+        lease: object,
+        *,
+        tool_id: object,
+        contract_version: object,
+        arguments: object,
+        logical_call_id: object,
+        attempt_id: object,
+        attempt_number: object = 1,
+        call_ordinal: object | None = None,
+        step_id: object | None = None,
+        causation_event_id: object | None = None,
+        approval_id: object | None = None,
+    ) -> ToolExecutionResult:
         field_error = _validate_call_fields(
             lease,
             tool_id,
@@ -775,7 +850,16 @@ class ToolGateway:
                         before_result = None
                     else:
                         assert self._fault_engine is not None
-                        before_result = self._fault_engine.apply_before(before)
+                        with span(
+                            "chaosagent.fault.apply",
+                            attributes={
+                                "chaosagent.run.id": run.run_id,
+                                "chaosagent.fault.phase": "before_tool",
+                            },
+                        ):
+                            before_result = self._fault_engine.apply_before(before)
+                        for applied in before_result.applied:
+                            record_fault(applied.rule.kind, applied.rule.phase, "applied")
                     if before_result is not None:
                         applied_faults.extend(
                             self._record_applied_faults(
@@ -979,7 +1063,16 @@ class ToolGateway:
                         after_result = None
                     else:
                         assert self._fault_engine is not None
-                        after_result = self._fault_engine.apply_after(after, output)
+                        with span(
+                            "chaosagent.fault.apply",
+                            attributes={
+                                "chaosagent.run.id": run.run_id,
+                                "chaosagent.fault.phase": "after_tool",
+                            },
+                        ):
+                            after_result = self._fault_engine.apply_after(after, output)
+                        for applied in after_result.applied:
+                            record_fault(applied.rule.kind, applied.rule.phase, "applied")
                     if after_result is not None:
                         try:
                             self._repository.lock_current_lease(lease)
@@ -1057,6 +1150,7 @@ class ToolGateway:
                         correlation_id=logical_call_id,
                         causation_event_id=result_event_id,
                     )
+                    record_fault(applied.rule.kind, applied.rule.phase, "observed")
                 state_evidence_event_id: str | None = None
                 if effect is not None and effect.newly_applied:
                     state_evidence_event_id = _event_id()
@@ -1238,7 +1332,7 @@ class ToolGateway:
                         monotonic_ns(),
                     )
                 else:
-                    first = durable.execute(
+                    first = durable._execute(
                         lease,
                         tool_id=tool_id,
                         contract_version=contract_version,
@@ -1313,7 +1407,16 @@ class ToolGateway:
                     first.selection,
                     preferred_matched_event_ids={marker.fault_id: marker.matched_event_id},
                 )
-                application = self._fault_engine.apply_post_commit(first.selection)
+                with span(
+                    "chaosagent.fault.apply",
+                    attributes={
+                        "chaosagent.run.id": lease.run_id,
+                        "chaosagent.fault.phase": "after_commit",
+                    },
+                ):
+                    application = self._fault_engine.apply_post_commit(first.selection)
+                for applied_fault in application.applied:
+                    record_fault(applied_fault.rule.kind, applied_fault.rule.phase, "applied")
                 if (
                     len(application.applied) != 1
                     or application.applied[0].rule.fault_id != marker.fault_id
@@ -1366,6 +1469,11 @@ class ToolGateway:
                     },
                     correlation_id=marker.logical_call_id,
                     causation_event_id=marker.result_event_id,
+                )
+                record_fault(
+                    application.applied[0].rule.kind,
+                    application.applied[0].rule.phase,
+                    "observed",
                 )
             return ToolExecutionResult(
                 tool_id,
@@ -1439,19 +1547,40 @@ class ToolGateway:
             scenario_digest=scenario_digest,
             current_request_event_id=request_event_id,
         )
-        return self._fault_engine.select(
-            run_id=run_id,
-            scenario_digest=scenario_digest,
-            tool_id=tool_id,
-            phase=phase,
-            logical_call_id=logical_call_id,
-            physical_attempt_id=attempt_id,
-            attempt_number=attempt_number,
-            call_ordinal=call_ordinal,
-            arguments=arguments,
-            arguments_digest=arguments_digest,
-            prior_applied_occurrences=history,
-        )
+        with span(
+            "chaosagent.fault.match",
+            attributes={
+                "chaosagent.run.id": run_id,
+                "chaosagent.tool.id": tool_id,
+                "chaosagent.fault.phase": phase,
+            },
+        ) as match_span:
+            selection = self._fault_engine.select(
+                run_id=run_id,
+                scenario_digest=scenario_digest,
+                tool_id=tool_id,
+                phase=phase,
+                logical_call_id=logical_call_id,
+                physical_attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                call_ordinal=call_ordinal,
+                arguments=arguments,
+                arguments_digest=arguments_digest,
+                prior_applied_occurrences=history,
+            )
+            match_span.set_attribute("chaosagent.fault.matched_count", len(selection.matched_rules))
+            for decision in selection.decisions:
+                match_span.add_event(
+                    "chaosagent.fault.decision",
+                    {
+                        "fault_id": decision.fault_id,
+                        "matched": decision.matched,
+                        "reason": decision.reason,
+                    },
+                )
+        for rule in selection.matched_rules:
+            record_fault(rule.kind, rule.phase, "matched")
+        return selection
 
     def _authoritative_fault_history(
         self,
@@ -2279,6 +2408,7 @@ class ToolGateway:
             }
             if causation_event_id is not None:
                 document["causation_event_id"] = causation_event_id
+            inject_trace_context(document)
             return loads_run_event(json.dumps(document))
 
         self._repository.append_event_allocated(run_id, event_factory)

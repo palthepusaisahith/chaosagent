@@ -8,6 +8,7 @@ dependencies = [
     "chaosagent-policies",
     "chaosagent-evidence",
     "chaosagent-persistence",
+    "chaosagent-telemetry",
     "jsonschema==4.26.0",
     "sqlalchemy==2.0.52",
 ]
@@ -17,6 +18,7 @@ chaosagent-evidence = { workspace = true }
 chaosagent-faults = { workspace = true }
 chaosagent-policies = { workspace = true }
 chaosagent-persistence = { workspace = true }
+chaosagent-telemetry = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

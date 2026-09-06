@@ -26,6 +26,14 @@ from chaosagent_persistence import (
     RunRecord,
     StaleLeaseError,
 )
+from chaosagent_telemetry import (
+    inject_trace_context,
+    record_evaluation,
+    record_gate,
+    safe_identifier,
+    span,
+    timed,
+)
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -365,6 +373,7 @@ def _event(
             "payload": payload,
             "payload_digest": digest_payload_v0(payload),
         }
+        inject_trace_context(document)
         return loads_run_event(json.dumps(document))
 
     repository.append_event_allocated(run_id, factory)
@@ -464,6 +473,50 @@ def evaluate_leased_run(
 
 
 def execute_evaluation(
+    engine: Engine,
+    lease: LeaseIdentity,
+    ground_truths: tuple[GroundTruth, ...],
+) -> EvaluationExecutionResult:
+    """Execute one leased evaluation with failure-isolated operational telemetry."""
+    with (
+        timed() as duration,
+        span(
+            "chaosagent.evaluator.execute",
+            attributes={
+                "chaosagent.run.id": safe_identifier(lease.run_id),
+                "chaosagent.worker.id": safe_identifier(lease.worker_id),
+                "chaosagent.lease.attempt": (
+                    lease.attempt
+                    if isinstance(lease.attempt, int) and not isinstance(lease.attempt, bool)
+                    else 0
+                ),
+                "chaosagent.evaluator.id": EVALUATOR_REVISION["id"],
+                "chaosagent.evaluator.revision": EVALUATOR_REVISION["revision"],
+            },
+        ) as evaluator_span,
+    ):
+        execution = _execute_evaluation(engine, lease, ground_truths)
+        evaluator_span.set_outcome(execution.status)
+        if execution.result is not None:
+            document = execution.result.to_dict()
+            gates = cast(list[dict[str, object]], document["critical_gates"])
+            for gate in gates:
+                gate_id = cast(str, gate["gate_id"])
+                outcome = cast(str, gate["status"])
+                evaluator_span.add_event(
+                    "chaosagent.evaluator.gate", {"gate_id": gate_id, "outcome": outcome}
+                )
+                record_gate("critical", outcome)
+    classification = (
+        execution.status
+        if execution.result is None
+        else cast(str, execution.result.to_dict()["classification"])
+    )
+    record_evaluation(classification, duration[0])
+    return execution
+
+
+def _execute_evaluation(
     engine: Engine,
     lease: LeaseIdentity,
     ground_truths: tuple[GroundTruth, ...],

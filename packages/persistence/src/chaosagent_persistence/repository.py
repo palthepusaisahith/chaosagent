@@ -30,6 +30,7 @@ from chaosagent_evidence import (
 from chaosagent_fixtures import Fixture, FixtureValidationError, loads_fixture
 from chaosagent_policies import Policy, PolicyValidationError, loads_policy
 from chaosagent_scenarios import Scenario, ScenarioValidationError, loads_scenario
+from chaosagent_telemetry import inject_trace_context
 from sqlalchemy import Engine, Select, create_engine, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -2471,6 +2472,7 @@ class PersistenceRepository:
                     "payload": payload,
                     "payload_digest": digest_payload_v0(payload),
                 }
+                inject_trace_context(document)
                 return loads_run_event(json.dumps(document))
 
             self.append_event_allocated(authoritative_run.run_id, event_factory)
@@ -2549,6 +2551,7 @@ class PersistenceRepository:
                     "payload": payload,
                     "payload_digest": digest_payload_v0(payload),
                 }
+                inject_trace_context(document)
                 return loads_run_event(json.dumps(document))
 
             self.append_event_allocated(request.run_id, event_factory)
@@ -2936,6 +2939,7 @@ class PersistenceRepository:
             }
             if evidence.causation_event_id is not None:
                 document["causation_event_id"] = evidence.causation_event_id
+            inject_trace_context(document)
             return loads_run_event(json.dumps(document))
 
         self.append_event_allocated(run_id, event_factory)

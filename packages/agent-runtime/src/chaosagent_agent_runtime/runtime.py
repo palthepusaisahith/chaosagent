@@ -36,6 +36,17 @@ from chaosagent_persistence import (
     StaleLeaseError,
     validate_jsonb_persistence_profile,
 )
+from chaosagent_telemetry import (
+    inject_trace_context,
+    model_operation_attributes,
+    model_response_attributes,
+    record_model,
+    record_run,
+    safe_identifier,
+    set_current_span_attributes,
+    span,
+    timed,
+)
 from chaosagent_tool_gateway import (
     SCENARIO_V0_TOOL_VERSIONS,
     ToolDefinition,
@@ -317,6 +328,39 @@ def execute_run(
     producer_component: str = "agent-runtime",
     fault_engine: FaultEngine | None = None,
 ) -> ExecutionResult:
+    """Execute one leased Run with failure-isolated attempt telemetry."""
+    attributes: dict[str, str | int] = {
+        "chaosagent.run.id": safe_identifier(lease.run_id),
+        "chaosagent.worker.id": safe_identifier(lease.worker_id),
+        "chaosagent.lease.attempt": (
+            lease.attempt
+            if isinstance(lease.attempt, int) and not isinstance(lease.attempt, bool)
+            else 0
+        ),
+    }
+    with timed() as duration, span("chaosagent.run.execute", attributes=attributes) as run_span:
+        result = _execute_run(
+            engine,
+            lease,
+            adapter,
+            registry=registry,
+            producer_component=producer_component,
+            fault_engine=fault_engine,
+        )
+        run_span.set_outcome(result.status)
+    record_run(result.status, duration[0])
+    return result
+
+
+def _execute_run(
+    engine: Engine,
+    lease: LeaseIdentity,
+    adapter: AgentAdapter,
+    *,
+    registry: ToolRegistry | None = None,
+    producer_component: str = "agent-runtime",
+    fault_engine: FaultEngine | None = None,
+) -> ExecutionResult:
     """Execute one leased Run until evaluation-ready, approval wait, or failure."""
     tool_registry = registry or default_tool_registry()
     try:
@@ -327,6 +371,17 @@ def execute_run(
         return ExecutionResult("run_not_ready", lease.run_id, None, error_code="internal_error")
     except AgentOutputValidationError:
         return ExecutionResult("run_not_ready", lease.run_id, None, error_code="run_not_ready")
+
+    set_current_span_attributes(
+        {
+            "chaosagent.scenario.id": state.run.scenario.id,
+            "chaosagent.scenario.revision": state.run.scenario.revision,
+            "chaosagent.scenario.digest": state.run.scenario.digest,
+            "chaosagent.agent.configuration.id": state.run.agent_configuration.id,
+            "chaosagent.agent.configuration.revision": state.run.agent_configuration.revision,
+            "chaosagent.agent.configuration.digest": state.run.agent_configuration.digest,
+        }
+    )
 
     if state.run.status == "evaluating":
         answer = (
@@ -399,49 +454,93 @@ def execute_run(
 
         context = _agent_context(state, tool_registry)
         started = monotonic_ns()
-        try:
-            output = adapter.invoke(context)
-            elapsed_ms = _elapsed_ms(started)
-            validated = _validated_output(output, state.scenario, tool_registry, adapter)
-        except AgentProviderTimeout:
+        provider = "scripted" if isinstance(adapter, ScriptedAgentAdapter) else "other"
+        elapsed_ms: int | None = None
+        validated: AgentOutput | None = None
+        failure_code: str | None = None
+        failure_target: Literal["failed", "infra_error", "timed_out"] | None = None
+        with timed() as model_duration:
+            try:
+                model_attributes: dict[str, str | int] = {
+                    **model_operation_attributes(provider),
+                    "chaosagent.run.id": lease.run_id,
+                    "chaosagent.agent.step": next_step,
+                    "chaosagent.model.provider": provider,
+                    "chaosagent.agent.adapter.id": state.run.agent_configuration.id,
+                    "chaosagent.agent.adapter.version": state.run.agent_configuration.revision,
+                }
+                with span(
+                    "chaosagent.model.invoke",
+                    kind="client",
+                    attributes=model_attributes,
+                ) as model_span:
+                    output = adapter.invoke(context)
+                    elapsed_ms = _elapsed_ms(started)
+                    validated = _validated_output(output, state.scenario, tool_registry, adapter)
+                    if validated.provider_metadata is not None:
+                        provider = validated.provider_metadata.provider
+                        for key, value in model_response_attributes(
+                            provider=provider,
+                            requested_model=validated.provider_metadata.requested_model,
+                            resolved_model=validated.provider_metadata.resolved_model,
+                            input_tokens=validated.usage.input_tokens,
+                            output_tokens=validated.usage.output_tokens,
+                        ).items():
+                            model_span.set_attribute(key, value)
+                        model_span.set_attribute("chaosagent.model.provider", provider)
+                        model_span.set_attribute(
+                            "chaosagent.model.requested",
+                            validated.provider_metadata.requested_model,
+                        )
+                        if validated.provider_metadata.resolved_model is not None:
+                            model_span.set_attribute(
+                                "chaosagent.model.resolved",
+                                validated.provider_metadata.resolved_model,
+                            )
+                    if validated.usage.input_tokens is not None:
+                        model_span.set_attribute(
+                            "chaosagent.model.usage.input_tokens", validated.usage.input_tokens
+                        )
+                    if validated.usage.output_tokens is not None:
+                        model_span.set_attribute(
+                            "chaosagent.model.usage.output_tokens", validated.usage.output_tokens
+                        )
+                    if validated.usage.cost_microusd is not None:
+                        model_span.set_attribute(
+                            "chaosagent.model.usage.cost_microusd", validated.usage.cost_microusd
+                        )
+                    model_span.set_outcome("success")
+            except AgentProviderTimeout:
+                failure_target = "timed_out"
+                failure_code = "provider_timeout"
+            except AgentProviderError:
+                failure_target = "infra_error"
+                failure_code = "provider_error"
+            except Exception as error:
+                if isinstance(error, AgentOutputValidationError):
+                    failure_code = "invalid_agent_output"
+                    failure_target = "failed"
+                else:
+                    failure_code = "provider_error"
+                    failure_target = "infra_error"
+        if failure_code is not None and failure_target is not None:
+            record_model(
+                provider,
+                "error",
+                model_duration[0] if elapsed_ms is None else elapsed_ms / 1_000,
+            )
             return _terminate(
                 engine,
                 lease,
                 state.run,
-                "timed_out",
-                "provider_timeout",
+                failure_target,
+                failure_code,
                 producer_component,
                 failed_adapter=adapter,
                 failed_context=context,
             )
-        except AgentProviderError:
-            return _terminate(
-                engine,
-                lease,
-                state.run,
-                "infra_error",
-                "provider_error",
-                producer_component,
-                failed_adapter=adapter,
-                failed_context=context,
-            )
-        except Exception as error:
-            if isinstance(error, AgentOutputValidationError):
-                code = "invalid_agent_output"
-                target: Literal["failed", "infra_error"] = "failed"
-            else:
-                code = "provider_error"
-                target = "infra_error"
-            return _terminate(
-                engine,
-                lease,
-                state.run,
-                target,
-                code,
-                producer_component,
-                failed_adapter=adapter,
-                failed_context=context,
-            )
+        assert validated is not None and elapsed_ms is not None
+        record_model(provider, "success", elapsed_ms / 1_000)
 
         try:
             state = _persist_agent_output(
@@ -1622,6 +1721,7 @@ def _append_agent_step(
             "payload": payload,
             "payload_digest": digest_payload_v0(payload),
         }
+        inject_trace_context(document)
         return loads_run_event(json.dumps(document))
 
     return repository.append_event_allocated(run.run_id, factory)
@@ -2003,6 +2103,7 @@ def _terminate(
                     "payload": payload,
                     "payload_digest": digest_payload_v0(payload),
                 }
+                inject_trace_context(document)
                 return loads_run_event(json.dumps(document))
 
             error_event = repository.append_event_allocated(run.run_id, factory)
@@ -2070,6 +2171,7 @@ def _append_failed_agent_step(
             "payload": payload,
             "payload_digest": digest_payload_v0(payload),
         }
+        inject_trace_context(document)
         return loads_run_event(json.dumps(document))
 
     return repository.append_event_allocated(run.run_id, factory)

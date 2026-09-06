@@ -10,6 +10,7 @@ dependencies = [
     "chaosagent-evidence",
     "chaosagent-fixtures",
     "chaosagent-scenarios",
+    "chaosagent-telemetry",
     "psycopg[binary]==3.3.4",
     "rfc8785==0.1.4",
     "sqlalchemy==2.0.52",
@@ -21,6 +22,7 @@ chaosagent-evidence = { workspace = true }
 chaosagent-fixtures = { workspace = true }
 chaosagent-policies = { workspace = true }
 chaosagent-scenarios = { workspace = true }
+chaosagent-telemetry = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

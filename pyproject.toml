@@ -33,6 +33,7 @@ members = [
     "packages/policies",
     "packages/scenarios",
     "packages/tool-gateway",
+    "packages/telemetry",
     "services/control-plane",
 ]
 
@@ -62,6 +63,7 @@ files = [
     "packages/policies/src",
     "packages/scenarios/src",
     "packages/tool-gateway/src",
+    "packages/telemetry/src",
     "services/control-plane/src",
     "tests/python",
 ]

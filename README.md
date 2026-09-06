@@ -13,7 +13,9 @@ ChaosAgent is pre-1.0 and under active design.
   provider-neutral deterministic execution runtime, and the bounded OpenAI
   Responses hosted-provider adapter, deterministic fault matching/application
   including post-commit ambiguity recovery, and deterministic critical
-  evaluators over authoritative state/evidence.
+  evaluators over authoritative state/evidence. Export bundles and
+  backend-neutral OpenTelemetry traces/metrics are also available, with
+  telemetry disabled by default.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
@@ -123,6 +125,7 @@ packages/faults/           Pure Scenario v0 fault compiler and matcher
 packages/fixtures/         Fixture v0 schema, deterministic loader, digest
 packages/persistence/      PostgreSQL models, Alembic migration, repositories
 packages/scenarios/        Scenario v0 schema, validation, and canonicalization
+packages/telemetry/        Failure-isolated OpenTelemetry facade and bootstrap
 tests/python/              Python smoke tests
 docs/                      Project documentation
 .github/workflows/         Linux CI
@@ -136,6 +139,9 @@ Fixture semantics and isolated synthetic state are documented in
 [`docs/fixtures/FIXTURE_V0.md`](docs/fixtures/FIXTURE_V0.md). The deterministic
 execution loop, approval resume, and crash semantics are documented in
 [`docs/runtime/AGENT_RUNTIME_V0.md`](docs/runtime/AGENT_RUNTIME_V0.md).
+Operational telemetry and its strict separation from product evidence are
+documented in
+[`docs/observability/OPENTELEMETRY_V0.md`](docs/observability/OPENTELEMETRY_V0.md).
 
 ## Developer commands
 

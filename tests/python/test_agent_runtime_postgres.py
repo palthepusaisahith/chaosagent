@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +68,8 @@ from chaosagent_persistence import (
 from chaosagent_policies import load_policy
 from chaosagent_provider_openai import OpenAIResponsesAdapter
 from chaosagent_scenarios import loads_scenario
+from chaosagent_telemetry import span
+from chaosagent_telemetry.testing import install_test_providers, reset_test_telemetry
 from chaosagent_tool_gateway import (
     ORDERS_GET_V0,
     PAYMENTS_REFUND_V0,
@@ -75,6 +77,21 @@ from chaosagent_tool_gateway import (
     SUPPORT_UPDATE_TICKET_V0,
     ToolGateway,
 )
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    InMemoryMetricReader,
+    MetricExporter,
+    MetricExportResult,
+    MetricsData,
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import (
+    SimpleSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
@@ -495,6 +512,158 @@ def test_final_answer_transitions_only_to_evaluating(runtime_engine: Engine) -> 
         assert checkpoint is not None
         assert checkpoint.document["final_answer"] == "Done"
         assert "reasoning" not in cast(dict[str, object], checkpoint.document)
+
+
+def test_issue19_trace_correlates_runtime_tool_fault_evaluator_and_events(
+    runtime_engine: Engine,
+) -> None:
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    installation = install_test_providers(tracer_provider, meter_provider)
+    try:
+        with span("test.issue19.root"):
+            claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+            evaluation = execute_evaluation(
+                runtime_engine, claimed.lease, (load_ground_truth_v0(GROUND_TRUTH_PATH),)
+            )
+            assert evaluation.status == "completed"
+            assert evaluation.result is not None
+            assert evaluation.result.to_dict()["classification"] == "pass"
+        spans = exporter.get_finished_spans()
+        names = {item.name for item in spans}
+        assert {
+            "chaosagent.run.execute",
+            "chaosagent.model.invoke",
+            "chaosagent.tool.execute",
+            "chaosagent.fault.match",
+            "chaosagent.fault.apply",
+            "chaosagent.evaluator.execute",
+        } <= names
+        root = next(item for item in spans if item.name == "test.issue19.root")
+        assert all(item.context.trace_id == root.context.trace_id for item in spans)
+        run_span = next(item for item in spans if item.name == "chaosagent.run.execute")
+        model_spans = [item for item in spans if item.name == "chaosagent.model.invoke"]
+        tool_spans = [item for item in spans if item.name == "chaosagent.tool.execute"]
+        fault_spans = [item for item in spans if item.name.startswith("chaosagent.fault.")]
+        evaluator_span = next(item for item in spans if item.name == "chaosagent.evaluator.execute")
+        assert run_span.parent is not None and run_span.parent.span_id == root.context.span_id
+        assert all(
+            item.parent is not None and item.parent.span_id == run_span.context.span_id
+            for item in model_spans + tool_spans
+        )
+        tool_span_ids = {item.context.span_id for item in tool_spans}
+        assert all(
+            item.parent is not None and item.parent.span_id in tool_span_ids for item in fault_spans
+        )
+        assert (
+            evaluator_span.parent is not None
+            and evaluator_span.parent.span_id == root.context.span_id
+        )
+        with Session(runtime_engine) as session:
+            repository = PersistenceRepository(session)
+            events = repository.fetch_events(claimed.run.run_id)
+            company = repository.get_run_company_state(claimed.run.run_id)
+        assert company is not None and len(company.refunds) == 1
+        event_documents = [item.event.to_dict() for item in events]
+        assert sum(item["event_type"] == "fault.applied" for item in event_documents) == 1
+        assert sum(item["event_type"] == "state.evidence_recorded" for item in event_documents) == 2
+        traced = [
+            context
+            for item in events
+            if (context := item.event.to_dict().get("trace_context")) is not None
+        ]
+        assert len(traced) >= 6
+        assert {cast(dict[str, str], item)["trace_id"] for item in traced} == {
+            f"{root.context.trace_id:032x}"
+        }
+        emitted_span_ids = {f"{item.context.span_id:016x}" for item in spans}
+        assert {cast(dict[str, str], item)["span_id"] for item in traced} <= emitted_span_ids
+        telemetry_text = repr(spans) + repr(metric_reader.get_metrics_data())
+        assert "ORD-1007" not in telemetry_text
+        assert "Refund confirmed exactly once." not in telemetry_text
+        assert "Failed shipment" not in telemetry_text
+        assert "evaluation-refund" not in telemetry_text
+    finally:
+        installation.shutdown()
+
+
+def test_issue19_failing_span_exporter_cannot_change_run_semantics(
+    runtime_engine: Engine,
+) -> None:
+    class FailingExporter(SpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            assert spans
+            raise RuntimeError("deliberate exporter outage")
+
+    claimed = _create_run(runtime_engine)
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(FailingExporter()))
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    installation = install_test_providers(tracer_provider, meter_provider)
+    try:
+        result = execute_run(
+            runtime_engine,
+            claimed.lease,
+            _adapter(AgentOutput("Done", final=True, usage=_usage())),
+        )
+        assert result.status == "evaluation_ready"
+        with Session(runtime_engine) as session:
+            run = PersistenceRepository(session).get_run(claimed.run.run_id)
+            assert run is not None and run.status == "evaluating"
+    finally:
+        installation.shutdown()
+
+
+def test_issue19_failing_metric_exporter_cannot_change_runtime_effect_or_evidence(
+    runtime_engine: Engine,
+) -> None:
+    class FailingMetricExporter(MetricExporter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.export_calls = 0
+
+        def export(
+            self, metrics_data: MetricsData, timeout_millis: float = 10_000, **kwargs: object
+        ) -> MetricExportResult:
+            del metrics_data, timeout_millis, kwargs
+            self.export_calls += 1
+            return MetricExportResult.FAILURE
+
+        def force_flush(self, timeout_millis: float = 10_000) -> bool:
+            del timeout_millis
+            return False
+
+        def shutdown(self, timeout_millis: float = 30_000, **kwargs: object) -> None:
+            del timeout_millis, kwargs
+
+    exporter = FailingMetricExporter()
+    tracer_provider = TracerProvider()
+    metric_reader = PeriodicExportingMetricReader(exporter, export_interval_millis=3_600_000)
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    installation = install_test_providers(tracer_provider, meter_provider)
+    try:
+        claimed = _evaluation_ready_ambiguity_run(runtime_engine)
+        metric_reader.force_flush()
+        assert exporter.export_calls == 1
+        with Session(runtime_engine) as session:
+            repository = PersistenceRepository(session)
+            run = repository.get_run(claimed.run.run_id)
+            company = repository.get_run_company_state(claimed.run.run_id)
+            effects = repository.list_company_effects(claimed.run.run_id)
+            event_types = [
+                row.event.to_dict()["event_type"]
+                for row in repository.fetch_events(claimed.run.run_id)
+            ]
+        assert run is not None and run.status == "evaluating"
+        assert company is not None and len(company.refunds) == 1
+        assert len(effects) == 2
+        assert event_types.count("state.evidence_recorded") == 2
+    finally:
+        installation.shutdown()
 
 
 def test_agent_step_digests_cover_exact_context_and_output(runtime_engine: Engine) -> None:
@@ -2865,8 +3034,11 @@ def test_post_provider_and_terminalization_sqlalchemy_failures_are_sanitized(
         assert all(row.event.to_dict()["event_type"] != "agent.step" for row in events)
 
 
-def test_wall_budget_uses_monotonic_elapsed_time(
-    runtime_engine: Engine, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("telemetry_enabled", [False, True])
+def test_wall_budget_uses_same_domain_clock_with_telemetry_enabled_or_disabled(
+    runtime_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    telemetry_enabled: bool,
 ) -> None:
     claimed = _create_run(
         runtime_engine,
@@ -2877,14 +3049,83 @@ def test_wall_budget_uses_monotonic_elapsed_time(
             "max_cost_microusd": 100,
         },
     )
-    ticks = iter((0, 2_000_000))
-    monkeypatch.setattr(runtime_module, "monotonic_ns", lambda: next(ticks))
-    result = execute_run(
-        runtime_engine,
-        claimed.lease,
-        _adapter(AgentOutput("late final", final=True, usage=_usage())),
-    )
+    values = (0, 2_000_000)
+    calls = 0
+
+    def domain_clock() -> int:
+        nonlocal calls
+        if calls >= len(values):
+            raise AssertionError("telemetry consumed an extra domain-clock reading")
+        value = values[calls]
+        calls += 1
+        return value
+
+    reset_test_telemetry()
+    installation = None
+    if telemetry_enabled:
+        installation = install_test_providers(TracerProvider(), MeterProvider())
+    monkeypatch.setattr(runtime_module, "monotonic_ns", domain_clock)
+    try:
+        result = execute_run(
+            runtime_engine,
+            claimed.lease,
+            _adapter(AgentOutput("late final", final=True, usage=_usage())),
+        )
+    finally:
+        if installation is not None:
+            installation.shutdown()
     assert result.status == "timed_out" and result.error_code == "max_wall_time_exceeded"
+    assert calls == 2
+
+
+@pytest.mark.parametrize("telemetry_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("output", "clock_values", "expected_status", "expected_error"),
+    [
+        (AgentProviderTimeout("timeout"), (10,), "timed_out", "provider_timeout"),
+        (AgentProviderError("failure"), (10,), "infra_error", "provider_error"),
+        (object(), (10, 20), "failed", "invalid_agent_output"),
+        (
+            AgentOutput("done", final=True, usage=_usage()),
+            (10, 20),
+            "evaluation_ready",
+            None,
+        ),
+    ],
+)
+def test_provider_paths_use_same_domain_clock_with_telemetry_enabled_or_disabled(
+    runtime_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    telemetry_enabled: bool,
+    output: object,
+    clock_values: tuple[int, ...],
+    expected_status: str,
+    expected_error: str | None,
+) -> None:
+    claimed = _create_run(runtime_engine)
+    calls = 0
+
+    def domain_clock() -> int:
+        nonlocal calls
+        if calls >= len(clock_values):
+            raise AssertionError("telemetry consumed an extra domain-clock reading")
+        value = clock_values[calls]
+        calls += 1
+        return value
+
+    reset_test_telemetry()
+    installation = None
+    if telemetry_enabled:
+        installation = install_test_providers(TracerProvider(), MeterProvider())
+    monkeypatch.setattr(runtime_module, "monotonic_ns", domain_clock)
+    try:
+        result = execute_run(runtime_engine, claimed.lease, _adapter(output))
+    finally:
+        if installation is not None:
+            installation.shutdown()
+    assert result.status == expected_status
+    assert result.error_code == expected_error
+    assert calls == len(clock_values)
 
 
 def test_tool_effect_and_evidence_roll_back_if_checkpoint_fails(

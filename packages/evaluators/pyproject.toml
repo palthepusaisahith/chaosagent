@@ -9,6 +9,7 @@ dependencies = [
     "chaosagent-agent-runtime",
     "chaosagent-persistence",
     "chaosagent-scenarios",
+    "chaosagent-telemetry",
     "jsonschema==4.26.0",
     "referencing==0.37.0",
     "rfc8785==0.1.4",
@@ -21,6 +22,7 @@ chaosagent-faults = { workspace = true }
 chaosagent-agent-runtime = { workspace = true }
 chaosagent-persistence = { workspace = true }
 chaosagent-scenarios = { workspace = true }
+chaosagent-telemetry = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
