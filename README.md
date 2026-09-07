@@ -16,17 +16,18 @@ ChaosAgent is pre-1.0 and under active design.
   evaluators over authoritative state/evidence. Export bundles and
   backend-neutral OpenTelemetry traces/metrics are also available, with
   telemetry disabled by default. A versioned REST and replay-safe SSE control
-  plane exposes these authoritative backend capabilities.
-- **Planned:** the V1 capabilities described below and in the architecture
-  dossier. They are not available yet.
+  plane exposes these authoritative backend capabilities. The React dashboard
+  presents the flagship Run and Campaign evidence flow.
+- **Planned:** the remaining V1 capabilities described below and in the
+  architecture dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
 The execution runtime supports deterministic in-process adapters and the strict
 Issue #12 OpenAI Responses v0 profile. The Gateway applies the bounded V0 fault
 set and preserves idempotent post-commit recovery. Critical evaluation, Campaign
-aggregation, deterministic exports, and the control-plane API are implemented.
-The user interface is not implemented yet.
+aggregation, deterministic exports, the control-plane API, and its evidence-led
+dashboard are implemented.
 
 ## Why ChaosAgent exists
 
@@ -109,6 +110,21 @@ make install
 make check
 ```
 
+### Dashboard
+
+With PostgreSQL migrated through `0010` and the control plane running on
+`127.0.0.1:8000`, start the Issue #21 React/Vite dashboard with:
+
+```shell
+pnpm --filter @chaosagent/web dev
+```
+
+Vite proxies `/api` to the local control plane. For a separately hosted API, set
+`VITE_CONTROL_PLANE_URL` to an explicitly allowed origin. The dashboard hydrates
+persisted state and events before attaching its live SSE stream; PostgreSQL
+remains authoritative. See
+[`docs/dashboard/DASHBOARD_V1.md`](docs/dashboard/DASHBOARD_V1.md).
+
 ## Repository layout
 
 `packages/agent-configurations` owns the minimal immutable hosted-agent
@@ -117,7 +133,7 @@ SDK integration; the provider-neutral runtime does not import the SDK. See
 [`docs/providers/OPENAI_RESPONSES_V0.md`](docs/providers/OPENAI_RESPONSES_V0.md).
 
 ```text
-apps/web/                  TypeScript web-package placeholder
+apps/web/                  React/Vite reliability dashboard
 services/control-plane/    Versioned REST and replay-safe SSE service
 packages/shared/           Shared TypeScript package and smoke test
 packages/agent-runtime/    Provider-neutral loop and checkpoint v0 contract
