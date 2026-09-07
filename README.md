@@ -15,7 +15,8 @@ ChaosAgent is pre-1.0 and under active design.
   including post-commit ambiguity recovery, and deterministic critical
   evaluators over authoritative state/evidence. Export bundles and
   backend-neutral OpenTelemetry traces/metrics are also available, with
-  telemetry disabled by default.
+  telemetry disabled by default. A versioned REST and replay-safe SSE control
+  plane exposes these authoritative backend capabilities.
 - **Planned:** the V1 capabilities described below and in the architecture
   dossier. They are not available yet.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
@@ -23,9 +24,9 @@ ChaosAgent is pre-1.0 and under active design.
 
 The execution runtime supports deterministic in-process adapters and the strict
 Issue #12 OpenAI Responses v0 profile. The Gateway applies the bounded V0 fault
-set and preserves idempotent post-commit recovery. Critical evaluation is
-deterministic and report-ready, but full Run Report generation, Campaign
-aggregation, and the user interface are not implemented yet.
+set and preserves idempotent post-commit recovery. Critical evaluation, Campaign
+aggregation, deterministic exports, and the control-plane API are implemented.
+The user interface is not implemented yet.
 
 ## Why ChaosAgent exists
 
@@ -117,7 +118,7 @@ SDK integration; the provider-neutral runtime does not import the SDK. See
 
 ```text
 apps/web/                  TypeScript web-package placeholder
-services/control-plane/    Installable Python package placeholder
+services/control-plane/    Versioned REST and replay-safe SSE service
 packages/shared/           Shared TypeScript package and smoke test
 packages/agent-runtime/    Provider-neutral loop and checkpoint v0 contract
 packages/evidence/         Run Event/Report v0 schemas and validated loaders
@@ -142,6 +143,9 @@ execution loop, approval resume, and crash semantics are documented in
 Operational telemetry and its strict separation from product evidence are
 documented in
 [`docs/observability/OPENTELEMETRY_V0.md`](docs/observability/OPENTELEMETRY_V0.md).
+The HTTP resources, replay cursor, SSE behavior, and local startup command are
+documented in
+[`docs/control-plane/CONTROL_PLANE_V1.md`](docs/control-plane/CONTROL_PLANE_V1.md).
 
 ## Developer commands
 

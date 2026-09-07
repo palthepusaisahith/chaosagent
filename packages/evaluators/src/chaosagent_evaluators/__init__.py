@@ -51,9 +51,11 @@ from .engine import (
     invalid_evaluation_result_v0,
 )
 from .service import (
+    AuthoritativeEvaluationSnapshot,
     EvaluationExecutionResult,
     evaluate_leased_run,
     execute_evaluation,
+    load_authoritative_evaluation_snapshot,
 )
 
 __all__ = [
@@ -64,6 +66,7 @@ __all__ = [
     "GROUND_TRUTH_V0_SCHEMA_VERSION",
     "EffectFact",
     "ApprovalFact",
+    "AuthoritativeEvaluationSnapshot",
     "CampaignCohort",
     "CampaignComparison",
     "CampaignPlan",
@@ -91,6 +94,7 @@ __all__ = [
     "evaluation_result_schema",
     "evaluation_result_v0",
     "execute_evaluation",
+    "load_authoritative_evaluation_snapshot",
     "ground_truth_schema_v0",
     "ground_truth_schema",
     "load_ground_truth_v0",

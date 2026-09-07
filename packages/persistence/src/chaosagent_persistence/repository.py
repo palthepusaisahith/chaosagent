@@ -2573,6 +2573,30 @@ class PersistenceRepository:
             query = query.where(RunEventModel.sequence <= through_sequence)
         return tuple(self._event_record(model) for model in self._session.scalars(query))
 
+    def fetch_event_page(
+        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> tuple[RunEventRecord, ...]:
+        """Return one bounded authoritative event page in Run sequence order."""
+        _require_identifier(run_id, "run_id")
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        models = self._session.scalars(
+            select(RunEventModel)
+            .where(RunEventModel.run_id == run_id, RunEventModel.sequence > after_sequence)
+            .order_by(RunEventModel.sequence)
+            .limit(limit)
+            .execution_options(populate_existing=True)
+        )
+        return tuple(self._event_record(model) for model in models)
+
+    def get_event(self, event_id: str) -> RunEventRecord | None:
+        """Load one immutable event by its globally unique identity."""
+        _require_identifier(event_id, "event_id")
+        model = self._session.get(RunEventModel, event_id, populate_existing=True)
+        return None if model is None else self._event_record(model)
+
     def latest_event_projection(self, run_id: str) -> tuple[str, int] | None:
         """Read only the constraint-protected identity/sequence projection.
 

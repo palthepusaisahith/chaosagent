@@ -1,9 +1,27 @@
 [project]
 name = "chaosagent-control-plane"
 version = "0.0.0"
-description = "Control-plane package placeholder for ChaosAgent"
+description = "REST and replay-safe SSE control plane for ChaosAgent"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "chaosagent-agent-configurations",
+    "chaosagent-evaluators",
+    "chaosagent-exports",
+    "chaosagent-persistence",
+    "chaosagent-scenarios",
+    "fastapi==0.141.1",
+    "pydantic==2.13.5",
+    "sqlalchemy==2.0.52",
+    "starlette==1.6.0",
+    "uvicorn==0.52.4",
+]
+
+[tool.uv.sources]
+chaosagent-agent-configurations = { workspace = true }
+chaosagent-evaluators = { workspace = true }
+chaosagent-exports = { workspace = true }
+chaosagent-persistence = { workspace = true }
+chaosagent-scenarios = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
