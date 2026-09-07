@@ -189,21 +189,19 @@ function HomePage({
   runs: Run[];
   navigate: (path: string) => void;
 }) {
-  const active = runs.filter((run) => !terminalStatuses.has(run.status));
-  const faulted = runs.filter((run) => run.fault_seed !== null);
   return (
     <div className="page home-page">
       <section className="home-hero">
         <div>
-          <p className="eyebrow">Reliability engineering for agents</p>
+          <p className="eyebrow">Agent reliability control</p>
           <h1>
             Know what happens
             <br />
             after the tool <em>lies.</em>
           </h1>
           <p className="lede">
-            Reliability evaluation for tool-using AI agents under real failure
-            conditions.
+            Inject controlled tool failures, trace recovery, and verify business
+            effects against authoritative evidence.
           </p>
           <div className="hero-actions">
             <button
@@ -222,34 +220,19 @@ function HomePage({
         </div>
         <FlagshipPreview />
       </section>
-      <section className="summary-strip" aria-label="Loaded run summary">
-        <SummaryMetric
-          label="Loaded Runs"
-          value={String(runs.length)}
-          note="This browser session"
-        />
-        <SummaryMetric
-          label="Active"
-          value={String(active.length)}
-          note="Queued through evaluating"
-        />
-        <SummaryMetric
-          label="Fault-selected"
-          value={String(faulted.length)}
-          note="With persisted fault seed"
-        />
-        <SummaryMetric
-          label="Authority"
-          value="DB"
-          note="Append-only evidence"
-        />
-      </section>
-      <section className="home-grid">
-        <Panel eyebrow="Workspace" title="Loaded Runs" className="recent-runs">
+      <section className="workspace-section" aria-labelledby="workspace-title">
+        <div className="workspace-section__heading">
+          <div>
+            <p className="eyebrow">Workspace</p>
+            <h2 id="workspace-title">Loaded Runs</h2>
+          </div>
+          <span>Session view · {runs.length} loaded</span>
+        </div>
+        <div className="recent-runs">
           {runs.length === 0 ? (
             <EmptyState
               title="No Runs loaded"
-              body="Issue #20 exposes lookup—not a global Run list. Open or create a Run to begin this truthful session view."
+              body="Issue #20 exposes lookup—not a global Run list. Open or create a Run."
             />
           ) : (
             <div className="run-list">
@@ -261,60 +244,47 @@ function HomePage({
                 ))}
             </div>
           )}
-        </Panel>
-        <Panel
-          eyebrow="Flagship experiment"
-          title="The lost refund acknowledgement"
-        >
-          <p className="feature-copy">
-            A refund commits. Its acknowledgement is deliberately hidden. The
-            agent must recover without creating a second refund—and prove it
-            from authoritative state.
-          </p>
-          <div className="mini-sequence">
-            <span>Commit</span>
-            <Icon name="arrow" />
-            <span className="mini-sequence__fault">Timeout</span>
-            <Icon name="arrow" />
-            <span>Recover</span>
-            <Icon name="arrow" />
-            <span className="mini-sequence__pass">Prove</span>
-          </div>
-        </Panel>
+        </div>
       </section>
     </div>
   );
 }
 
 function FlagshipPreview() {
+  const steps = [
+    ['01', 'Refund request', 'Agent asks to refund the order'],
+    ['02', 'Refund committed', 'Authoritative business state changes'],
+    ['03', 'ACK timeout', 'The success acknowledgement is withheld'],
+    ['04', 'Retry / recovery', 'Agent resolves the ambiguous outcome'],
+    ['05', 'Duplicate prevented', 'Idempotency blocks a second effect'],
+    ['06', 'Exactly 1 refund', 'Authoritative state proves the invariant'],
+    ['07', 'PASS', 'Critical evaluator gates are satisfied'],
+  ] as const;
   return (
-    <div className="signal-card" aria-label="Flagship reliability signal">
+    <section className="signal-card" aria-label="Reference experiment flow">
       <div className="signal-card__top">
-        <span>AMBIGUOUS REFUND</span>
-        <span className="live-dot">REFERENCE FLOW</span>
+        <span>SHIPMENT / REFUND</span>
+        <span>REFERENCE EXPERIMENT</span>
       </div>
-      <div className="signal-wave">
-        <i />
-        <i />
-        <i />
-        <i />
-        <i />
-        <i />
-        <i />
+      <div className="signal-card__intro">
+        <strong>Ambiguous refund acknowledgment</strong>
+        <span>Cause → fault → recovery → proof</span>
       </div>
-      <div className="signal-card__fault">
-        <span>Mutation committed</span>
-        <strong>ACK LOST</strong>
-      </div>
-      <div className="signal-card__result">
-        <span className="seal">✓</span>
-        <div>
-          <strong>1 refund</strong>
-          <small>exactly-once invariant preserved</small>
-        </div>
-        <StatusBadge value="pass" />
-      </div>
-    </div>
+      <ol className="reference-flow">
+        {steps.map(([number, label, detail], index) => (
+          <li
+            className={`reference-flow__step reference-flow__step--${index + 1}`}
+            key={number}
+          >
+            <span>{number}</span>
+            <div>
+              <strong>{label}</strong>
+              <small>{detail}</small>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -407,7 +377,7 @@ function RunsPage({
       />
       <div className="runs-layout">
         <RunCreationForm busy={busy} onCreate={create} />
-        <aside className="panel lookup-card">
+        <aside className="panel lookup-card operational-surface">
           <p className="eyebrow">Persisted history</p>
           <h2>Open a Run</h2>
           <p>
@@ -638,7 +608,29 @@ function RunDetailPage({
       {error !== null && <ErrorNotice error={error} />}
       <FlagshipStory events={events} report={report} />
       <div className="evidence-layout">
-        <section className="panel timeline-panel">
+        <aside className="inspector-column">
+          <ExactlyOncePanel events={events} report={report} />
+          <Panel
+            eyebrow="Evaluation"
+            title="Critical gates"
+            className="supporting-panel evaluation-panel"
+          >
+            <EvaluationPanel report={report} />
+          </Panel>
+          <ExpectedActual report={report} />
+          <Panel
+            eyebrow="Policy boundary"
+            title="Approvals"
+            className="supporting-panel approvals-panel"
+          >
+            <ApprovalsPanel
+              approvals={approvals}
+              busyId={approvalBusy}
+              onResolve={resolve}
+            />
+          </Panel>
+        </aside>
+        <section className="panel timeline-panel operational-surface">
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Execution timeline</p>
@@ -654,20 +646,6 @@ function RunDetailPage({
           )}
           <EventTimeline events={visibleEvents} />
         </section>
-        <aside className="inspector-column">
-          <ExactlyOncePanel events={events} report={report} />
-          <Panel eyebrow="Evaluation" title="Critical gates">
-            <EvaluationPanel report={report} />
-          </Panel>
-          <Panel eyebrow="Policy boundary" title="Approvals">
-            <ApprovalsPanel
-              approvals={approvals}
-              busyId={approvalBusy}
-              onResolve={resolve}
-            />
-          </Panel>
-          <ExpectedActual report={report} />
-        </aside>
       </div>
       <RawEvidence events={events} report={report} />
     </div>
@@ -677,7 +655,11 @@ function RunDetailPage({
 function ExpectedActual({ report }: { report: ReportResponse | null }) {
   const gates = report?.document.critical_gates ?? [];
   return (
-    <Panel eyebrow="Expected vs observed" title="Verified outcomes">
+    <Panel
+      eyebrow="Expected vs observed"
+      title="Verified outcomes"
+      className="supporting-panel outcomes-panel"
+    >
       {gates.length === 0 ? (
         <EmptyState
           title="No verified outcomes"
@@ -758,14 +740,18 @@ function CampaignsPage({
     }
   };
   return (
-    <div className="page">
+    <div className="page campaign-page">
       <PageHeader
         eyebrow="Campaign reliability"
         title="Inspect cohorts and paired deltas"
       />
       {error !== null && <ErrorNotice error={error} />}
       <div className="campaign-layout">
-        <Panel eyebrow="Authoritative cohort" title="Open Campaign">
+        <Panel
+          eyebrow="Authoritative cohort"
+          title="Open Campaign"
+          className="control-surface"
+        >
           <form
             className="inline-form"
             onSubmit={(event) => void loadCampaign(event)}
@@ -784,7 +770,11 @@ function CampaignsPage({
             </button>
           </form>
         </Panel>
-        <Panel eyebrow="Paired comparison" title="Baseline vs faulted">
+        <Panel
+          eyebrow="Paired comparison"
+          title="Baseline vs faulted"
+          className="control-surface"
+        >
           <form
             className="comparison-form"
             onSubmit={(event) => void compare(event)}
@@ -824,7 +814,7 @@ function CampaignsPage({
       {campaign === null && comparison === null && (
         <EmptyState
           title="No Campaign loaded"
-          body="Enter an exact persisted Campaign identity. Aggregates are computed by the Issue #17 backend."
+          body="Enter a persisted Campaign ID. Statistics remain backend-authoritative."
         />
       )}
     </div>
@@ -841,7 +831,7 @@ function CampaignResult({
   navigate: (path: string) => void;
 }) {
   return (
-    <section className="panel campaign-result">
+    <section className="panel campaign-result operational-surface">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{campaign.arm} arm</p>
@@ -900,7 +890,7 @@ function CampaignComparison({
   response: CampaignComparisonResponse;
 }) {
   return (
-    <section className="panel campaign-result">
+    <section className="panel campaign-result operational-surface">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Authenticated comparison</p>

@@ -160,7 +160,10 @@ export function RunCreationForm({ busy, onCreate }: RunFormProps) {
     }
   };
   return (
-    <form className="run-form panel" onSubmit={(event) => void submit(event)}>
+    <form
+      className="run-form panel operational-surface"
+      onSubmit={(event) => void submit(event)}
+    >
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Immutable inputs</p>
@@ -618,7 +621,7 @@ export function RawEvidence({
 }) {
   const visibleEvents = events.length > 400 ? events.slice(-400) : events;
   return (
-    <details className="raw-evidence panel">
+    <details className="raw-evidence panel operational-surface">
       <summary>Raw evidence inspector</summary>
       <p>
         Immutable event documents and the final report are shown as inert text.
