@@ -9,6 +9,7 @@ import {
   ExactlyOncePanel,
   FlagshipStory,
   ApprovalsPanel,
+  RawEvidence,
   StatusBadge,
   RunCreationForm,
 } from '../src/components';
@@ -22,6 +23,24 @@ import type { ReportResponse } from '../src/domain';
 import { approval, event, flagshipEvents, gate, report } from './fixtures';
 
 describe('evidence presentation', () => {
+  it('renders hostile raw evidence as inert text without executable DOM', () => {
+    const hostile =
+      '<script>globalThis.pwned=true</script><a href="javascript:alert(1)">PASS</a>\n\nid: forged';
+    const hostileEvent = event(1, 'agent.step', { text: hostile });
+    const { container } = render(
+      <RawEvidence events={[hostileEvent]} report={null} />,
+    );
+    expect(
+      screen.getByText(/globalThis\.pwned=true/, { exact: false }),
+    ).toBeInTheDocument();
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('a')).toBeNull();
+    const serialized = container.querySelector('pre')?.textContent;
+    expect(serialized).toContain('<script>globalThis.pwned=true</script>');
+    expect(serialized).toContain('href=\\"javascript:alert(1)\\"');
+    expect(serialized).toContain('\\n\\nid: forged');
+  });
+
   it('constructs Run creation from every explicit immutable reference field', async () => {
     const create = vi.fn().mockResolvedValue(undefined);
     const user = userEvent.setup();

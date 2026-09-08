@@ -115,4 +115,6 @@ executes bundle content.
 - Raw provider/model bodies are not persisted by current contracts and therefore
   are not exported.
 - Issue #19 owns OpenTelemetry. Issue #20 owns REST/SSE. Issue #21 owns the
-  dashboard/download UI. Issue #22 owns sandbox/container hardening.
+  dashboard/download UI. The final V1 execution threat model and abuse coverage
+  are documented in
+  [`EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).

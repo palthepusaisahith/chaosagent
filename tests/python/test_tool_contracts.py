@@ -114,6 +114,33 @@ def test_invalid_unknown_and_wrong_version_calls_fail_before_database_access() -
         assert result.request_event_id is None
 
 
+@pytest.mark.parametrize(
+    "tool_id",
+    [
+        "unknown.tool",
+        "payments.refund.extra",
+        "PAYMENTS.REFUND",
+        "../payments.refund",
+        "__import__",
+        "os.system",
+        "payments.refund; echo owned",
+        "payments.refun\N{CYRILLIC SMALL LETTER DE}",
+    ],
+)
+def test_adversarial_capability_names_fail_before_database_access(tool_id: str) -> None:
+    result = ToolGateway(Session()).execute(
+        _unused_lease(),
+        tool_id=tool_id,
+        contract_version=PAYMENTS_REFUND_V0,
+        arguments={},
+        logical_call_id="logical-1",
+        attempt_id="attempt-1",
+    )
+    assert result.error is not None
+    assert result.error.code in {"invalid_request", "unsupported_tool"}
+    assert result.request_event_id is None
+
+
 def test_positive_physical_attempt_number_is_structurally_accepted() -> None:
     result = ToolGateway(Session()).execute(
         _unused_lease(),
@@ -278,6 +305,33 @@ def test_mutation_contracts_are_strict_and_use_integer_money() -> None:
     )
     assert wrong_version.error is not None
     assert wrong_version.error.code == "unsupported_tool"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"approved": True},
+        {"amount_minor": 0},
+        {"amount_minor": True},
+        {"idempotency_key": "x" * 129},
+        {"order_id": "../ORD-1007"},
+    ],
+)
+def test_mutation_argument_abuse_has_no_implicit_authority(
+    mutation: dict[str, object],
+) -> None:
+    definition = next(
+        item for item in default_tool_registry().definitions if item.tool_id == "payments.refund"
+    )
+    arguments: dict[str, object] = {
+        "order_id": "ORD-1007",
+        "payment_id": "PAY-1007",
+        "amount_minor": 12999,
+        "reason": "Shipment failed",
+        "idempotency_key": "refund-ord-1007",
+    }
+    arguments.update(mutation)
+    assert list(Draft202012Validator(dict(definition.input_schema)).iter_errors(arguments))
 
 
 def _unused_lease() -> LeaseIdentity:

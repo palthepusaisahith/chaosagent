@@ -17,9 +17,9 @@ ChaosAgent is pre-1.0 and under active design.
   backend-neutral OpenTelemetry traces/metrics are also available, with
   telemetry disabled by default. A versioned REST and replay-safe SSE control
   plane exposes these authoritative backend capabilities. The React dashboard
-  presents the flagship Run and Campaign evidence flow.
-- **Planned:** the remaining V1 capabilities described below and in the
-  architecture dossier. They are not available yet.
+  presents the flagship Run and Campaign evidence flow. The final V1 hardening
+  pass documents and tests the capability-restricted agent boundary and hostile
+  input handling.
 - **Experimental:** architecture, interfaces, and roadmap decisions may change
   before the first release.
 
@@ -162,6 +162,9 @@ documented in
 The HTTP resources, replay cursor, SSE behavior, and local startup command are
 documented in
 [`docs/control-plane/CONTROL_PLANE_V1.md`](docs/control-plane/CONTROL_PLANE_V1.md).
+The implemented execution threat model, abuse-test map, and precise isolation
+limitations are documented in
+[`docs/security/EXECUTION_TRUST_BOUNDARY_V1.md`](docs/security/EXECUTION_TRUST_BOUNDARY_V1.md).
 
 ## Developer commands
 

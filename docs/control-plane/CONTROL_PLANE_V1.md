@@ -122,7 +122,9 @@ unless explicit origins are configured and is not an authentication mechanism.
 
 ## Deferred work
 
-Issue #21 owns the dashboard and frontend SSE client. Issue #22 owns sandbox and
-abuse hardening. This package adds neither a worker daemon nor scheduler,
-WebSockets, Redis/Kafka, object storage, export registry, Campaign-comparison
-bundle, or new telemetry/evidence authority.
+Issue #21 owns the dashboard and frontend SSE client. The final V1 abuse and
+capability-boundary model is documented in
+[`EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).
+This package adds neither a worker daemon nor scheduler, WebSockets,
+Redis/Kafka, object storage, export registry, Campaign-comparison bundle, or new
+telemetry/evidence authority.

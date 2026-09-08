@@ -183,14 +183,16 @@ does not claim a forcibly interruptible hard deadline and does not add threads
 or process killing.
 
 The runtime does not guarantee automatic heartbeat, lease renewal, scheduling,
-model cancellation after lease expiry, retries/backoff, provider determinism,
-fault injection, evaluation, campaigns, streaming, telemetry, or sandboxing.
-Those remain later work. If accepted output persistence fails, the failed
-transaction is rolled back and a fresh fenced transaction attempts to record
-sanitized `run.error` plus an `infra_error` lifecycle transition; invalid
-adapter output terminates as `failed`. If PostgreSQL itself is unavailable, no
-system can promise that terminal evidence was recorded, and the public result
-reports `run_not_ready`/`internal_error` without claiming that the Run reached a
+model cancellation after lease expiry, retries/backoff, or provider determinism.
+It is a trusted in-process capability boundary, not an OS/container isolation
+layer; see
+[`EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).
+If accepted output persistence fails, the failed transaction is rolled back and
+a fresh fenced transaction attempts to record sanitized `run.error` plus an
+`infra_error` lifecycle transition; invalid adapter output terminates as
+`failed`. If PostgreSQL itself is unavailable, no system can promise that
+terminal evidence was recorded, and the public result reports
+`run_not_ready`/`internal_error` without claiming that the Run reached a
 terminal state or that checkpoint progress committed.
 
 The public runtime boundary contains ChaosAgent persistence errors, SQLAlchemy

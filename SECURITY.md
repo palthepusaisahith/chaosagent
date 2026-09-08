@@ -58,9 +58,12 @@ reported as vulnerabilities. Security or design concerns about planned features
 may be raised through normal feature or design discussions, provided they do not
 include secrets, exploit details, or other sensitive security information.
 
-At this stage the repository contains bootstrap and governance tooling only; it
-does not operate a hosted service, accept arbitrary real-world credentials, or
-integrate with real payment systems.
+The repository now contains the V1 contracts, runtime, synthetic Tool Gateway,
+PostgreSQL persistence, provider adapter, control plane, exports, telemetry, and
+dashboard. Their implemented trust boundaries and limitations are documented in
+[`docs/security/EXECUTION_TRUST_BOUNDARY_V1.md`](docs/security/EXECUTION_TRUST_BOUNDARY_V1.md).
+ChaosAgent still does not integrate with real payment systems and must not be
+used with production customer data or production credentials.
 
 General feature requests, unsupported forks, social engineering unrelated to
 this project, and vulnerabilities entirely in third-party services should be

@@ -30,6 +30,10 @@ from openai import (
 )
 
 _SAFE_INTEGER = 9_007_199_254_740_991
+_MAX_PROVIDER_OUTPUT_ITEMS = 256
+_MAX_MESSAGE_CONTENT_ITEMS = 256
+_MAX_PROVIDER_TEXT_CHARS = 100_000
+_MAX_TOOL_ARGUMENT_JSON_CHARS = 65_536
 _PROVIDER_SCHEMA_DROPPED_KEYWORDS = frozenset({"$schema", "$id", "title", "minLength", "maxLength"})
 _PROVIDER_SCHEMA_SUPPORTED_KEYWORDS = frozenset(
     {
@@ -158,8 +162,11 @@ class OpenAIResponsesAdapter:
         output = document.get("output")
         if not isinstance(output, list):
             raise AgentOutputValidationError("OpenAI response output is malformed")
+        if len(output) > _MAX_PROVIDER_OUTPUT_ITEMS:
+            raise AgentOutputValidationError("OpenAI response contains too many output items")
         _, aliases = _tool_maps(context)
         text_parts: list[str] = []
+        text_chars = 0
         calls: list[AgentToolCall] = []
         for item in output:
             if not isinstance(item, dict) or not isinstance(item.get("type"), str):
@@ -170,7 +177,7 @@ class OpenAIResponsesAdapter:
                     "OpenAI returned reasoning state outside the configured compatibility profile"
                 )
             if item_type == "message":
-                _collect_message_text(item, text_parts)
+                text_chars = _collect_message_text(item, text_parts, text_chars)
                 continue
             if item_type == "function_call":
                 calls.append(_function_call(item, aliases))
@@ -194,18 +201,23 @@ class OpenAIResponsesAdapter:
 
 
 def _response_document(response: object) -> dict[str, object]:
-    if isinstance(response, Mapping):
-        plain = _plain_json(response)
-        if not isinstance(plain, dict):
+    try:
+        if isinstance(response, Mapping):
+            plain = _plain_json(response)
+            if not isinstance(plain, dict):
+                raise AgentOutputValidationError("OpenAI response object is malformed")
+            return plain
+        model_dump = getattr(response, "model_dump", None)
+        if not callable(model_dump):
             raise AgentOutputValidationError("OpenAI response object is malformed")
-        return plain
-    model_dump = getattr(response, "model_dump", None)
-    if not callable(model_dump):
-        raise AgentOutputValidationError("OpenAI response object is malformed")
-    dumped = model_dump(mode="json")
-    if not isinstance(dumped, dict):
-        raise AgentOutputValidationError("OpenAI response object is malformed")
-    return cast(dict[str, object], dumped)
+        dumped = model_dump(mode="json")
+        if not isinstance(dumped, dict):
+            raise AgentOutputValidationError("OpenAI response object is malformed")
+        return cast(dict[str, object], dumped)
+    except AgentOutputValidationError:
+        raise
+    except Exception:
+        raise AgentOutputValidationError("OpenAI response object is malformed") from None
 
 
 def _tool_alias(tool_id: str) -> str:
@@ -320,16 +332,32 @@ def _trajectory_input(context: AgentContext) -> list[dict[str, object]]:
     return items
 
 
-def _collect_message_text(item: dict[str, object], target: list[str]) -> None:
+def _collect_message_text(item: dict[str, object], target: list[str], current_chars: int) -> int:
     if item.get("role") != "assistant" or not isinstance(item.get("content"), list):
         raise AgentOutputValidationError("OpenAI message output is malformed")
-    for content in cast(list[object], item["content"]):
+    contents = cast(list[object], item["content"])
+    if len(contents) > _MAX_MESSAGE_CONTENT_ITEMS:
+        raise AgentOutputValidationError("OpenAI message contains too many content items")
+    for content in contents:
         if not isinstance(content, dict) or content.get("type") != "output_text":
             raise AgentOutputValidationError("OpenAI message content is unsupported")
         text = content.get("text")
         if not isinstance(text, str):
             raise AgentOutputValidationError("OpenAI text output is malformed")
+        current_chars += len(text)
+        if current_chars > _MAX_PROVIDER_TEXT_CHARS:
+            raise AgentOutputValidationError("OpenAI text output exceeds the supported limit")
         target.append(text)
+    return current_chars
+
+
+def _reject_duplicate_argument_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _function_call(item: dict[str, object], aliases: dict[str, object]) -> AgentToolCall:
@@ -345,10 +373,16 @@ def _function_call(item: dict[str, object], aliases: dict[str, object]) -> Agent
     tool = aliases.get(name)
     if tool is None:
         raise AgentOutputValidationError("OpenAI requested an unauthorized function")
+    if len(raw_arguments) > _MAX_TOOL_ARGUMENT_JSON_CHARS:
+        raise AgentOutputValidationError("OpenAI function arguments exceed the supported limit")
     try:
-        arguments = json.loads(raw_arguments)
-    except json.JSONDecodeError as error:
-        raise AgentOutputValidationError("OpenAI function arguments are malformed JSON") from error
+        arguments = json.loads(
+            raw_arguments,
+            object_pairs_hook=_reject_duplicate_argument_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        raise AgentOutputValidationError("OpenAI function arguments are malformed JSON") from None
     if not isinstance(arguments, dict):
         raise AgentOutputValidationError("OpenAI function arguments must be an object")
     return AgentToolCall(

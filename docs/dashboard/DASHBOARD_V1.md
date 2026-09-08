@@ -66,5 +66,7 @@ environment configuration.
 ## Deferred
 
 Issue #21 does not add Run or revision collection endpoints, a worker daemon,
-frontend authentication, a mock production data plane, a new migration, or the
-Issue #22 sandbox and abuse-hardening work.
+frontend authentication, a mock production data plane, or a new migration. Raw
+evidence abuse coverage and the process-level capability boundary are described
+in
+[`EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).

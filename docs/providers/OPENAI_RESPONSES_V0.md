@@ -75,6 +75,10 @@ Response rules are deterministic:
   opaque reasoning-state continuation;
 - empty, unsupported, malformed, or unauthorized output fails closed;
 - function argument JSON must parse to an object and is never repaired;
+- response translation rejects more than 256 output items, more than 256 content
+  items per message, more than 100,000 text characters, and tool-argument JSON
+  over 65,536 characters; duplicate keys, non-finite constants, and recursively
+  malformed JSON fail closed;
 - provider call IDs remain correlation labels; the runtime derives authoritative
   logical and physical identities.
 
@@ -122,5 +126,6 @@ tokens.
 ## Deferred
 
 Live smoke testing, retries/backoff, streaming, invoice reconciliation, new
-accounting schedules, reasoning-state transport, automatic heartbeats, fault
-injection, evaluation, Campaigns, telemetry, and UI remain deferred.
+accounting schedules, reasoning-state transport, and automatic heartbeats remain
+deferred. The complete V1 execution trust boundary is documented in
+[`docs/security/EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).
