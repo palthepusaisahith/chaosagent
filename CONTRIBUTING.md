@@ -10,8 +10,7 @@ Contributions are submitted under the [Apache License 2.0](LICENSE).
 
 You need Python 3.12.x, uv 0.12.1, Node.js 22.x, pnpm 10.15.1, and GNU Make.
 Follow the
-[README setup instructions](README.md#quick-start--local-development), then
-run:
+[README setup instructions](README.md#quick-start--local-development), then run:
 
 ```shell
 make install
