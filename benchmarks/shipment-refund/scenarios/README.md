@@ -4,7 +4,12 @@
 left byte-for-byte semantically unchanged.
 `refund-ambiguous-timeout.evaluated.v0.json` is revision 2; it references the
 committed deterministic Fixture v0 document in `../fixtures` and the executable
-Ground Truth v0 revision.
+Ground Truth v0 revision. `refund-ambiguous-timeout.demo.v0.json` is revision 3
+for the deterministic local flagship runner. It preserves revision 2's
+verification-first instructions but removes the global logical-call ordinal from
+the refund fault matcher. The tool, phase, order, probability, and
+single-occurrence constraints still select the intended first eligible refund
+without coupling it to the preceding reads.
 
 Its policy reference resolves to the committed Policy v0 document in
 `../policies`. Revision 2's expected-outcome reference resolves to the

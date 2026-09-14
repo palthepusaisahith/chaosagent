@@ -124,13 +124,21 @@ proof, and evaluator verdict. It can create queued Runs, open a known Run or
 Campaign, hydrate persisted evidence, and continue from the last replay-safe SSE
 cursor. It does not invent global Run or Campaign listings.
 
-**Current pre-1.0 demo limitation:** the commands below start PostgreSQL, apply
-migrations, and run the control plane and dashboard. `POST /api/v1/runs` creates
-queued work; the control plane intentionally does not claim or execute it in the
-HTTP request. The repository does not yet package a worker daemon or one-command
-flagship bootstrap/runner, so this setup alone cannot reproduce the complete
-ambiguous-refund experiment from a fresh empty database. The dashboard can
-inspect known persisted Runs and Campaigns.
+After starting PostgreSQL and applying migrations as shown below, run the real
+deterministic flagship experiment from a fresh database without an OpenAI key or
+external network access:
+
+```powershell
+uv run --package chaosagent-demo-runner chaosagent-demo
+```
+
+The local runner seeds immutable benchmark revisions, executes the scripted
+provider-neutral agent through the production lifecycle, Tool Gateway, fault,
+idempotency, and evaluator boundaries, then prints its authenticated Run ID and
+dashboard URL. It is a single flagship orchestration command, not a worker
+daemon. General Runs created through `POST /api/v1/runs` remain queued until a
+separate worker claims them; the control plane never executes work inside the
+HTTP request.
 
 With PostgreSQL migrated through `0010` and the control plane running on
 `127.0.0.1:8000`, start it with:
@@ -196,6 +204,7 @@ apply all migrations:
 docker compose -f deploy/compose/postgres.yml up -d
 $env:CHAOSAGENT_DATABASE_URL = "postgresql+psycopg://chaosagent:chaosagent@127.0.0.1:55432/chaosagent_test"
 uv run alembic -c packages/persistence/alembic.ini upgrade head
+uv run --package chaosagent-demo-runner chaosagent-demo
 ```
 
 The fixed credentials are development-only and unsuitable for production. Full

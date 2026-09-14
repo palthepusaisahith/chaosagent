@@ -22,6 +22,7 @@ build-constraint-dependencies = ["hatchling==1.32.0"]
 
 [tool.uv.workspace]
 members = [
+    "apps/demo-runner",
     "packages/agent-configurations",
     "packages/agent-runtime",
     "packages/faults",
@@ -52,6 +53,7 @@ quote-style = "double"
 python_version = "3.12"
 strict = true
 files = [
+    "apps/demo-runner/src",
     "packages/agent-configurations/src",
     "packages/agent-runtime/src",
     "packages/faults/src",

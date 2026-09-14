@@ -20,6 +20,17 @@ The Vite server runs at `http://127.0.0.1:5173` and proxies `/api` to
 origin when that origin is explicitly allowed by control-plane CORS. No
 credential is stored in browser storage.
 
+The deterministic local flagship runner prints the exact persisted Run route:
+
+```powershell
+uv run --package chaosagent-demo-runner chaosagent-demo
+```
+
+Open that URL after starting the control plane and dashboard against the same
+migrated PostgreSQL database. The runner itself needs neither service and does
+not require `CHAOSAGENT_GROUND_TRUTH_PATHS`; it loads the committed flagship
+Ground Truth directly.
+
 ## Workflow
 
 - **Dashboard** explains the ambiguous-refund experiment and summarizes only
@@ -65,8 +76,8 @@ environment configuration.
 
 ## Deferred
 
-Issue #21 does not add Run or revision collection endpoints, a worker daemon,
-frontend authentication, a mock production data plane, or a new migration. Raw
-evidence abuse coverage and the process-level capability boundary are described
-in
+The dashboard does not add Run or revision collection endpoints, a worker
+daemon, frontend authentication, a mock production data plane, or a new
+migration. Raw evidence abuse coverage and the process-level capability boundary
+are described in
 [`EXECUTION_TRUST_BOUNDARY_V1.md`](../security/EXECUTION_TRUST_BOUNDARY_V1.md).
