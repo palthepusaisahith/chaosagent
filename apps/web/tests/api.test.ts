@@ -4,6 +4,27 @@ import { ControlPlaneApiError, ControlPlaneClient } from '../src/api';
 import { event, run } from './fixtures';
 
 describe('ControlPlaneClient', () => {
+  it('preserves the native fetch receiver', async () => {
+    const nativeFetch = vi.fn(function (
+      this: typeof globalThis,
+    ): Promise<Response> {
+      if (this !== globalThis) throw new TypeError('Illegal invocation');
+      return Promise.resolve(json(run()));
+    });
+    vi.stubGlobal('fetch', nativeFetch);
+
+    try {
+      const client = new ControlPlaneClient('https://control.example');
+
+      await expect(client.getRun('run-refund-001')).resolves.toMatchObject({
+        run_id: 'run-refund-001',
+      });
+      expect(nativeFetch).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('sends every immutable Run identity input unchanged', async () => {
     const created = run({ status: 'queued' });
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(

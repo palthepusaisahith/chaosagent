@@ -31,7 +31,10 @@ export class ControlPlaneClient {
   private readonly baseUrl: string;
   private readonly fetcher: typeof fetch;
 
-  public constructor(baseUrl = configuredBaseUrl(), fetcher = fetch) {
+  public constructor(
+    baseUrl = configuredBaseUrl(),
+    fetcher = globalThis.fetch.bind(globalThis),
+  ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.fetcher = fetcher;
   }
