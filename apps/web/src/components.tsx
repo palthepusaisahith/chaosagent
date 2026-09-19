@@ -275,10 +275,14 @@ export function RunHeader({
       <div className="run-hero__identity">
         <p className="eyebrow">Run evidence room</p>
         <div className="run-title-row">
-          <h1>{run.run_id}</h1>
+          <h1>{run.scenario.id}</h1>
           <StatusBadge value={run.status} />
           {classification !== null && <StatusBadge value={classification} />}
         </div>
+        <p className="run-id">
+          <span className="run-id__label">Run ID</span>
+          <code className="run-id__value">{run.run_id}</code>
+        </p>
         <p className="run-subtitle">
           Created {formatTime(run.created_at)} by {run.created_by} · attempt{' '}
           {run.attempt}

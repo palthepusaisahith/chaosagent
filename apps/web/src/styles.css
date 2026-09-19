@@ -581,6 +581,27 @@ legend {
   font-size: clamp(1.9rem, 4vw, 3.2rem);
   overflow-wrap: anywhere;
 }
+.run-id {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  margin: 0.8rem 0 0;
+  color: #a7b1ab;
+}
+.run-id__label {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.run-id__value {
+  min-width: 0;
+  color: inherit;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
 .run-subtitle {
   margin: 1rem 0 0;
   color: #a7b1ab;

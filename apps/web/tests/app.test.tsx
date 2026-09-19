@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ControlPlaneClient } from '../src/api';
 import { App } from '../src/app';
+import { RunHeader } from '../src/components';
 import { event, report, run } from './fixtures';
 
 class BrowserEventSource extends EventTarget {
@@ -30,6 +31,33 @@ afterEach(() => {
 });
 
 describe('Run detail live integration', () => {
+  it('uses the Scenario identity as the heading and keeps the complete Run ID secondary', () => {
+    const longRunId = `run-flagship-${'a'.repeat(64)}`;
+
+    render(
+      <RunHeader
+        run={run({ run_id: longRunId, status: 'completed' })}
+        report={report()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('heading', {
+        level: 1,
+        name: 'shipment-refund.ambiguous-timeout',
+      }),
+    ).toBeVisible();
+    expect(screen.getByText('Run ID')).toBeVisible();
+    expect(screen.getByText(longRunId)).toHaveClass('run-id__value');
+    expect(screen.getByText(longRunId)).toBeVisible();
+    expect(screen.getByText('COMPLETED')).toBeVisible();
+    expect(screen.getByText('PASS')).toBeVisible();
+    expect(screen.getByText(/Created .* by test-user/)).toBeVisible();
+    expect(screen.getByText('Scenario')).toBeVisible();
+    expect(screen.getByText('Agent Configuration')).toBeVisible();
+    expect(screen.getByText('Fault seed')).toBeVisible();
+  });
+
   it('hydrates REST first, appends SSE evidence, and finalizes a terminal Run', async () => {
     window.history.replaceState(null, '', '/runs/run-refund-001');
     vi.stubGlobal('EventSource', BrowserEventSource);
@@ -86,6 +114,12 @@ describe('Run detail live integration', () => {
     );
     expect(source?.closed).toBe(true);
     expect(screen.getByText('Run completed')).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'Critical gates' }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'What happened, in order' }),
+    ).toBeVisible();
   });
 
   it('shows a truthful empty dashboard without inventing recent Runs', () => {
